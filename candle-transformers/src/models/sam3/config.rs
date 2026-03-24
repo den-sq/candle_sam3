@@ -46,6 +46,7 @@ impl Default for ImageConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct VisionConfig {
+    pub image_size: usize,
     pub pretrain_image_size: usize,
     pub patch_size: usize,
     pub embed_dim: usize,
@@ -58,6 +59,7 @@ pub struct VisionConfig {
     pub tile_abs_pos: bool,
     pub use_rope: bool,
     pub use_interp_rope: bool,
+    pub rope_theta: f64,
     pub retain_cls_token: bool,
     pub ln_pre: bool,
 }
@@ -65,6 +67,7 @@ pub struct VisionConfig {
 impl Default for VisionConfig {
     fn default() -> Self {
         Self {
+            image_size: 1008,
             pretrain_image_size: 336,
             patch_size: 14,
             embed_dim: 1024,
@@ -77,6 +80,7 @@ impl Default for VisionConfig {
             tile_abs_pos: true,
             use_rope: true,
             use_interp_rope: true,
+            rope_theta: 10_000.0,
             retain_cls_token: false,
             ln_pre: true,
         }

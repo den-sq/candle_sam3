@@ -123,10 +123,12 @@ pub struct Sam3ImageModel {
 
 impl Sam3ImageModel {
     pub fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
-        let vision_trunk =
-            Sam3ViTDetTrunk::new(&config.vision, vb.pp("backbone").pp("vision_trunk"))?;
+        let vision_trunk = Sam3ViTDetTrunk::new(
+            &config.vision,
+            vb.pp("backbone").pp("vision_backbone").pp("trunk"),
+        )?;
         let vision_neck =
-            Sam3DualViTDetNeck::new(&config.neck, vb.pp("backbone").pp("vision_neck"))?;
+            Sam3DualViTDetNeck::new(&config.neck, vb.pp("backbone").pp("vision_backbone"))?;
         let text = Sam3TextEncoder::new(&config.text, vb.pp("backbone").pp("language_backbone"))?;
         let geometry =
             SequenceGeometryEncoder::new(&config.geometry, vb.pp("input_geometry_encoder"))?;

@@ -1,22 +1,438 @@
-use candle::{Result, Tensor};
-use candle_nn::VarBuilder;
+use candle::{DType, IndexOp, Result, Tensor};
+use candle_nn::{Conv2d, Conv2dConfig, LayerNorm, Linear, Module, VarBuilder};
 
 use super::config::VisionConfig;
 
 #[derive(Debug)]
 pub struct ViTDetTrunkOutput {
+    /// Final spatial feature map from the ViT trunk in `[batch, height, width, channels]` layout.
     pub stage_features: Vec<Tensor>,
+}
+
+#[derive(Debug)]
+struct PatchEmbed {
+    proj: Conv2d,
+}
+
+impl PatchEmbed {
+    fn new(config: &VisionConfig, vb: VarBuilder) -> Result<Self> {
+        let conv_cfg = Conv2dConfig {
+            stride: config.patch_size,
+            ..Default::default()
+        };
+        let proj = candle_nn::conv2d_no_bias(
+            3,
+            config.embed_dim,
+            config.patch_size,
+            conv_cfg,
+            vb.pp("proj"),
+        )?;
+        Ok(Self { proj })
+    }
+
+    fn forward(&self, images: &Tensor) -> Result<Tensor> {
+        self.proj.forward(images)?.permute((0, 2, 3, 1))
+    }
+}
+
+#[derive(Debug)]
+struct VisionRotaryEmbedding {
+    cos: Tensor,
+    sin: Tensor,
+}
+
+impl VisionRotaryEmbedding {
+    fn new(
+        config: &VisionConfig,
+        end_x: usize,
+        end_y: usize,
+        scale: f32,
+        device: &candle::Device,
+    ) -> Result<Self> {
+        let head_dim = config.embed_dim / config.num_heads;
+        if head_dim % 4 != 0 {
+            candle::bail!("sam3 vision head dim must be divisible by 4, got {head_dim}")
+        }
+        let rotary_dim = head_dim / 4;
+        let seq_len = end_x * end_y;
+        let mut cos = vec![0f32; seq_len * head_dim];
+        let mut sin = vec![0f32; seq_len * head_dim];
+        let inv_freqs: Vec<f32> = (0..rotary_dim)
+            .map(|i| 1f32 / (config.rope_theta as f32).powf((4 * i) as f32 / head_dim as f32))
+            .collect();
+        for flat_idx in 0..seq_len {
+            let x_pos = (flat_idx % end_x) as f32 * scale;
+            let y_pos = (flat_idx / end_x) as f32 * scale;
+            let row = &mut cos[flat_idx * head_dim..(flat_idx + 1) * head_dim];
+            let row_sin = &mut sin[flat_idx * head_dim..(flat_idx + 1) * head_dim];
+            for (i, inv_freq) in inv_freqs.iter().copied().enumerate() {
+                let x_freq = x_pos * inv_freq;
+                let y_freq = y_pos * inv_freq;
+                let x_offset = 2 * i;
+                row[x_offset] = x_freq.cos();
+                row[x_offset + 1] = x_freq.cos();
+                row_sin[x_offset] = x_freq.sin();
+                row_sin[x_offset + 1] = x_freq.sin();
+
+                let y_offset = 2 * rotary_dim + 2 * i;
+                row[y_offset] = y_freq.cos();
+                row[y_offset + 1] = y_freq.cos();
+                row_sin[y_offset] = y_freq.sin();
+                row_sin[y_offset + 1] = y_freq.sin();
+            }
+        }
+        Ok(Self {
+            cos: Tensor::from_slice(&cos, (seq_len, head_dim), device)?,
+            sin: Tensor::from_slice(&sin, (seq_len, head_dim), device)?,
+        })
+    }
+
+    fn apply(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (_, _, seq_len, head_dim) = q.dims4()?;
+        let cos = self
+            .cos
+            .narrow(0, 0, seq_len)?
+            .reshape((1, 1, seq_len, head_dim))?;
+        let sin = self
+            .sin
+            .narrow(0, 0, seq_len)?
+            .reshape((1, 1, seq_len, head_dim))?;
+        let q_dtype = q.dtype();
+        let k_dtype = k.dtype();
+        let q = q.to_dtype(DType::F32)?;
+        let k = k.to_dtype(DType::F32)?;
+        let q_rot = rotate_pairwise(&q)?;
+        let k_rot = rotate_pairwise(&k)?;
+        let q = (q.broadcast_mul(&cos)? + q_rot.broadcast_mul(&sin)?)?.to_dtype(q_dtype)?;
+        let k = (k.broadcast_mul(&cos)? + k_rot.broadcast_mul(&sin)?)?.to_dtype(k_dtype)?;
+        Ok((q, k))
+    }
+}
+
+fn rotate_pairwise(xs: &Tensor) -> Result<Tensor> {
+    let (batch_size, num_heads, seq_len, head_dim) = xs.dims4()?;
+    let xs = xs.reshape((batch_size, num_heads, seq_len, head_dim / 2, 2))?;
+    let pair = xs.chunk(2, 4)?;
+    let even = pair[0].clone();
+    let odd = pair[1].clone();
+    let rotated = Tensor::cat(&[&odd.neg()?, &even], 4)?;
+    rotated.reshape((batch_size, num_heads, seq_len, head_dim))
+}
+
+#[derive(Debug)]
+struct Sam3VisionAttention {
+    qkv: Linear,
+    proj: Linear,
+    num_heads: usize,
+    head_dim: usize,
+    scale: f64,
+    rotary_emb: VisionRotaryEmbedding,
+}
+
+impl Sam3VisionAttention {
+    fn new(
+        config: &VisionConfig,
+        rotary_emb: VisionRotaryEmbedding,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        let qkv = candle_nn::linear_b(config.embed_dim, config.embed_dim * 3, true, vb.pp("qkv"))?;
+        let proj = candle_nn::linear(config.embed_dim, config.embed_dim, vb.pp("proj"))?;
+        let head_dim = config.embed_dim / config.num_heads;
+        Ok(Self {
+            qkv,
+            proj,
+            num_heads: config.num_heads,
+            head_dim,
+            scale: (head_dim as f64).powf(-0.5),
+            rotary_emb,
+        })
+    }
+
+    fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        let in_dtype = hidden_states.dtype();
+        let (batch_size, height, width, channels) = hidden_states.dims4()?;
+        let seq_len = height * width;
+        let qkv = self
+            .qkv
+            .forward(&hidden_states.reshape((batch_size, seq_len, channels))?)?
+            .reshape((batch_size, seq_len, 3, self.num_heads, self.head_dim))?
+            .permute((2, 0, 3, 1, 4))?;
+        let q = qkv.i(0)?;
+        let k = qkv.i(1)?;
+        let v = qkv.i(2)?;
+        let (q, k) = self.rotary_emb.apply(&q, &k)?;
+        let q = (q.to_dtype(DType::F32)? * self.scale)?;
+        let k = k.to_dtype(DType::F32)?;
+        let v = v.to_dtype(DType::F32)?;
+        let attn = q.matmul(&k.transpose(2, 3)?)?;
+        let attn = candle_nn::ops::softmax_last_dim(&attn)?;
+        let hidden_states = attn
+            .matmul(&v)?
+            .to_dtype(in_dtype)?
+            .transpose(1, 2)?
+            .reshape((batch_size, height, width, channels))?;
+        self.proj.forward(&hidden_states)
+    }
+}
+
+#[derive(Debug)]
+struct Sam3VisionMlp {
+    fc1: Linear,
+    fc2: Linear,
+}
+
+impl Sam3VisionMlp {
+    fn new(config: &VisionConfig, vb: VarBuilder) -> Result<Self> {
+        let hidden_dim = ((config.embed_dim as f64) * config.mlp_ratio) as usize;
+        Ok(Self {
+            fc1: candle_nn::linear(config.embed_dim, hidden_dim, vb.pp("fc1"))?,
+            fc2: candle_nn::linear(hidden_dim, config.embed_dim, vb.pp("fc2"))?,
+        })
+    }
+
+    fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        self.fc2.forward(&self.fc1.forward(hidden_states)?.gelu()?)
+    }
+}
+
+#[derive(Debug)]
+struct Sam3VisionBlock {
+    norm1: LayerNorm,
+    attn: Sam3VisionAttention,
+    norm2: LayerNorm,
+    mlp: Sam3VisionMlp,
+    window_size: usize,
+}
+
+impl Sam3VisionBlock {
+    fn new(
+        config: &VisionConfig,
+        window_size: usize,
+        input_size: (usize, usize),
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        let rotary_input_size = if window_size == 0 {
+            input_size
+        } else {
+            (window_size, window_size)
+        };
+        let rotary_scale = config.window_size as f32 / rotary_input_size.0 as f32;
+        Ok(Self {
+            norm1: candle_nn::layer_norm(config.embed_dim, 1e-6, vb.pp("norm1"))?,
+            attn: Sam3VisionAttention::new(
+                config,
+                VisionRotaryEmbedding::new(
+                    config,
+                    rotary_input_size.0,
+                    rotary_input_size.1,
+                    rotary_scale,
+                    vb.device(),
+                )?,
+                vb.pp("attn"),
+            )?,
+            norm2: candle_nn::layer_norm(config.embed_dim, 1e-6, vb.pp("norm2"))?,
+            mlp: Sam3VisionMlp::new(config, vb.pp("mlp"))?,
+            window_size,
+        })
+    }
+
+    fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        let residual = hidden_states;
+        let hidden_states = self.norm1.forward(hidden_states)?;
+        let original_hw = (hidden_states.dim(1)?, hidden_states.dim(2)?);
+        let (hidden_states, padded_hw) = if self.window_size > 0 {
+            window_partition(&hidden_states, self.window_size)?
+        } else {
+            (hidden_states, original_hw)
+        };
+        let hidden_states = self.attn.forward(&hidden_states)?;
+        let hidden_states = if self.window_size > 0 {
+            window_unpartition(&hidden_states, self.window_size, padded_hw, original_hw)?
+        } else {
+            hidden_states
+        };
+        let hidden_states = (residual + hidden_states)?;
+        let residual = &hidden_states;
+        let hidden_states = self.norm2.forward(&hidden_states)?;
+        let hidden_states = self.mlp.forward(&hidden_states)?;
+        residual + hidden_states
+    }
+}
+
+fn window_partition(
+    hidden_states: &Tensor,
+    window_size: usize,
+) -> Result<(Tensor, (usize, usize))> {
+    let (batch_size, height, width, channels) = hidden_states.dims4()?;
+    let pad_height = (window_size - height % window_size) % window_size;
+    let pad_width = (window_size - width % window_size) % window_size;
+    let hidden_states = if pad_height > 0 {
+        hidden_states.pad_with_zeros(1, 0, pad_height)?
+    } else {
+        hidden_states.clone()
+    };
+    let hidden_states = if pad_width > 0 {
+        hidden_states.pad_with_zeros(2, 0, pad_width)?
+    } else {
+        hidden_states
+    };
+    let padded_height = height + pad_height;
+    let padded_width = width + pad_width;
+    let windows = hidden_states
+        .reshape((
+            batch_size,
+            padded_height / window_size,
+            window_size,
+            padded_width / window_size,
+            window_size,
+            channels,
+        ))?
+        .permute((0, 1, 3, 2, 4, 5))?
+        .reshape((
+            batch_size * (padded_height / window_size) * (padded_width / window_size),
+            window_size,
+            window_size,
+            channels,
+        ))?;
+    Ok((windows, (padded_height, padded_width)))
+}
+
+fn window_unpartition(
+    windows: &Tensor,
+    window_size: usize,
+    padded_hw: (usize, usize),
+    original_hw: (usize, usize),
+) -> Result<Tensor> {
+    let (padded_height, padded_width) = padded_hw;
+    let (height, width) = original_hw;
+    let num_windows_per_image = padded_height * padded_width / window_size / window_size;
+    let batch_size = windows.dim(0)? / num_windows_per_image;
+    let hidden_states = windows
+        .reshape((
+            batch_size,
+            padded_height / window_size,
+            padded_width / window_size,
+            window_size,
+            window_size,
+            windows.dim(3)?,
+        ))?
+        .permute((0, 1, 3, 2, 4, 5))?
+        .reshape((batch_size, padded_height, padded_width, windows.dim(3)?))?;
+    let hidden_states = if padded_height > height {
+        hidden_states.narrow(1, 0, height)?
+    } else {
+        hidden_states
+    };
+    let hidden_states = if padded_width > width {
+        hidden_states.narrow(2, 0, width)?
+    } else {
+        hidden_states
+    };
+    Ok(hidden_states)
+}
+
+fn load_pos_embed(config: &VisionConfig, vb: VarBuilder) -> Result<Tensor> {
+    let pretrain_grid = config.pretrain_image_size / config.patch_size;
+    let no_cls_shape = (1, pretrain_grid * pretrain_grid, config.embed_dim);
+    let with_cls_shape = (1, pretrain_grid * pretrain_grid + 1, config.embed_dim);
+    match vb.get(with_cls_shape, "pos_embed") {
+        Ok(pos_embed) => Ok(pos_embed),
+        Err(_) => vb.get(no_cls_shape, "pos_embed"),
+    }
+}
+
+fn strip_cls_position_embedding(pos_embed: &Tensor) -> Result<Tensor> {
+    let (batch_size, tokens, hidden_size) = pos_embed.dims3()?;
+    if batch_size != 1 {
+        candle::bail!("sam3 vision pos_embed expected batch dimension 1, got {batch_size}")
+    }
+    let square = (tokens as f64).sqrt() as usize;
+    if square * square == tokens {
+        return Ok(pos_embed.clone());
+    }
+    let square_without_cls = ((tokens - 1) as f64).sqrt() as usize;
+    if square_without_cls * square_without_cls == tokens - 1 {
+        return pos_embed.narrow(1, 1, tokens - 1);
+    }
+    candle::bail!(
+        "sam3 vision pos_embed length {tokens} is neither square nor square-plus-cls for hidden size {hidden_size}"
+    )
+}
+
+fn tile_position_embeddings(
+    pos_embed: &Tensor,
+    target_height: usize,
+    target_width: usize,
+) -> Result<Tensor> {
+    let pos_embed = strip_cls_position_embedding(pos_embed)?;
+    let (_, tokens, hidden_size) = pos_embed.dims3()?;
+    let pretrain_size = (tokens as f64).sqrt() as usize;
+    if pretrain_size * pretrain_size != tokens {
+        candle::bail!("sam3 vision pos_embed length {tokens} is not square after cls stripping")
+    }
+    let pos_embed = pos_embed
+        .reshape((1, pretrain_size, pretrain_size, hidden_size))?
+        .permute((0, 3, 1, 2))?;
+    let repeat_h = target_height / pretrain_size + 1;
+    let repeat_w = target_width / pretrain_size + 1;
+    let pos_embed = pos_embed.repeat((1, 1, repeat_h, repeat_w))?;
+    pos_embed
+        .narrow(2, 0, target_height)?
+        .narrow(3, 0, target_width)?
+        .permute((0, 2, 3, 1))
 }
 
 #[derive(Debug)]
 pub struct Sam3ViTDetTrunk {
     config: VisionConfig,
+    patch_embed: PatchEmbed,
+    pos_embed: Option<Tensor>,
+    blocks: Vec<Sam3VisionBlock>,
+    pre_layer_norm: Option<LayerNorm>,
 }
 
 impl Sam3ViTDetTrunk {
-    pub fn new(config: &VisionConfig, _vb: VarBuilder) -> Result<Self> {
+    pub fn new(config: &VisionConfig, vb: VarBuilder) -> Result<Self> {
+        let patch_embed = PatchEmbed::new(config, vb.pp("patch_embed"))?;
+        let pos_embed = if config.use_abs_pos {
+            Some(load_pos_embed(config, vb.clone())?)
+        } else {
+            None
+        };
+        let input_size = (
+            config.image_size / config.patch_size,
+            config.image_size / config.patch_size,
+        );
+        let pre_layer_norm = if vb.contains_tensor("layer_norm.weight") {
+            Some(candle_nn::layer_norm(
+                config.embed_dim,
+                1e-6,
+                vb.pp("layer_norm"),
+            )?)
+        } else {
+            None
+        };
+        let block_vb = vb.pp("blocks");
+        let mut blocks = Vec::with_capacity(config.depth);
+        for layer_idx in 0..config.depth {
+            let window_size = if config.global_attn_blocks.contains(&layer_idx) {
+                0
+            } else {
+                config.window_size
+            };
+            blocks.push(Sam3VisionBlock::new(
+                config,
+                window_size,
+                input_size,
+                block_vb.pp(layer_idx),
+            )?);
+        }
         Ok(Self {
             config: config.clone(),
+            patch_embed,
+            pos_embed,
+            blocks,
+            pre_layer_norm,
         })
     }
 
@@ -24,7 +440,96 @@ impl Sam3ViTDetTrunk {
         &self.config
     }
 
-    pub fn forward(&self, _images: &Tensor) -> Result<ViTDetTrunkOutput> {
-        candle::bail!("sam3 ViTDet trunk scaffold only: window/global attention, abs-pos tiling, and 2D RoPE are not implemented yet")
+    pub fn forward(&self, images: &Tensor) -> Result<ViTDetTrunkOutput> {
+        let (_, _, image_height, image_width) = images.dims4()?;
+        if image_height % self.config.patch_size != 0 || image_width % self.config.patch_size != 0 {
+            candle::bail!(
+                "sam3 vision trunk expects image sizes divisible by patch size {}, got {image_height}x{image_width}",
+                self.config.patch_size
+            )
+        }
+        let patch_height = image_height / self.config.patch_size;
+        let patch_width = image_width / self.config.patch_size;
+        let mut hidden_states = self.patch_embed.forward(images)?;
+        if let Some(pos_embed) = &self.pos_embed {
+            let pos_embed = tile_position_embeddings(pos_embed, patch_height, patch_width)?;
+            hidden_states = hidden_states.broadcast_add(&pos_embed)?;
+        }
+        if let Some(pre_layer_norm) = &self.pre_layer_norm {
+            hidden_states = pre_layer_norm.forward(&hidden_states)?;
+        }
+        for block in self.blocks.iter() {
+            hidden_states = block.forward(&hidden_states)?;
+        }
+        Ok(ViTDetTrunkOutput {
+            stage_features: vec![hidden_states],
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use candle::{DType, Device, IndexOp, Result, Tensor};
+    use candle_nn::VarBuilder;
+
+    use super::Sam3ViTDetTrunk;
+    use crate::models::sam3::VisionConfig;
+
+    fn small_config() -> VisionConfig {
+        VisionConfig {
+            image_size: 56,
+            pretrain_image_size: 28,
+            patch_size: 14,
+            embed_dim: 8,
+            depth: 0,
+            num_heads: 2,
+            mlp_ratio: 4.0,
+            window_size: 2,
+            global_attn_blocks: vec![],
+            use_abs_pos: true,
+            tile_abs_pos: true,
+            use_rope: true,
+            use_interp_rope: true,
+            rope_theta: 10_000.0,
+            retain_cls_token: false,
+            ln_pre: false,
+        }
+    }
+
+    #[test]
+    fn vitdet_trunk_tiles_position_embeddings_and_strips_cls_token() -> Result<()> {
+        let device = Device::Cpu;
+        let config = small_config();
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "patch_embed.proj.weight".to_string(),
+            Tensor::zeros((config.embed_dim, 3, 14, 14), DType::F32, &device)?,
+        );
+        let mut pos = vec![0f32; 5 * config.embed_dim];
+        for token_idx in 1..5 {
+            pos[token_idx * config.embed_dim] = token_idx as f32;
+        }
+        tensors.insert(
+            "pos_embed".to_string(),
+            Tensor::from_slice(&pos, (1, 5, config.embed_dim), &device)?,
+        );
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+        let trunk = Sam3ViTDetTrunk::new(&config, vb)?;
+        let images = Tensor::zeros((1, 3, 56, 56), DType::F32, &device)?;
+        let output = trunk.forward(&images)?;
+        let feature = output.stage_features[0].i((0, .., .., 0))?;
+        assert_eq!(output.stage_features[0].dims4()?, (1, 4, 4, 8));
+        assert_eq!(
+            feature.to_vec2::<f32>()?,
+            vec![
+                vec![1.0, 2.0, 1.0, 2.0],
+                vec![3.0, 4.0, 3.0, 4.0],
+                vec![1.0, 2.0, 1.0, 2.0],
+                vec![3.0, 4.0, 3.0, 4.0],
+            ]
+        );
+        Ok(())
     }
 }
