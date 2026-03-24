@@ -3,7 +3,7 @@ use candle_nn::VarBuilder;
 
 use super::config::GeometryConfig;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct GeometryPrompt {
     pub boxes_cxcywh: Option<Tensor>,
     pub box_labels: Option<Tensor>,
@@ -11,6 +11,17 @@ pub struct GeometryPrompt {
     pub point_labels: Option<Tensor>,
     pub masks: Option<Tensor>,
     pub mask_labels: Option<Tensor>,
+}
+
+impl GeometryPrompt {
+    pub fn is_empty(&self) -> bool {
+        self.boxes_cxcywh.is_none()
+            && self.box_labels.is_none()
+            && self.points_xy.is_none()
+            && self.point_labels.is_none()
+            && self.masks.is_none()
+            && self.mask_labels.is_none()
+    }
 }
 
 #[derive(Debug)]

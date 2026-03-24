@@ -12,6 +12,7 @@
 //! API and file layout are in place so the actual port can land
 //! incrementally without reshaping the module tree later.
 
+mod checkpoint;
 pub mod config;
 mod decoder;
 mod encoder;
@@ -22,11 +23,15 @@ mod segmentation;
 mod text;
 mod vitdet;
 
+pub use checkpoint::{
+    load_upstream_detector_var_builder, map_image_tensor_to_upstream_checkpoint_name,
+    Sam3CheckpointSource, UPSTREAM_SAM3_DETECTOR_PREFIX, UPSTREAM_SAM3_STATE_KEY,
+};
 pub use config::{
     Config, DecoderConfig, EncoderConfig, GeometryConfig, ImageConfig, NeckConfig,
     SegmentationConfig, TextConfig, VisionConfig,
 };
 pub use geometry::{EncodedPrompt, GeometryPrompt, SequenceGeometryEncoder};
-pub use image::{GroundingOutput, Sam3ImageModel, Sam3ImageState};
+pub use image::{GroundingOutput, ImageSize, Sam3ImageModel, Sam3ImageState, Sam3PromptState};
 pub use text::{Sam3TextEncoder, TextEncoding};
 pub use vitdet::{Sam3ViTDetTrunk, ViTDetTrunkOutput};
