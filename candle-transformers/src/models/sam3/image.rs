@@ -10,7 +10,7 @@ use super::encoder::Sam3FusionEncoder;
 use super::geometry::{GeometryPrompt, SequenceGeometryEncoder};
 use super::neck::Sam3DualViTDetNeck;
 use super::segmentation::UniversalSegmentationHead;
-use super::text::Sam3TextEncoder;
+use super::text::{Sam3TextEncoder, TextEncoding};
 use super::vitdet::Sam3ViTDetTrunk;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +193,14 @@ impl Sam3ImageModel {
             rank => candle::bail!("expected CHW or BCHW image tensor, got rank {rank}"),
         };
         Ok(Sam3ImageState::new(original_size, self.input_size()))
+    }
+
+    pub fn encode_text_tokens(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+    ) -> Result<TextEncoding> {
+        self.text.forward(input_ids, attention_mask)
     }
 
     pub fn ground_text(&self, state: &Sam3ImageState) -> Result<GroundingOutput> {

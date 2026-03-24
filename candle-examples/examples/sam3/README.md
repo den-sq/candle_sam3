@@ -27,3 +27,21 @@ claiming the model is already ported.
 The scaffold example accepts the upstream `sam3.pt` checkpoint and opens the
 `model` state dictionary namespace, matching the current upstream checkpoint
 layout.
+
+## Text encoder status
+
+Step 4 of the port plan is now implemented:
+
+- `sam3/text.rs` runs the CLIP-like text transformer and resize projection.
+- Tokenization stays in the example crate instead of `candle-transformers`.
+- The example accepts `--tokenizer <tokenizer.json>` and pads/truncates to the
+  SAM3 text context length before running the encoder.
+
+Example:
+
+```bash
+cargo run -p candle-examples --example sam3 -- \
+  --checkpoint /path/to/sam3.pt \
+  --tokenizer /path/to/tokenizer.json \
+  --prompt "a white sneaker"
+```
