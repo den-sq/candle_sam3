@@ -45,7 +45,14 @@ pub fn load_upstream_detector_var_builder<P: AsRef<Path>>(
     dtype: DType,
     device: &Device,
 ) -> Result<VarBuilder<'static>> {
-    let vb = VarBuilder::from_pth_with_state(path, dtype, UPSTREAM_SAM3_STATE_KEY, device)?;
+    let path = path.as_ref();
+    let vb = match VarBuilder::from_pth_with_state(path, dtype, UPSTREAM_SAM3_STATE_KEY, device) {
+        Ok(vb) => vb,
+        Err(err) if should_fallback_to_direct_state_dict(&err) => {
+            VarBuilder::from_pth(path, dtype, device)?
+        }
+        Err(err) => return Err(err),
+    };
     Ok(vb.rename_f(map_image_tensor_to_upstream_checkpoint_name))
 }
 
@@ -57,9 +64,16 @@ pub fn map_image_tensor_to_upstream_checkpoint_name(name: &str) -> String {
     }
 }
 
+fn should_fallback_to_direct_state_dict(err: &candle::Error) -> bool {
+    err.to_string()
+        .contains(&format!("key {UPSTREAM_SAM3_STATE_KEY} not found"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::map_image_tensor_to_upstream_checkpoint_name;
+    use super::{
+        map_image_tensor_to_upstream_checkpoint_name, should_fallback_to_direct_state_dict,
+    };
 
     #[test]
     fn adds_detector_prefix_for_image_model_names() {
@@ -77,5 +91,11 @@ mod tests {
             ),
             "detector.transformer.decoder.query_embed"
         );
+    }
+
+    #[test]
+    fn falls_back_when_checkpoint_is_not_wrapped_in_model_key() {
+        let err = candle::Error::msg("key model not found");
+        assert!(should_fallback_to_direct_state_dict(&err));
     }
 }

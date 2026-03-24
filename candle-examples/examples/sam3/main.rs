@@ -38,8 +38,23 @@ struct Args {
 
 const CLIP_EOT_TOKEN: &str = "<|endoftext|>";
 
+fn resolve_repo_file(path: &str, expected_file: &str) -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(path);
+    if path.is_dir() {
+        path.join(expected_file)
+    } else {
+        path
+    }
+}
+
 fn get_tokenizer(tokenizer: &str, context_length: usize) -> Result<Tokenizer> {
-    let mut tokenizer = Tokenizer::from_file(tokenizer).map_err(E::msg)?;
+    let tokenizer_path = resolve_repo_file(tokenizer, "tokenizer.json");
+    let mut tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|err| {
+        E::msg(format!(
+            "failed to load tokenizer from {}: {err}",
+            tokenizer_path.display()
+        ))
+    })?;
     let pad_id = *tokenizer
         .get_vocab(true)
         .get(CLIP_EOT_TOKEN)
@@ -107,7 +122,7 @@ pub fn main() -> anyhow::Result<()> {
     let checkpoint_source = args
         .checkpoint
         .as_ref()
-        .map(|path| sam3::Sam3CheckpointSource::upstream_pth(path));
+        .map(|path| sam3::Sam3CheckpointSource::upstream_pth(resolve_repo_file(path, "sam3.pt")));
 
     println!("sam3 scaffold example");
     println!("device: {device:?}");
@@ -127,10 +142,7 @@ pub fn main() -> anyhow::Result<()> {
     let model = if let Some(checkpoint) = checkpoint_source.as_ref() {
         let model =
             sam3::Sam3ImageModel::from_checkpoint_source(&config, checkpoint, DType::F32, &device)?;
-        println!(
-            "checkpoint opened with state key `{}` and image-model namespace remap",
-            sam3::UPSTREAM_SAM3_STATE_KEY
-        );
+        println!("checkpoint opened and image-model namespace remap applied");
         Some(model)
     } else {
         None

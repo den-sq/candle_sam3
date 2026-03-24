@@ -127,7 +127,7 @@ impl Sam3ImageModel {
             Sam3ViTDetTrunk::new(&config.vision, vb.pp("backbone").pp("vision_trunk"))?;
         let vision_neck =
             Sam3DualViTDetNeck::new(&config.neck, vb.pp("backbone").pp("vision_neck"))?;
-        let text = Sam3TextEncoder::new(&config.text, vb.pp("backbone").pp("text_encoder"))?;
+        let text = Sam3TextEncoder::new(&config.text, vb.pp("backbone").pp("language_backbone"))?;
         let geometry =
             SequenceGeometryEncoder::new(&config.geometry, vb.pp("input_geometry_encoder"))?;
         let encoder = Sam3FusionEncoder::new(&config.encoder, vb.pp("transformer").pp("encoder"))?;
