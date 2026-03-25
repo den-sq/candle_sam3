@@ -9,7 +9,7 @@ use super::decoder::{DecoderOutput, Sam3TransformerDecoder};
 use super::encoder::{FusionEncoderOutput, Sam3FusionEncoder};
 use super::geometry::{EncodedPrompt, GeometryPrompt, SequenceGeometryEncoder};
 use super::neck::{Sam3DualViTDetNeck, VisualBackboneOutput};
-use super::segmentation::UniversalSegmentationHead;
+use super::segmentation::{SegmentationOutput, UniversalSegmentationHead};
 use super::text::{Sam3TextEncoder, TextEncoding};
 use super::vitdet::Sam3ViTDetTrunk;
 
@@ -281,6 +281,36 @@ impl Sam3ImageModel {
         }
     }
 
+    pub fn segment_grounding(
+        &self,
+        visual_features: &VisualBackboneOutput,
+        decoder_out: &DecoderOutput,
+        encoder_out: &FusionEncoderOutput,
+        prompt: &EncodedPrompt,
+    ) -> Result<SegmentationOutput> {
+        let segmentation = self.segmentation.as_ref().ok_or_else(|| {
+            candle::Error::Msg("sam3 segmentation head is disabled in this config".to_owned())
+        })?;
+        segmentation.forward(
+            &visual_features.backbone_fpn,
+            decoder_out,
+            &encoder_out.memory,
+            Some(&prompt.features),
+            Some(&prompt.padding_mask),
+        )
+    }
+
+    pub fn segment_text_grounding(
+        &self,
+        visual_features: &VisualBackboneOutput,
+        decoder_out: &DecoderOutput,
+        encoder_out: &FusionEncoderOutput,
+        text: &TextEncoding,
+    ) -> Result<SegmentationOutput> {
+        let prompt = encoded_prompt_from_text(text);
+        self.segment_grounding(visual_features, decoder_out, encoder_out, &prompt)
+    }
+
     pub fn ground_text(&self, state: &Sam3ImageState) -> Result<GroundingOutput> {
         let Some(_prompt) = state.text_prompt() else {
             candle::bail!("sam3 image state has no text prompt; call `with_text_prompt` first")
@@ -405,6 +435,32 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn image_model_can_run_text_segmentation_stage() -> Result<()> {
+        let dev = Device::Cpu;
+        let config = tiny_segmentation_config();
+        let model = Sam3ImageModel::new(&config, VarBuilder::zeros(candle::DType::F32, &dev))?;
+        let image = Tensor::zeros(
+            (1, 3, config.image.image_size, config.image.image_size),
+            candle::DType::F32,
+            &dev,
+        )?;
+        let input_ids = Tensor::new(&[[1u32, 2, 3, 0]], &dev)?;
+        let attention_mask = Tensor::new(&[[1u8, 1, 1, 0]], &dev)?;
+        let text = model.encode_text_tokens(&input_ids, &attention_mask)?;
+        let visual = model.encode_image_features(&image)?;
+        let fused = model.encode_fused_text(&visual, &text)?;
+        let decoder = model.decode_text_grounding(&fused, &text)?;
+        let segmentation = model.segment_text_grounding(&visual, &decoder, &fused, &text)?;
+
+        assert_eq!(
+            segmentation.mask_logits.dims4()?,
+            (1, config.decoder.num_queries, 16, 16)
+        );
+        assert_eq!(segmentation.semantic_logits.dims4()?, (1, 1, 16, 16));
+        Ok(())
+    }
+
     fn tiny_config() -> Config {
         Config {
             image: ImageConfig {
@@ -479,6 +535,86 @@ mod tests {
                 enabled: false,
                 hidden_dim: 4,
                 upsampling_stages: 1,
+                aux_masks: false,
+                presence_head: false,
+            },
+        }
+    }
+
+    fn tiny_segmentation_config() -> Config {
+        Config {
+            image: ImageConfig {
+                image_size: 56,
+                image_mean: [0.5, 0.5, 0.5],
+                image_std: [0.5, 0.5, 0.5],
+            },
+            vision: VisionConfig {
+                image_size: 56,
+                pretrain_image_size: 28,
+                patch_size: 14,
+                embed_dim: 32,
+                depth: 0,
+                num_heads: 4,
+                mlp_ratio: 4.0,
+                window_size: 2,
+                global_attn_blocks: vec![],
+                use_abs_pos: true,
+                tile_abs_pos: true,
+                use_rope: true,
+                use_interp_rope: true,
+                rope_theta: 10_000.0,
+                retain_cls_token: false,
+                ln_pre: false,
+            },
+            text: TextConfig {
+                d_model: 8,
+                width: 16,
+                heads: 2,
+                layers: 1,
+                context_length: 4,
+                vocab_size: 16,
+            },
+            neck: NeckConfig {
+                d_model: 8,
+                scale_factors: [4.0, 2.0, 1.0, 0.5],
+                scalp: 1,
+                add_sam2_neck: false,
+            },
+            geometry: GeometryConfig {
+                d_model: 8,
+                num_layers: 1,
+                num_heads: 1,
+                dim_feedforward: 16,
+                roi_size: 2,
+                add_cls: true,
+                add_post_encode_proj: true,
+            },
+            encoder: EncoderConfig {
+                d_model: 8,
+                num_layers: 1,
+                num_feature_levels: 1,
+                num_heads: 1,
+                dim_feedforward: 16,
+                add_pooled_text_to_image: false,
+                pool_text_with_mask: true,
+            },
+            decoder: DecoderConfig {
+                d_model: 8,
+                num_layers: 1,
+                num_queries: 2,
+                num_heads: 1,
+                dim_feedforward: 16,
+                presence_token: true,
+                use_text_cross_attention: true,
+                box_rpb_mode: "none".to_owned(),
+                box_rpb_resolution: 56,
+                box_rpb_stride: 14,
+                clamp_presence_logit_max: 10.0,
+            },
+            segmentation: SegmentationConfig {
+                enabled: true,
+                hidden_dim: 8,
+                upsampling_stages: 3,
                 aux_masks: false,
                 presence_head: false,
             },

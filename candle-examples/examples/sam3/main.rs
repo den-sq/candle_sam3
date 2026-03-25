@@ -371,6 +371,21 @@ fn run_vision_and_geometry(
         if let Some(presence_logits) = &decoder.presence_logits {
             println!("  presence logits shape: {:?}", presence_logits.dims());
         }
+
+        let segmentation =
+            model.segment_text_grounding(&visual, &decoder, &fused, text_encoding)?;
+        println!("segmentation stage:");
+        println!("  mask logits shape: {:?}", segmentation.mask_logits.dims());
+        println!(
+            "  semantic logits shape: {:?}",
+            segmentation.semantic_logits.dims()
+        );
+        if let Some(presence_logits) = &segmentation.presence_logits {
+            println!(
+                "  segmentation presence logits shape: {:?}",
+                presence_logits.dims()
+            );
+        }
     }
 
     Ok(())
