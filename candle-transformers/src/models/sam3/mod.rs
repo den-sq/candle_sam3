@@ -31,6 +31,8 @@ pub use config::{
     Config, DecoderConfig, EncoderConfig, GeometryConfig, ImageConfig, NeckConfig,
     SegmentationConfig, TextConfig, VisionConfig,
 };
+pub use decoder::{DecoderOutput, Sam3TransformerDecoder};
+pub use encoder::{FusionEncoderOutput, Sam3FusionEncoder};
 pub use geometry::{EncodedPrompt, GeometryPrompt, SequenceGeometryEncoder};
 pub use image::{GroundingOutput, ImageSize, Sam3ImageModel, Sam3ImageState, Sam3PromptState};
 pub use neck::VisualBackboneOutput;

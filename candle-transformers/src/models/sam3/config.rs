@@ -158,8 +158,10 @@ impl Default for GeometryConfig {
 pub struct EncoderConfig {
     pub d_model: usize,
     pub num_layers: usize,
+    pub num_feature_levels: usize,
     pub num_heads: usize,
     pub dim_feedforward: usize,
+    pub add_pooled_text_to_image: bool,
     pub pool_text_with_mask: bool,
 }
 
@@ -168,8 +170,10 @@ impl Default for EncoderConfig {
         Self {
             d_model: 256,
             num_layers: 6,
+            num_feature_levels: 1,
             num_heads: 8,
             dim_feedforward: 2048,
+            add_pooled_text_to_image: false,
             pool_text_with_mask: true,
         }
     }
@@ -184,6 +188,10 @@ pub struct DecoderConfig {
     pub dim_feedforward: usize,
     pub presence_token: bool,
     pub use_text_cross_attention: bool,
+    pub box_rpb_mode: String,
+    pub box_rpb_resolution: usize,
+    pub box_rpb_stride: usize,
+    pub clamp_presence_logit_max: f64,
 }
 
 impl Default for DecoderConfig {
@@ -196,6 +204,10 @@ impl Default for DecoderConfig {
             dim_feedforward: 2048,
             presence_token: true,
             use_text_cross_attention: true,
+            box_rpb_mode: "log".to_owned(),
+            box_rpb_resolution: 1008,
+            box_rpb_stride: 14,
+            clamp_presence_logit_max: 10.0,
         }
     }
 }

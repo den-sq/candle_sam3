@@ -5,8 +5,8 @@ use candle_nn::VarBuilder;
 
 use super::checkpoint::Sam3CheckpointSource;
 use super::config::Config;
-use super::decoder::Sam3TransformerDecoder;
-use super::encoder::Sam3FusionEncoder;
+use super::decoder::{DecoderOutput, Sam3TransformerDecoder};
+use super::encoder::{FusionEncoderOutput, Sam3FusionEncoder};
 use super::geometry::{EncodedPrompt, GeometryPrompt, SequenceGeometryEncoder};
 use super::neck::{Sam3DualViTDetNeck, VisualBackboneOutput};
 use super::segmentation::UniversalSegmentationHead;
@@ -132,8 +132,11 @@ impl Sam3ImageModel {
         let text = Sam3TextEncoder::new(&config.text, vb.pp("backbone").pp("language_backbone"))?;
         let geometry = SequenceGeometryEncoder::new(&config.geometry, vb.pp("geometry_encoder"))?;
         let encoder = Sam3FusionEncoder::new(&config.encoder, vb.pp("transformer").pp("encoder"))?;
-        let decoder =
-            Sam3TransformerDecoder::new(&config.decoder, vb.pp("transformer").pp("decoder"))?;
+        let decoder = Sam3TransformerDecoder::new(
+            &config.decoder,
+            vb.pp("transformer").pp("decoder"),
+            vb.pp("dot_prod_scoring"),
+        )?;
         let segmentation = if config.segmentation.enabled {
             Some(UniversalSegmentationHead::new(
                 &config.segmentation,
@@ -226,6 +229,58 @@ impl Sam3ImageModel {
         )
     }
 
+    pub fn encode_fused_prompt(
+        &self,
+        visual_features: &VisualBackboneOutput,
+        prompt: &EncodedPrompt,
+    ) -> Result<FusionEncoderOutput> {
+        self.encoder.forward(
+            &visual_features.backbone_fpn,
+            &visual_features.vision_pos_enc,
+            prompt,
+        )
+    }
+
+    pub fn encode_fused_text(
+        &self,
+        visual_features: &VisualBackboneOutput,
+        text: &TextEncoding,
+    ) -> Result<FusionEncoderOutput> {
+        self.encode_fused_prompt(visual_features, &encoded_prompt_from_text(text))
+    }
+
+    pub fn decode_grounding(
+        &self,
+        encoder_out: &FusionEncoderOutput,
+        prompt: &EncodedPrompt,
+    ) -> Result<DecoderOutput> {
+        self.decoder
+            .forward(encoder_out, &prompt.features, &prompt.padding_mask)
+    }
+
+    pub fn decode_text_grounding(
+        &self,
+        encoder_out: &FusionEncoderOutput,
+        text: &TextEncoding,
+    ) -> Result<DecoderOutput> {
+        let prompt = encoded_prompt_from_text(text);
+        self.decode_grounding(encoder_out, &prompt)
+    }
+
+    pub fn text_detection_scores(&self, decoder_out: &DecoderOutput) -> Result<Tensor> {
+        let class_scores = decoder_out.pred_logits.apply(&candle_nn::ops::sigmoid)?;
+        match &decoder_out.presence_logits {
+            Some(presence_logits) => {
+                let batch_size = presence_logits.dim(0)?;
+                let presence_scores = presence_logits
+                    .apply(&candle_nn::ops::sigmoid)?
+                    .reshape((batch_size, 1, 1))?;
+                class_scores.broadcast_mul(&presence_scores)
+            }
+            None => Ok(class_scores),
+        }
+    }
+
     pub fn ground_text(&self, state: &Sam3ImageState) -> Result<GroundingOutput> {
         let Some(_prompt) = state.text_prompt() else {
             candle::bail!("sam3 image state has no text prompt; call `with_text_prompt` first")
@@ -272,10 +327,24 @@ impl Sam3ImageModel {
     }
 }
 
+fn encoded_prompt_from_text(text: &TextEncoding) -> EncodedPrompt {
+    EncodedPrompt {
+        features: text.memory.clone(),
+        padding_mask: text.attention_mask.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{GroundingOutput, ImageSize, Sam3ImageState};
     use candle::{Device, Result, Tensor};
+    use candle_nn::VarBuilder;
+
+    use crate::models::sam3::Sam3ImageModel;
+    use crate::models::sam3::{
+        Config, DecoderConfig, EncoderConfig, GeometryConfig, ImageConfig, NeckConfig,
+        SegmentationConfig, TextConfig, VisionConfig,
+    };
 
     #[test]
     fn image_state_tracks_prompt_state() {
@@ -302,5 +371,117 @@ mod tests {
             .with_last_output(output);
         assert!(state.last_output.is_some());
         Ok(())
+    }
+
+    #[test]
+    fn image_model_can_run_text_fusion_and_decoder_stages() -> Result<()> {
+        let dev = Device::Cpu;
+        let config = tiny_config();
+        let model = Sam3ImageModel::new(&config, VarBuilder::zeros(candle::DType::F32, &dev))?;
+        let image = Tensor::zeros(
+            (1, 3, config.image.image_size, config.image.image_size),
+            candle::DType::F32,
+            &dev,
+        )?;
+        let input_ids = Tensor::new(&[[1u32, 2, 3, 0]], &dev)?;
+        let attention_mask = Tensor::new(&[[1u8, 1, 1, 0]], &dev)?;
+        let text = model.encode_text_tokens(&input_ids, &attention_mask)?;
+        let visual = model.encode_image_features(&image)?;
+        let fused = model.encode_fused_text(&visual, &text)?;
+        let decoder = model.decode_text_grounding(&fused, &text)?;
+        let scores = model.text_detection_scores(&decoder)?;
+
+        assert_eq!(visual.backbone_fpn.len(), 1);
+        assert_eq!(fused.memory.dims3()?, (16, 1, config.encoder.d_model));
+        assert_eq!(
+            decoder.queries.dims3()?,
+            (1, config.decoder.num_queries, config.decoder.d_model)
+        );
+        assert_eq!(
+            decoder.pred_logits.dims3()?,
+            (1, config.decoder.num_queries, 1)
+        );
+        assert_eq!(scores.dims3()?, (1, config.decoder.num_queries, 1));
+        Ok(())
+    }
+
+    fn tiny_config() -> Config {
+        Config {
+            image: ImageConfig {
+                image_size: 56,
+                image_mean: [0.5, 0.5, 0.5],
+                image_std: [0.5, 0.5, 0.5],
+            },
+            vision: VisionConfig {
+                image_size: 56,
+                pretrain_image_size: 28,
+                patch_size: 14,
+                embed_dim: 16,
+                depth: 0,
+                num_heads: 2,
+                mlp_ratio: 4.0,
+                window_size: 2,
+                global_attn_blocks: vec![],
+                use_abs_pos: true,
+                tile_abs_pos: true,
+                use_rope: true,
+                use_interp_rope: true,
+                rope_theta: 10_000.0,
+                retain_cls_token: false,
+                ln_pre: false,
+            },
+            text: TextConfig {
+                d_model: 4,
+                width: 8,
+                heads: 2,
+                layers: 1,
+                context_length: 4,
+                vocab_size: 16,
+            },
+            neck: NeckConfig {
+                d_model: 4,
+                scale_factors: [1.0, 0.5, 0.5, 0.5],
+                scalp: 3,
+                add_sam2_neck: false,
+            },
+            geometry: GeometryConfig {
+                d_model: 4,
+                num_layers: 1,
+                num_heads: 1,
+                dim_feedforward: 8,
+                roi_size: 2,
+                add_cls: true,
+                add_post_encode_proj: true,
+            },
+            encoder: EncoderConfig {
+                d_model: 4,
+                num_layers: 1,
+                num_feature_levels: 1,
+                num_heads: 1,
+                dim_feedforward: 8,
+                add_pooled_text_to_image: false,
+                pool_text_with_mask: true,
+            },
+            decoder: DecoderConfig {
+                d_model: 4,
+                num_layers: 1,
+                num_queries: 2,
+                num_heads: 1,
+                dim_feedforward: 8,
+                presence_token: true,
+                use_text_cross_attention: true,
+                box_rpb_mode: "none".to_owned(),
+                box_rpb_resolution: 56,
+                box_rpb_stride: 14,
+                clamp_presence_logit_max: 10.0,
+            },
+            segmentation: SegmentationConfig {
+                enabled: false,
+                hidden_dim: 4,
+                upsampling_stages: 1,
+                aux_masks: false,
+                presence_head: false,
+            },
+        }
     }
 }

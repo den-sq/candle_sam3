@@ -252,7 +252,7 @@ fn run_text_encoder(
     tokenizer_path: &str,
     context_length: usize,
     device: &Device,
-) -> Result<()> {
+) -> Result<sam3::TextEncoding> {
     let tokenizer = get_tokenizer(tokenizer_path, context_length)?;
     let (input_ids, attention_mask) = tokenize_prompt(prompt, &tokenizer, device)?;
     let encoding = model.encode_text_tokens(&input_ids, &attention_mask)?;
@@ -266,7 +266,7 @@ fn run_text_encoder(
         encoding.input_embeddings.dims()
     );
     println!("  resized memory shape: {:?}", encoding.memory.dims());
-    Ok(())
+    Ok(encoding)
 }
 
 fn run_vision_and_geometry(
@@ -274,6 +274,7 @@ fn run_vision_and_geometry(
     image_path: &str,
     smoke_image_size: Option<usize>,
     text_prompt: Option<&str>,
+    text_encoding: Option<&sam3::TextEncoding>,
     geometry_prompt: Option<&sam3::GeometryPrompt>,
     device: &Device,
 ) -> Result<()> {
@@ -340,6 +341,38 @@ fn run_vision_and_geometry(
         );
     }
 
+    if let Some(text_encoding) = text_encoding {
+        let fused = model.encode_fused_text(&visual, text_encoding)?;
+        println!("fusion stage:");
+        println!("  memory shape: {:?}", fused.memory.dims());
+        println!("  pos embed shape: {:?}", fused.pos_embed.dims());
+        println!("  padding mask shape: {:?}", fused.padding_mask.dims());
+        println!(
+            "  spatial shapes: {:?}",
+            fused.spatial_shapes.to_vec2::<u32>()?
+        );
+        println!(
+            "  level start index: {:?}",
+            fused.level_start_index.to_vec1::<u32>()?
+        );
+        println!("  valid ratios shape: {:?}", fused.valid_ratios.dims());
+
+        let decoder = model.decode_text_grounding(&fused, text_encoding)?;
+        let scores = model.text_detection_scores(&decoder)?;
+        println!("decoder stage:");
+        println!("  queries shape: {:?}", decoder.queries.dims());
+        println!("  pred logits shape: {:?}", decoder.pred_logits.dims());
+        println!("  pred boxes shape: {:?}", decoder.pred_boxes.dims());
+        println!(
+            "  pred boxes xyxy shape: {:?}",
+            decoder.pred_boxes_xyxy.dims()
+        );
+        println!("  text detection scores shape: {:?}", scores.dims());
+        if let Some(presence_logits) = &decoder.presence_logits {
+            println!("  presence logits shape: {:?}", presence_logits.dims());
+        }
+    }
+
     Ok(())
 }
 
@@ -390,11 +423,11 @@ pub fn main() -> anyhow::Result<()> {
 
     let geometry_prompt = build_geometry_prompt(&args, &device)?;
 
-    if let Some(prompt) = args.prompt.as_deref() {
+    let text_encoding = if let Some(prompt) = args.prompt.as_deref() {
         let tokenizer = args.tokenizer.as_deref().ok_or_else(|| {
             E::msg("encoding a SAM3 text prompt requires `--tokenizer <tokenizer.json>`")
         })?;
-        run_text_encoder(
+        Some(run_text_encoder(
             model
                 .as_ref()
                 .context("SAM3 text stage requires `--checkpoint <sam3.pt>`")?,
@@ -402,8 +435,10 @@ pub fn main() -> anyhow::Result<()> {
             tokenizer,
             config.text.context_length,
             &device,
-        )?;
-    }
+        )?)
+    } else {
+        None
+    };
 
     if let Some(image_path) = args.image.as_deref() {
         run_vision_and_geometry(
@@ -413,6 +448,7 @@ pub fn main() -> anyhow::Result<()> {
             image_path,
             args.smoke_image_size,
             args.prompt.as_deref(),
+            text_encoding.as_ref(),
             geometry_prompt.as_ref(),
             &device,
         )?;
