@@ -7,8 +7,13 @@ extern crate accelerate_src;
 use anyhow::{bail, Context, Error as E, Result};
 use clap::Parser;
 
-use candle::{DType, Device, Tensor};
+use candle::{DType, Device, IndexOp, Tensor};
 use candle_transformers::models::sam3;
+use image::{GrayImage, Luma, Rgba, RgbaImage};
+use imageproc::drawing::draw_hollow_rect_mut;
+use imageproc::rect::Rect;
+use serde_json::json;
+use std::path::{Path, PathBuf};
 use tokenizers::{PaddingDirection, PaddingParams, Tokenizer, TruncationParams};
 
 #[derive(Parser, Debug)]
@@ -28,6 +33,10 @@ struct Args {
     /// Optional square resize used by the example smoke path before vision encoding.
     #[arg(long)]
     smoke_image_size: Option<usize>,
+
+    /// Directory used for rendered overlay, mask, and summary outputs.
+    #[arg(long, default_value = "candle-examples/examples/sam3/output")]
+    output_dir: String,
 
     /// Optional text prompt for the text-encoder smoke test.
     #[arg(long)]
@@ -106,7 +115,7 @@ fn parse_floats(value: &str, expected: usize) -> std::result::Result<Vec<f32>, S
 }
 
 fn resolve_repo_file(path: &str, expected_file: &str) -> std::path::PathBuf {
-    let path = std::path::PathBuf::from(path);
+    let path = PathBuf::from(path);
     if path.is_dir() {
         path.join(expected_file)
     } else {
@@ -173,6 +182,146 @@ fn preprocess_image_for_sam3(
         .broadcast_div(&std)?
         .unsqueeze(0)?;
     Ok(image)
+}
+
+fn load_render_image(image_path: &str, image_size: usize) -> Result<RgbaImage> {
+    Ok(image::ImageReader::open(image_path)?
+        .decode()
+        .map_err(E::msg)?
+        .resize_to_fill(
+            image_size as u32,
+            image_size as u32,
+            image::imageops::FilterType::Triangle,
+        )
+        .to_rgba8())
+}
+
+fn best_query(scores: &Tensor) -> Result<(usize, f32)> {
+    let scores = scores.to_vec3::<f32>()?;
+    let mut best_idx = 0usize;
+    let mut best_score = f32::NEG_INFINITY;
+    for (idx, score) in scores[0].iter().enumerate() {
+        if score[0] > best_score {
+            best_idx = idx;
+            best_score = score[0];
+        }
+    }
+    Ok((best_idx, best_score))
+}
+
+fn normalized_box_to_rect(box_xyxy: [f32; 4], image_size: usize) -> Rect {
+    let scale = (image_size.saturating_sub(1)) as f32;
+    let x0 = (box_xyxy[0].clamp(0.0, 1.0) * scale).round() as i32;
+    let y0 = (box_xyxy[1].clamp(0.0, 1.0) * scale).round() as i32;
+    let x1 = (box_xyxy[2].clamp(0.0, 1.0) * scale).round() as i32;
+    let y1 = (box_xyxy[3].clamp(0.0, 1.0) * scale).round() as i32;
+    let min_x = x0.min(x1);
+    let min_y = y0.min(y1);
+    let width = (x1.max(x0) - min_x).max(1) as u32;
+    let height = (y1.max(y0) - min_y).max(1) as u32;
+    Rect::at(min_x, min_y).of_size(width, height)
+}
+
+fn cxcywh_to_xyxy(bbox: &BoxArg) -> [f32; 4] {
+    [
+        bbox.cx - bbox.w * 0.5,
+        bbox.cy - bbox.h * 0.5,
+        bbox.cx + bbox.w * 0.5,
+        bbox.cy + bbox.h * 0.5,
+    ]
+}
+
+fn blend_mask(image: &mut RgbaImage, mask_probs: &[Vec<f32>], color: [u8; 3]) -> Result<GrayImage> {
+    let height = mask_probs.len();
+    let width = mask_probs.first().map(|row| row.len()).unwrap_or(0);
+    let mut mask = GrayImage::new(width as u32, height as u32);
+    for (y, row) in mask_probs.iter().enumerate() {
+        for (x, prob) in row.iter().enumerate() {
+            let prob = prob.clamp(0.0, 1.0);
+            let mask_value = (prob * 255.0).round() as u8;
+            mask.put_pixel(x as u32, y as u32, Luma([mask_value]));
+            if prob >= 0.5 {
+                let pixel = image.get_pixel_mut(x as u32, y as u32);
+                let alpha = 0.35f32;
+                pixel[0] = ((1.0 - alpha) * pixel[0] as f32 + alpha * color[0] as f32) as u8;
+                pixel[1] = ((1.0 - alpha) * pixel[1] as f32 + alpha * color[1] as f32) as u8;
+                pixel[2] = ((1.0 - alpha) * pixel[2] as f32 + alpha * color[2] as f32) as u8;
+                pixel[3] = 255;
+            }
+        }
+    }
+    Ok(mask)
+}
+
+fn save_render_outputs(
+    image_path: &str,
+    image_size: usize,
+    output_dir: &Path,
+    prompt: &str,
+    decoder: &sam3::DecoderOutput,
+    segmentation: &sam3::SegmentationOutput,
+    scores: &Tensor,
+    input_boxes: &[BoxArg],
+) -> Result<()> {
+    std::fs::create_dir_all(output_dir)?;
+    let mut overlay = load_render_image(image_path, image_size)?;
+    for bbox in input_boxes {
+        draw_hollow_rect_mut(
+            &mut overlay,
+            normalized_box_to_rect(cxcywh_to_xyxy(bbox), image_size),
+            Rgba([66, 135, 245, 255]),
+        );
+    }
+
+    let (best_idx, best_score) = best_query(scores)?;
+    let pred_boxes = decoder.pred_boxes_xyxy.to_vec3::<f32>()?;
+    let best_box = pred_boxes[0][best_idx].clone();
+    draw_hollow_rect_mut(
+        &mut overlay,
+        normalized_box_to_rect(
+            [best_box[0], best_box[1], best_box[2], best_box[3]],
+            image_size,
+        ),
+        Rgba([56, 201, 84, 255]),
+    );
+
+    let best_mask_logits = segmentation
+        .mask_logits
+        .i((0, best_idx))?
+        .unsqueeze(0)?
+        .unsqueeze(0)?
+        .upsample_bilinear2d(image_size, image_size, false)?
+        .i((0, 0))?;
+    let best_mask_probs = candle_nn::ops::sigmoid(&best_mask_logits)?;
+    let best_mask_probs = best_mask_probs.to_vec2::<f32>()?;
+    let mask = blend_mask(&mut overlay, &best_mask_probs, [56, 201, 84])?;
+
+    let overlay_path = output_dir.join("overlay.png");
+    let mask_path = output_dir.join("mask.png");
+    overlay.save(&overlay_path)?;
+    mask.save(&mask_path)?;
+
+    let summary = json!({
+        "prompt": prompt,
+        "render_image_size": image_size,
+        "best_query_index": best_idx,
+        "best_score": best_score,
+        "best_box_xyxy_normalized": best_box,
+        "input_boxes_cxcywh_normalized": input_boxes.iter().map(|bbox| vec![bbox.cx, bbox.cy, bbox.w, bbox.h]).collect::<Vec<_>>(),
+        "overlay_path": overlay_path.display().to_string(),
+        "mask_path": mask_path.display().to_string(),
+    });
+    let summary_path = output_dir.join("summary.json");
+    std::fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)?;
+
+    println!("rendered outputs:");
+    println!("  best query index: {best_idx}");
+    println!("  best score: {best_score:.4}");
+    println!("  best box xyxy (normalized): {:?}", best_box);
+    println!("  overlay: {}", overlay_path.display());
+    println!("  mask: {}", mask_path.display());
+    println!("  summary: {}", summary_path.display());
+    Ok(())
 }
 
 fn build_geometry_prompt(args: &Args, device: &Device) -> Result<Option<sam3::GeometryPrompt>> {
@@ -273,9 +422,11 @@ fn run_vision_and_geometry(
     model: &sam3::Sam3ImageModel,
     image_path: &str,
     smoke_image_size: Option<usize>,
+    output_dir: &Path,
     text_prompt: Option<&str>,
     text_encoding: Option<&sam3::TextEncoding>,
     geometry_prompt: Option<&sam3::GeometryPrompt>,
+    input_boxes: &[BoxArg],
     device: &Device,
 ) -> Result<()> {
     let config = model.config();
@@ -386,6 +537,19 @@ fn run_vision_and_geometry(
                 presence_logits.dims()
             );
         }
+
+        if let Some(text_prompt) = text_prompt {
+            save_render_outputs(
+                image_path,
+                image_size,
+                output_dir,
+                text_prompt,
+                &decoder,
+                &segmentation,
+                &scores,
+                input_boxes,
+            )?;
+        }
     }
 
     Ok(())
@@ -462,9 +626,11 @@ pub fn main() -> anyhow::Result<()> {
                 .context("SAM3 vision stage requires `--checkpoint <sam3.pt>`")?,
             image_path,
             args.smoke_image_size,
+            Path::new(&args.output_dir),
             args.prompt.as_deref(),
             text_encoding.as_ref(),
             geometry_prompt.as_ref(),
+            &args.boxes,
             &device,
         )?;
     }

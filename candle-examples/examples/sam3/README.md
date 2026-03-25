@@ -1,113 +1,105 @@
 # SAM 3 Example
 
-This example is a smoke harness for the SAM 3 stages that are implemented so
-far. It does not claim end-to-end grounding works yet, but it can exercise the
-checkpoint loader, typed image state, text encoder, vision trunk, FPN neck, and
-geometry encoder.
+This example now runs the implemented SAM3 image pipeline end to end:
 
-## Intended module split
+1. load `sam3.pt`
+2. resize the image to `1008x1008` by default
+3. normalize with mean/std `0.5`
+4. call `set_image`
+5. call `set_text_prompt` through the typed image state
+6. tokenize and encode the text prompt
+7. run the ViTDet trunk, FPN neck, fusion encoder, DETR decoder, and segmentation head
+8. render the best predicted box and mask to disk
 
-- `sam3/config.rs`: upstream-shaped defaults and staging knobs
+The rendered outputs are:
+
+- `overlay.png`: resized square input with the predicted mask overlay and predicted box
+- `mask.png`: grayscale mask confidence image for the selected query, bilinearly upsampled to the render image size
+- `summary.json`: prompt, score, normalized box, and output paths
+
+If `--box` prompts are provided, they are:
+
+- stored in the typed state
+- encoded by the geometry encoder smoke path
+- drawn in blue on `overlay.png`
+
+The predicted box is drawn in green.
+
+## Relevant modules
+
 - `sam3/text.rs`: CLIP-like text encoder + resize projection
-- `sam3/vitdet.rs`: ViTDet-style visual trunk
-- `sam3/neck.rs`: simple-FPN neck and SAM2 side-neck hook
-- `sam3/geometry.rs`: box/point/mask prompt encoding
+- `sam3/vitdet.rs`: ViTDet visual trunk
+- `sam3/neck.rs`: FPN projection and position encodings
 - `sam3/encoder.rs`: visual-language fusion encoder
-- `sam3/decoder.rs`: DETR-style decoder with presence token
-- `sam3/segmentation.rs`: MaskFormer-like mask head
-- `sam3/image.rs`: typed image-facing API for `set_image` and grounding
+- `sam3/decoder.rs`: DETR-style decoder with presence-token scoring
+- `sam3/segmentation.rs`: MaskFormer-style segmentation head
+- `sam3/image.rs`: typed image API used by the example
 
-## Expected implementation order
-
-1. Image-only grounding parity against upstream SAM 3 detector.
-2. Checkpoint namespace mapping from `sam3.pt` into Candle `VarBuilder`.
-3. Interactive image refinement using the SAM-style path.
-4. Video detector/tracker integration.
-
-## Checkpoint note
+## Checkpoint and tokenizer paths
 
 The example accepts either:
 
 - a direct path to `sam3.pt`
-- a Hugging Face repo directory containing `sam3.pt`
+- a repo directory containing `sam3.pt`
 
-It also accepts either:
+And either:
 
 - a direct path to `tokenizer.json`
 - a repo directory containing `tokenizer.json`
 
-## Implemented smoke stages
+## Default image pipeline
 
-- Text stage: tokenization plus the CLIP-like text encoder and resize projection
-- Vision stage: image preprocessing, ViTDet trunk, and simple-FPN neck
-- Geometry stage: empty-prompt encoding plus optional point/box prompt encoding
+Unless `--smoke-image-size` is set, the example uses the model default image size:
 
-The geometry stage uses the currently loaded image checkpoint. That checkpoint
-contains point and box prompt weights, but not a mask-prompt branch, so mask
-prompts are intentionally not part of the example yet.
+- resize to `1008x1008`
+- normalize RGB with mean `[0.5, 0.5, 0.5]`
+- normalize RGB with std `[0.5, 0.5, 0.5]`
 
-## Text encoder status
+`--smoke-image-size` is still available for faster CPU runs while debugging, but the
+default path is the real `1008x1008` pipeline.
 
-- `sam3/text.rs` runs the CLIP-like text transformer and resize projection
-- tokenization stays in the example crate instead of `candle-transformers`
-- the example pads and truncates to the SAM3 text context length before running
-  the encoder
-
-## Vision and geometry status
-
-- `sam3/vitdet.rs` runs the checkpoint-backed image trunk
-- `sam3/neck.rs` projects that output into FPN levels plus position encodings
-- `sam3/geometry.rs` encodes:
-  - an empty prompt via the CLS token path
-  - optional `--point x,y` prompts
-  - optional `--box cx,cy,w,h` prompts
-
-Coordinates are normalized to `[0, 1]`.
-
-For faster CPU smoke tests, pass `--smoke-image-size 336` to run the implemented
-vision and geometry stages on a smaller square resize while keeping the model
-configuration unchanged.
-
-## Example commands
-
-Text-only smoke:
-
-```bash
-cargo run -p candle-examples --example sam3 -- \
-  --checkpoint /path/to/hf_sam3 \
-  --tokenizer /path/to/hf_sam3 \
-  --prompt "a white sneaker"
-```
-
-Vision plus empty-geometry smoke:
-
-```bash
-cargo run -p candle-examples --example sam3 -- \
-  --checkpoint /path/to/hf_sam3 \
-  --image candle-examples/examples/wuerstchen/assets/cat.jpg \
-  --smoke-image-size 336
-```
-
-Vision plus point/box geometry smoke:
-
-```bash
-cargo run -p candle-examples --example sam3 -- \
-  --checkpoint /path/to/hf_sam3 \
-  --image candle-examples/examples/wuerstchen/assets/cat.jpg \
-  --smoke-image-size 336 \
-  --point 0.5,0.5 \
-  --box 0.5,0.5,0.4,0.4
-```
-
-Combined text, vision, and geometry smoke:
+## CPU Example
 
 ```bash
 cargo run -p candle-examples --example sam3 -- \
   --checkpoint /path/to/hf_sam3 \
   --tokenizer /path/to/hf_sam3 \
   --image candle-examples/examples/wuerstchen/assets/cat.jpg \
-  --smoke-image-size 336 \
   --prompt "a cat" \
-  --point 0.45,0.45 \
-  --box 0.5,0.5,0.6,0.6
+  --output-dir candle-examples/examples/sam3/output
 ```
+
+## CPU Example With Box Prompt Rendering
+
+```bash
+cargo run -p candle-examples --example sam3 -- \
+  --checkpoint /path/to/hf_sam3 \
+  --tokenizer /path/to/hf_sam3 \
+  --image candle-examples/examples/wuerstchen/assets/cat.jpg \
+  --prompt "a cat" \
+  --box 0.5,0.5,0.45,0.45 \
+  --output-dir candle-examples/examples/sam3/output
+```
+
+## CUDA Example
+
+```bash
+PATH=/usr/local/cuda-12.9/bin:$PATH \
+CUDA_HOME=/usr/local/cuda-12.9 \
+LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64:$LD_LIBRARY_PATH \
+cargo run -p candle-examples --example sam3 --features cuda -- \
+  --checkpoint /path/to/hf_sam3 \
+  --tokenizer /path/to/hf_sam3 \
+  --image candle-examples/examples/wuerstchen/assets/cat.jpg \
+  --prompt "a cat" \
+  --output-dir candle-examples/examples/sam3/output
+```
+
+Update environment variable paths to the appropriate ones for your CUDA version.  If your environment blocks automatic compute-capability detection during CUDA builds, set `CUDA_COMPUTE_CAP` as well.
+
+## Notes
+
+- The example prints intermediate stage shapes so it still works as a debug harness.
+- Geometry mask prompts are still not available because the current checkpoint does not
+  include a geometry mask-encoder branch.
+- Full video / tracker support is still outside this example.

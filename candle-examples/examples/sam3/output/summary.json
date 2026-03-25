@@ -1,0 +1,15 @@
+{
+  "best_box_xyxy_normalized": [
+    0.22583073377609253,
+    0.3759823739528656,
+    0.7473385334014893,
+    0.8148077726364136
+  ],
+  "best_query_index": 3,
+  "best_score": 0.10919717699289322,
+  "input_boxes_cxcywh_normalized": [],
+  "mask_path": "candle-examples/examples/sam3/output/mask.png",
+  "overlay_path": "candle-examples/examples/sam3/output/overlay.png",
+  "prompt": "a cat",
+  "render_image_size": 1008
+}
