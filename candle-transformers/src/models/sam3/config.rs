@@ -133,6 +133,9 @@ impl Default for NeckConfig {
 pub struct GeometryConfig {
     pub d_model: usize,
     pub num_layers: usize,
+    pub num_heads: usize,
+    pub dim_feedforward: usize,
+    pub roi_size: usize,
     pub add_cls: bool,
     pub add_post_encode_proj: bool,
 }
@@ -142,6 +145,9 @@ impl Default for GeometryConfig {
         Self {
             d_model: 256,
             num_layers: 3,
+            num_heads: 8,
+            dim_feedforward: 2048,
+            roi_size: 7,
             add_cls: true,
             add_post_encode_proj: true,
         }

@@ -7,8 +7,8 @@ use super::checkpoint::Sam3CheckpointSource;
 use super::config::Config;
 use super::decoder::Sam3TransformerDecoder;
 use super::encoder::Sam3FusionEncoder;
-use super::geometry::{GeometryPrompt, SequenceGeometryEncoder};
-use super::neck::Sam3DualViTDetNeck;
+use super::geometry::{EncodedPrompt, GeometryPrompt, SequenceGeometryEncoder};
+use super::neck::{Sam3DualViTDetNeck, VisualBackboneOutput};
 use super::segmentation::UniversalSegmentationHead;
 use super::text::{Sam3TextEncoder, TextEncoding};
 use super::vitdet::Sam3ViTDetTrunk;
@@ -130,8 +130,7 @@ impl Sam3ImageModel {
         let vision_neck =
             Sam3DualViTDetNeck::new(&config.neck, vb.pp("backbone").pp("vision_backbone"))?;
         let text = Sam3TextEncoder::new(&config.text, vb.pp("backbone").pp("language_backbone"))?;
-        let geometry =
-            SequenceGeometryEncoder::new(&config.geometry, vb.pp("input_geometry_encoder"))?;
+        let geometry = SequenceGeometryEncoder::new(&config.geometry, vb.pp("geometry_encoder"))?;
         let encoder = Sam3FusionEncoder::new(&config.encoder, vb.pp("transformer").pp("encoder"))?;
         let decoder =
             Sam3TransformerDecoder::new(&config.decoder, vb.pp("transformer").pp("decoder"))?;
@@ -203,6 +202,28 @@ impl Sam3ImageModel {
         attention_mask: &Tensor,
     ) -> Result<TextEncoding> {
         self.text.forward(input_ids, attention_mask)
+    }
+
+    pub fn encode_image_features(&self, image: &Tensor) -> Result<VisualBackboneOutput> {
+        let image = match image.rank() {
+            3 => image.unsqueeze(0)?,
+            4 => image.clone(),
+            rank => candle::bail!("sam3 image encoder expects CHW or BCHW input, got rank {rank}"),
+        };
+        let trunk = self.vision_trunk.forward(&image)?;
+        self.vision_neck.forward(&trunk)
+    }
+
+    pub fn encode_geometry_prompt(
+        &self,
+        prompt: &GeometryPrompt,
+        visual_features: &VisualBackboneOutput,
+    ) -> Result<EncodedPrompt> {
+        self.geometry.encode(
+            prompt,
+            &visual_features.backbone_fpn,
+            &visual_features.vision_pos_enc,
+        )
     }
 
     pub fn ground_text(&self, state: &Sam3ImageState) -> Result<GroundingOutput> {

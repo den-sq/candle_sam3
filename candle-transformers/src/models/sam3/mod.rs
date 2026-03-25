@@ -33,5 +33,6 @@ pub use config::{
 };
 pub use geometry::{EncodedPrompt, GeometryPrompt, SequenceGeometryEncoder};
 pub use image::{GroundingOutput, ImageSize, Sam3ImageModel, Sam3ImageState, Sam3PromptState};
+pub use neck::VisualBackboneOutput;
 pub use text::{Sam3TextEncoder, TextEncoding};
 pub use vitdet::{Sam3ViTDetTrunk, ViTDetTrunkOutput};

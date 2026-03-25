@@ -157,13 +157,13 @@ impl Sam3VisionAttention {
             .forward(&hidden_states.reshape((batch_size, seq_len, channels))?)?
             .reshape((batch_size, seq_len, 3, self.num_heads, self.head_dim))?
             .permute((2, 0, 3, 1, 4))?;
-        let q = qkv.i(0)?;
-        let k = qkv.i(1)?;
-        let v = qkv.i(2)?;
+        let q = qkv.i(0)?.contiguous()?;
+        let k = qkv.i(1)?.contiguous()?;
+        let v = qkv.i(2)?.contiguous()?;
         let (q, k) = self.rotary_emb.apply(&q, &k)?;
-        let q = (q.to_dtype(DType::F32)? * self.scale)?;
-        let k = k.to_dtype(DType::F32)?;
-        let v = v.to_dtype(DType::F32)?;
+        let q = (q.to_dtype(DType::F32)? * self.scale)?.contiguous()?;
+        let k = k.to_dtype(DType::F32)?.contiguous()?;
+        let v = v.to_dtype(DType::F32)?.contiguous()?;
         let attn = q.matmul(&k.transpose(2, 3)?)?;
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
         let hidden_states = attn

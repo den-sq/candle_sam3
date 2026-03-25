@@ -4,7 +4,7 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use anyhow::{Error as E, Result};
+use anyhow::{bail, Context, Error as E, Result};
 use clap::Parser;
 
 use candle::{DType, Device, Tensor};
@@ -13,21 +13,41 @@ use tokenizers::{PaddingDirection, PaddingParams, Tokenizer, TruncationParams};
 
 #[derive(Parser, Debug)]
 struct Args {
-    /// Optional path to the upstream `sam3.pt` checkpoint.
+    /// Optional path to the upstream `sam3.pt` checkpoint or a repo directory containing it.
     #[arg(long)]
     checkpoint: Option<String>,
 
-    /// Optional path to a `tokenizer.json` compatible with the upstream text encoder.
+    /// Optional path to a `tokenizer.json` or a repo directory containing it.
     #[arg(long)]
     tokenizer: Option<String>,
 
-    /// Optional image path. Present for the eventual image-grounding API.
+    /// Optional image path for the vision and geometry smoke tests.
     #[arg(long)]
     image: Option<String>,
 
-    /// Optional text prompt. Present for the eventual image-grounding API.
+    /// Optional square resize used by the example smoke path before vision encoding.
+    #[arg(long)]
+    smoke_image_size: Option<usize>,
+
+    /// Optional text prompt for the text-encoder smoke test.
     #[arg(long)]
     prompt: Option<String>,
+
+    /// Repeated normalized point prompts in `x,y` format.
+    #[arg(long = "point", value_parser = parse_point)]
+    points: Vec<PointArg>,
+
+    /// Optional repeated point labels aligned with `--point`, defaults to `1`.
+    #[arg(long = "point-label")]
+    point_labels: Vec<u32>,
+
+    /// Repeated normalized box prompts in `cx,cy,w,h` format.
+    #[arg(long = "box", value_parser = parse_box)]
+    boxes: Vec<BoxArg>,
+
+    /// Optional repeated box labels aligned with `--box`, defaults to `1`.
+    #[arg(long = "box-label")]
+    box_labels: Vec<u32>,
 
     #[arg(long)]
     cpu: bool,
@@ -36,7 +56,54 @@ struct Args {
     print_config: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PointArg {
+    x: f32,
+    y: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BoxArg {
+    cx: f32,
+    cy: f32,
+    w: f32,
+    h: f32,
+}
+
 const CLIP_EOT_TOKEN: &str = "<|endoftext|>";
+
+fn parse_point(value: &str) -> std::result::Result<PointArg, String> {
+    let coords = parse_floats(value, 2)?;
+    Ok(PointArg {
+        x: coords[0],
+        y: coords[1],
+    })
+}
+
+fn parse_box(value: &str) -> std::result::Result<BoxArg, String> {
+    let coords = parse_floats(value, 4)?;
+    Ok(BoxArg {
+        cx: coords[0],
+        cy: coords[1],
+        w: coords[2],
+        h: coords[3],
+    })
+}
+
+fn parse_floats(value: &str, expected: usize) -> std::result::Result<Vec<f32>, String> {
+    let parts = value
+        .split(',')
+        .map(|part| part.trim().parse::<f32>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|err| format!("failed to parse `{value}` as comma-separated floats: {err}"))?;
+    if parts.len() != expected {
+        return Err(format!(
+            "expected {expected} comma-separated values, got {} in `{value}`",
+            parts.len()
+        ));
+    }
+    Ok(parts)
+}
 
 fn resolve_repo_file(path: &str, expected_file: &str) -> std::path::PathBuf {
     let path = std::path::PathBuf::from(path);
@@ -91,6 +158,94 @@ fn tokenize_prompt(
     Ok((input_ids, attention_mask))
 }
 
+fn preprocess_image_for_sam3(
+    image_path: &str,
+    image_size: usize,
+    config: &sam3::Config,
+    device: &Device,
+) -> Result<Tensor> {
+    let image = candle_examples::load_image_and_resize(image_path, image_size, image_size)?;
+    let image = image.to_device(device)?;
+    let mean = Tensor::from_vec(config.image.image_mean.to_vec(), (3, 1, 1), device)?;
+    let std = Tensor::from_vec(config.image.image_std.to_vec(), (3, 1, 1), device)?;
+    let image = (image.to_dtype(DType::F32)? / 255.)?
+        .broadcast_sub(&mean)?
+        .broadcast_div(&std)?
+        .unsqueeze(0)?;
+    Ok(image)
+}
+
+fn build_geometry_prompt(args: &Args, device: &Device) -> Result<Option<sam3::GeometryPrompt>> {
+    if args.points.is_empty() && args.boxes.is_empty() {
+        return Ok(None);
+    }
+    if !args.point_labels.is_empty() && args.point_labels.len() != args.points.len() {
+        bail!(
+            "`--point-label` count ({}) must match `--point` count ({})",
+            args.point_labels.len(),
+            args.points.len()
+        )
+    }
+    if !args.box_labels.is_empty() && args.box_labels.len() != args.boxes.len() {
+        bail!(
+            "`--box-label` count ({}) must match `--box` count ({})",
+            args.box_labels.len(),
+            args.boxes.len()
+        )
+    }
+
+    let points_xy = if args.points.is_empty() {
+        None
+    } else {
+        let data = args
+            .points
+            .iter()
+            .flat_map(|point| [point.x, point.y])
+            .collect::<Vec<_>>();
+        Some(Tensor::from_vec(data, (args.points.len(), 2), device)?)
+    };
+    let point_labels = if args.points.is_empty() {
+        None
+    } else {
+        let labels = if args.point_labels.is_empty() {
+            vec![1u32; args.points.len()]
+        } else {
+            args.point_labels.clone()
+        };
+        Some(Tensor::new(labels, device)?)
+    };
+
+    let boxes_cxcywh = if args.boxes.is_empty() {
+        None
+    } else {
+        let data = args
+            .boxes
+            .iter()
+            .flat_map(|bbox| [bbox.cx, bbox.cy, bbox.w, bbox.h])
+            .collect::<Vec<_>>();
+        Some(Tensor::from_vec(data, (args.boxes.len(), 4), device)?)
+    };
+    let box_labels = if args.boxes.is_empty() {
+        None
+    } else {
+        let labels = if args.box_labels.is_empty() {
+            vec![1u32; args.boxes.len()]
+        } else {
+            args.box_labels.clone()
+        };
+        Some(Tensor::new(labels, device)?)
+    };
+
+    Ok(Some(sam3::GeometryPrompt {
+        boxes_cxcywh,
+        box_labels,
+        points_xy,
+        point_labels,
+        masks: None,
+        mask_labels: None,
+    }))
+}
+
 fn run_text_encoder(
     model: &sam3::Sam3ImageModel,
     prompt: &str,
@@ -101,17 +256,90 @@ fn run_text_encoder(
     let tokenizer = get_tokenizer(tokenizer_path, context_length)?;
     let (input_ids, attention_mask) = tokenize_prompt(prompt, &tokenizer, device)?;
     let encoding = model.encode_text_tokens(&input_ids, &attention_mask)?;
-    println!("tokenized prompt:");
+    println!("text stage:");
     println!("  text: {prompt}");
     println!("  input_ids: {:?}", input_ids.to_vec2::<u32>()?);
     println!("  attention_mask: {:?}", attention_mask.to_vec2::<u32>()?);
-    println!("text encoder output:");
     println!("  padding mask shape: {:?}", encoding.attention_mask.dims());
     println!(
         "  input embeddings shape: {:?}",
         encoding.input_embeddings.dims()
     );
     println!("  resized memory shape: {:?}", encoding.memory.dims());
+    Ok(())
+}
+
+fn run_vision_and_geometry(
+    model: &sam3::Sam3ImageModel,
+    image_path: &str,
+    smoke_image_size: Option<usize>,
+    text_prompt: Option<&str>,
+    geometry_prompt: Option<&sam3::GeometryPrompt>,
+    device: &Device,
+) -> Result<()> {
+    let config = model.config();
+    let (original_image, initial_h, initial_w) = candle_examples::load_image(image_path, None)?;
+    let mut state = model.set_image(&original_image)?;
+    if let Some(text_prompt) = text_prompt {
+        state = state.with_text_prompt(text_prompt.to_string());
+    }
+    if let Some(geometry_prompt) = geometry_prompt {
+        state = state.with_geometry_prompt(geometry_prompt.clone());
+    }
+    println!("typed image state:");
+    println!("  original image size: {}x{}", initial_h, initial_w);
+    println!(
+        "  model input size: {}x{}",
+        state.model_input_size.height, state.model_input_size.width
+    );
+    println!("  has text prompt: {}", state.text_prompt().is_some());
+    println!(
+        "  has geometry prompt: {}",
+        !state.geometry_prompt().is_empty()
+    );
+
+    let image_size = smoke_image_size.unwrap_or(config.image.image_size);
+    let image = preprocess_image_for_sam3(image_path, image_size, config, device)?;
+    println!("vision stage:");
+    println!("  preprocessed image shape: {:?}", image.dims());
+    println!("  smoke resize: {image_size}x{image_size}");
+    let visual = model.encode_image_features(&image)?;
+    println!("  backbone_fpn levels: {}", visual.backbone_fpn.len());
+    for (level_idx, (features, pos)) in visual
+        .backbone_fpn
+        .iter()
+        .zip(visual.vision_pos_enc.iter())
+        .enumerate()
+    {
+        println!(
+            "  level {level_idx}: features {:?}, pos {:?}",
+            features.dims(),
+            pos.dims()
+        );
+    }
+    println!(
+        "  sam2 side neck present: {}",
+        visual.sam2_backbone_fpn.is_some()
+    );
+
+    let empty_geometry = sam3::GeometryPrompt::default();
+    let empty_encoded = model.encode_geometry_prompt(&empty_geometry, &visual)?;
+    println!("geometry stage:");
+    println!(
+        "  empty prompt: features {:?}, padding mask {:?}",
+        empty_encoded.features.dims(),
+        empty_encoded.padding_mask.dims()
+    );
+
+    if let Some(geometry_prompt) = geometry_prompt {
+        let encoded = model.encode_geometry_prompt(geometry_prompt, &visual)?;
+        println!(
+            "  user prompt: features {:?}, padding mask {:?}",
+            encoded.features.dims(),
+            encoded.padding_mask.dims()
+        );
+    }
+
     Ok(())
 }
 
@@ -124,7 +352,7 @@ pub fn main() -> anyhow::Result<()> {
         .as_ref()
         .map(|path| sam3::Sam3CheckpointSource::upstream_pth(resolve_repo_file(path, "sam3.pt")));
 
-    println!("sam3 scaffold example");
+    println!("sam3 example");
     println!("device: {device:?}");
     println!(
         "image MVP target: {}x{}",
@@ -139,6 +367,18 @@ pub fn main() -> anyhow::Result<()> {
         println!("{config:#?}");
     }
 
+    if (args.image.is_some()
+        || args.prompt.is_some()
+        || !args.points.is_empty()
+        || !args.boxes.is_empty())
+        && checkpoint_source.is_none()
+    {
+        bail!("running implemented SAM3 stages currently requires `--checkpoint <sam3.pt>`")
+    }
+    if (!args.points.is_empty() || !args.boxes.is_empty()) && args.image.is_none() {
+        bail!("`--point` and `--box` prompts require `--image` so the geometry encoder has image features")
+    }
+
     let model = if let Some(checkpoint) = checkpoint_source.as_ref() {
         let model =
             sam3::Sam3ImageModel::from_checkpoint_source(&config, checkpoint, DType::F32, &device)?;
@@ -148,41 +388,34 @@ pub fn main() -> anyhow::Result<()> {
         None
     };
 
-    if let Some(image_path) = args.image.as_ref() {
-        let Some(model) = model.as_ref() else {
-            anyhow::bail!(
-                "loading an image into typed SAM3 state currently requires `--checkpoint <sam3.pt>`"
-            );
-        };
-        let (image, _h, _w) =
-            candle_examples::load_image(image_path, Some(config.image.image_size))?;
-        let image = image.to_device(&device)?;
-        let mut state = model.set_image(&image)?;
-        if let Some(prompt) = args.prompt.as_ref() {
-            state = state.with_text_prompt(prompt.clone());
-        }
-        println!("prepared typed image state:\n{state:#?}");
-    }
+    let geometry_prompt = build_geometry_prompt(&args, &device)?;
 
-    if let Some(prompt) = args.prompt.as_ref() {
+    if let Some(prompt) = args.prompt.as_deref() {
         let tokenizer = args.tokenizer.as_deref().ok_or_else(|| {
             E::msg("encoding a SAM3 text prompt requires `--tokenizer <tokenizer.json>`")
         })?;
-        let Some(model) = model.as_ref() else {
-            anyhow::bail!(
-                "running the SAM3 text encoder currently requires `--checkpoint <sam3.pt>`"
-            );
-        };
         run_text_encoder(
-            model,
+            model
+                .as_ref()
+                .context("SAM3 text stage requires `--checkpoint <sam3.pt>`")?,
             prompt,
             tokenizer,
             config.text.context_length,
             &device,
         )?;
-        anyhow::bail!(
-            "the sam3 example now supports text tokenization and text-encoder execution, but image grounding and rendering are not implemented yet"
-        );
+    }
+
+    if let Some(image_path) = args.image.as_deref() {
+        run_vision_and_geometry(
+            model
+                .as_ref()
+                .context("SAM3 vision stage requires `--checkpoint <sam3.pt>`")?,
+            image_path,
+            args.smoke_image_size,
+            args.prompt.as_deref(),
+            geometry_prompt.as_ref(),
+            &device,
+        )?;
     }
 
     Ok(())
