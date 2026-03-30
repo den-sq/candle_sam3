@@ -234,7 +234,7 @@ impl DecoderLayer {
     fn new(config: &DecoderConfig, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
             cross_attn_image: DecoderAttention::new(config, vb.pp("cross_attn"))?,
-            norm1: candle_nn::layer_norm(config.d_model, 1e-6, vb.pp("norm1"))?,
+            norm1: candle_nn::layer_norm(config.d_model, 1e-5, vb.pp("norm1"))?,
             text_cross_attn: if config.use_text_cross_attention {
                 Some(DecoderAttention::new(config, vb.pp("ca_text"))?)
             } else {
@@ -250,10 +250,10 @@ impl DecoderLayer {
                 None
             },
             self_attn: DecoderAttention::new(config, vb.pp("self_attn"))?,
-            norm2: candle_nn::layer_norm(config.d_model, 1e-6, vb.pp("norm2"))?,
+            norm2: candle_nn::layer_norm(config.d_model, 1e-5, vb.pp("norm2"))?,
             linear1: candle_nn::linear(config.d_model, config.dim_feedforward, vb.pp("linear1"))?,
             linear2: candle_nn::linear(config.dim_feedforward, config.d_model, vb.pp("linear2"))?,
-            norm3: candle_nn::layer_norm(config.d_model, 1e-6, vb.pp("norm3"))?,
+            norm3: candle_nn::layer_norm(config.d_model, 1e-5, vb.pp("norm3"))?,
         })
     }
 
@@ -368,7 +368,7 @@ impl Sam3TransformerDecoder {
         for layer_idx in 0..config.num_layers {
             layers.push(DecoderLayer::new(config, layers_vb.pp(layer_idx))?);
         }
-        let output_norm = candle_nn::layer_norm(config.d_model, 1e-6, vb.pp("norm"))?;
+        let output_norm = candle_nn::layer_norm(config.d_model, 1e-5, vb.pp("norm"))?;
         let query_embed = vb
             .pp("query_embed")
             .get((config.num_queries, config.d_model), "weight")?;

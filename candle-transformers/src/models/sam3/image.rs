@@ -11,7 +11,7 @@ use super::geometry::{EncodedPrompt, GeometryPrompt, SequenceGeometryEncoder};
 use super::neck::{Sam3DualViTDetNeck, VisualBackboneOutput};
 use super::segmentation::{SegmentationOutput, UniversalSegmentationHead};
 use super::text::{Sam3TextEncoder, TextEncoding};
-use super::vitdet::Sam3ViTDetTrunk;
+use super::vitdet::{Sam3ViTDetTrunk, ViTDetTrunkOutput};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageSize {
@@ -215,6 +215,45 @@ impl Sam3ImageModel {
         };
         let trunk = self.vision_trunk.forward(&image)?;
         self.vision_neck.forward(&trunk)
+    }
+
+    pub fn encode_image_trunk(&self, image: &Tensor) -> Result<ViTDetTrunkOutput> {
+        let image = match image.rank() {
+            3 => image.unsqueeze(0)?,
+            4 => image.clone(),
+            rank => candle::bail!("sam3 image encoder expects CHW or BCHW input, got rank {rank}"),
+        };
+        self.vision_trunk.forward(&image)
+    }
+
+    pub fn encode_image_trunk_with_block_outputs(
+        &self,
+        image: &Tensor,
+    ) -> Result<(ViTDetTrunkOutput, Vec<Tensor>)> {
+        let image = match image.rank() {
+            3 => image.unsqueeze(0)?,
+            4 => image.clone(),
+            rank => candle::bail!("sam3 image encoder expects CHW or BCHW input, got rank {rank}"),
+        };
+        self.vision_trunk.forward_with_block_outputs(&image)
+    }
+
+    pub fn encode_image_trunk_with_debug_blocks(
+        &self,
+        image: &Tensor,
+        debug_blocks: &[usize],
+    ) -> Result<(
+        ViTDetTrunkOutput,
+        Vec<Tensor>,
+        std::collections::BTreeMap<String, Tensor>,
+    )> {
+        let image = match image.rank() {
+            3 => image.unsqueeze(0)?,
+            4 => image.clone(),
+            rank => candle::bail!("sam3 image encoder expects CHW or BCHW input, got rank {rank}"),
+        };
+        self.vision_trunk
+            .forward_with_debug_blocks(&image, debug_blocks)
     }
 
     pub fn encode_geometry_prompt(

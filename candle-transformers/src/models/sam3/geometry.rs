@@ -155,11 +155,11 @@ struct GeometryEncoderLayer {
 impl GeometryEncoderLayer {
     fn new(config: &GeometryConfig, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            norm1: candle_nn::layer_norm(config.d_model, 1e-6, vb.pp("norm1"))?,
+            norm1: candle_nn::layer_norm(config.d_model, 1e-5, vb.pp("norm1"))?,
             self_attn: GeometryAttention::new(config, vb.pp("self_attn"))?,
-            norm2: candle_nn::layer_norm(config.d_model, 1e-6, vb.pp("norm2"))?,
+            norm2: candle_nn::layer_norm(config.d_model, 1e-5, vb.pp("norm2"))?,
             cross_attn_image: GeometryAttention::new(config, vb.pp("cross_attn_image"))?,
-            norm3: candle_nn::layer_norm(config.d_model, 1e-6, vb.pp("norm3"))?,
+            norm3: candle_nn::layer_norm(config.d_model, 1e-5, vb.pp("norm3"))?,
             linear1: candle_nn::linear(config.d_model, config.dim_feedforward, vb.pp("linear1"))?,
             linear2: candle_nn::linear(config.dim_feedforward, config.d_model, vb.pp("linear2"))?,
         })
@@ -292,7 +292,7 @@ impl SequenceGeometryEncoder {
         let img_pre_norm = if vb.contains_tensor("img_pre_norm.weight") {
             Some(candle_nn::layer_norm(
                 config.d_model,
-                1e-6,
+                1e-5,
                 vb.pp("img_pre_norm"),
             )?)
         } else {
@@ -307,7 +307,7 @@ impl SequenceGeometryEncoder {
         } else {
             None
         };
-        let norm = candle_nn::layer_norm(config.d_model, 1e-6, vb.pp("norm"))?;
+        let norm = candle_nn::layer_norm(config.d_model, 1e-5, vb.pp("norm"))?;
         let mut encode = Vec::with_capacity(config.num_layers);
         let encode_vb = vb.pp("encode");
         for layer_idx in 0..config.num_layers {
@@ -316,7 +316,7 @@ impl SequenceGeometryEncoder {
         let encode_norm = if vb.contains_tensor("encode_norm.weight") {
             Some(candle_nn::layer_norm(
                 config.d_model,
-                1e-6,
+                1e-5,
                 vb.pp("encode_norm"),
             )?)
         } else {

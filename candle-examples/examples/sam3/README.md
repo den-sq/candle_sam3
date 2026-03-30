@@ -69,6 +69,26 @@ cargo run -p candle-examples --example sam3 -- \
   --output-dir candle-examples/examples/sam3/output
 ```
 
+## CPU Example With Intel oneAPI MKL
+
+Source the oneAPI MKL environment first so `intel-mkl-src` can locate the
+system MKL installation instead of falling back to the downloaded `ocipkg`
+package cache.
+
+```bash
+source /opt/intel/oneapi/mkl/2025.3/env/vars.sh
+
+cargo run -p candle-examples --example sam3 --features mkl -- \
+  --checkpoint /path/to/hf_sam3 \
+  --tokenizer /path/to/hf_sam3 \
+  --image candle-examples/examples/wuerstchen/assets/cat.jpg \
+  --prompt "a cat" \
+  --output-dir candle-examples/examples/sam3/output
+```
+
+You can also source `/opt/intel/oneapi/setvars.sh` instead if you want the full
+oneAPI environment rather than MKL alone.
+
 ## CPU Example With Box Prompt Rendering
 
 ```bash
@@ -96,6 +116,89 @@ cargo run -p candle-examples --example sam3 --features cuda -- \
 ```
 
 Update environment variable paths to the appropriate ones for your CUDA version.  If your environment blocks automatic compute-capability detection during CUDA builds, set `CUDA_COMPUTE_CAP` as well.
+
+## CUDA Example With Intel oneAPI MKL
+
+```bash
+source /opt/intel/oneapi/mkl/2025.3/env/vars.sh
+
+PATH=/usr/local/cuda-12.9/bin:$PATH \
+CUDA_HOME=/usr/local/cuda-12.9 \
+LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64:$LD_LIBRARY_PATH \
+cargo run -p candle-examples --example sam3 --features cuda,mkl -- \
+  --checkpoint /path/to/hf_sam3 \
+  --tokenizer /path/to/hf_sam3 \
+  --image candle-examples/examples/wuerstchen/assets/cat.jpg \
+  --prompt "a cat" \
+  --output-dir candle-examples/examples/sam3/output
+```
+
+If you source `/opt/intel/oneapi/mkl/2025.3/env/vars.sh` first, `LD_LIBRARY_PATH`
+will already contain the MKL runtime directory. The inline CUDA override above
+keeps that existing value by appending `:$LD_LIBRARY_PATH`.
+
+## Parity Harness
+
+Step 11 is implemented as a stage-by-stage parity harness. It compares the Rust
+pipeline against a reference bundle exported from upstream PyTorch for one fixed
+image/prompt pair.
+
+The parity bundle contains:
+
+- `inputs.image`: preprocessed `1x3xHxW` image tensor
+- `inputs.input_ids`: token IDs used by upstream SAM3
+- `inputs.attention_mask`: token attention mask
+- `text.input_embeddings`
+- `text.memory`
+- `vision.backbone_fpn.0..N`
+- `fusion.memory`
+- `decoder.pred_logits`
+- `decoder.pred_boxes_xyxy`
+- `segmentation.mask_logits`
+
+Optional debug tensors such as `fusion.pos_embed`, `decoder.presence_logits`, and
+`segmentation.semantic_logits` are exported too when present.
+
+### Export Reference Bundle From Upstream PyTorch
+
+The exporter script assumes you have a Python environment with:
+
+- `torch`
+- `torchvision`
+- `safetensors`
+- `Pillow`
+
+And a local checkout of the official `facebookresearch/sam3` repo.
+
+```bash
+python candle-examples/examples/sam3/export_reference.py \
+  --sam3-repo /home/dnorthover/extcode/sam3_den/sam3 \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --image candle-examples/examples/wuerstchen/assets/cat.jpg \
+  --prompt "a cat" \
+  --output-dir candle-examples/examples/sam3/reference
+```
+
+This writes:
+
+- `candle-examples/examples/sam3/reference/reference.safetensors`
+- `candle-examples/examples/sam3/reference/reference.json`
+
+### Run Rust Parity Check
+
+```bash
+cargo run -p candle-examples --example sam3 -- \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --parity-bundle candle-examples/examples/sam3/reference \
+  --output-dir candle-examples/examples/sam3/output
+```
+
+The parity report is written to:
+
+- `candle-examples/examples/sam3/output/parity_report.json`
+
+By default the harness fails if any stage exceeds `1e-4` absolute error. You can
+override that with `--parity-atol 1e-3`.
 
 ## Notes
 

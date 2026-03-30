@@ -1,5 +1,3 @@
-use std::f32::consts::PI;
-
 use candle::{Result, Tensor};
 use candle_nn::{Conv2d, Conv2dConfig, ConvTranspose2d, ConvTranspose2dConfig, Module, VarBuilder};
 
@@ -145,17 +143,15 @@ impl FeaturePyramidStage {
                         .as_ref()
                         .expect("upsample-x4 first stage must exist")
                         .forward(feature_map)?
-                        .gelu()?,
-                )?
-                .gelu()?,
+                        .gelu_erf()?,
+                )?,
             PyramidStageKind::UpsampleX2 => self
                 .upsample0
                 .as_ref()
                 .expect("upsample-x2 stage must exist")
-                .forward(feature_map)?
-                .gelu()?,
+                .forward(feature_map)?,
             PyramidStageKind::Identity => feature_map.clone(),
-            PyramidStageKind::DownsampleX2 => feature_map.max_pool2d_with_stride(1, 2)?,
+            PyramidStageKind::DownsampleX2 => feature_map.max_pool2d_with_stride(2, 2)?,
         };
         let feature_map = self.conv_1x1.forward(&feature_map)?;
         self.conv_3x3.forward(&feature_map)
@@ -285,16 +281,8 @@ fn build_2d_sine_position_encoding(feature: &Tensor, d_model: usize) -> Result<T
     let device = feature.device();
     let dtype = feature.dtype();
     let temperature = 10_000f32;
-    let y_scale = if height > 1 {
-        2.0 * PI / (height - 1) as f32
-    } else {
-        0.0
-    };
-    let x_scale = if width > 1 {
-        2.0 * PI / (width - 1) as f32
-    } else {
-        0.0
-    };
+    let scale = 2.0 * std::f32::consts::PI;
+    let eps = 1e-6f32;
     let mut dim_t = Vec::with_capacity(num_pos_feats);
     for idx in 0..num_pos_feats {
         let exponent = 2.0 * (idx / 2) as f32 / num_pos_feats as f32;
@@ -302,9 +290,9 @@ fn build_2d_sine_position_encoding(feature: &Tensor, d_model: usize) -> Result<T
     }
     let mut encoding = vec![0f32; d_model * height * width];
     for y in 0..height {
-        let y_pos = y as f32 * y_scale;
+        let y_pos = ((y + 1) as f32 / (height as f32 + eps)) * scale;
         for x in 0..width {
-            let x_pos = x as f32 * x_scale;
+            let x_pos = ((x + 1) as f32 / (width as f32 + eps)) * scale;
             for idx in 0..num_pos_feats {
                 let div = dim_t[idx];
                 let y_value = if idx % 2 == 0 {

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use candle::{DType, IndexOp, Result, Tensor};
 use candle_nn::{Conv2d, Conv2dConfig, LayerNorm, Linear, Module, VarBuilder};
 
@@ -154,14 +156,18 @@ impl Sam3VisionAttention {
         let seq_len = height * width;
         let qkv = self
             .qkv
-            .forward(&hidden_states.reshape((batch_size, seq_len, channels))?)?
+            .forward(&hidden_states.contiguous()?)?
             .reshape((batch_size, seq_len, 3, self.num_heads, self.head_dim))?
             .permute((2, 0, 3, 1, 4))?;
         let q = qkv.i(0)?.contiguous()?;
         let k = qkv.i(1)?.contiguous()?;
         let v = qkv.i(2)?.contiguous()?;
         let (q, k) = self.rotary_emb.apply(&q, &k)?;
-        let q = (q.to_dtype(DType::F32)? * self.scale)?.contiguous()?;
+        let scale = Tensor::new(self.scale as f32, q.device())?;
+        let q = q
+            .to_dtype(DType::F32)?
+            .broadcast_mul(&scale)?
+            .contiguous()?;
         let k = k.to_dtype(DType::F32)?.contiguous()?;
         let v = v.to_dtype(DType::F32)?.contiguous()?;
         let attn = q.matmul(&k.transpose(2, 3)?)?;
@@ -170,7 +176,8 @@ impl Sam3VisionAttention {
             .matmul(&v)?
             .to_dtype(in_dtype)?
             .transpose(1, 2)?
-            .reshape((batch_size, height, width, channels))?;
+            .reshape((batch_size, height, width, channels))?
+            .contiguous()?;
         self.proj.forward(&hidden_states)
     }
 }
@@ -191,7 +198,15 @@ impl Sam3VisionMlp {
     }
 
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
-        self.fc2.forward(&self.fc1.forward(hidden_states)?.gelu()?)
+        let hidden_states = self.fc1.forward(&hidden_states.contiguous()?)?.gelu_erf()?;
+        self.fc2.forward(&hidden_states.contiguous()?)
+    }
+
+    fn forward_with_debug(&self, hidden_states: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let fc1 = self.fc1.forward(&hidden_states.contiguous()?)?;
+        let gelu = fc1.gelu_erf()?;
+        let output = self.fc2.forward(&gelu.contiguous()?)?;
+        Ok((fc1, gelu, output))
     }
 }
 
@@ -218,7 +233,7 @@ impl Sam3VisionBlock {
         };
         let rotary_scale = config.window_size as f32 / rotary_input_size.0 as f32;
         Ok(Self {
-            norm1: candle_nn::layer_norm(config.embed_dim, 1e-6, vb.pp("norm1"))?,
+            norm1: candle_nn::layer_norm(config.embed_dim, 1e-5, vb.pp("norm1"))?,
             attn: Sam3VisionAttention::new(
                 config,
                 VisionRotaryEmbedding::new(
@@ -230,7 +245,7 @@ impl Sam3VisionBlock {
                 )?,
                 vb.pp("attn"),
             )?,
-            norm2: candle_nn::layer_norm(config.embed_dim, 1e-6, vb.pp("norm2"))?,
+            norm2: candle_nn::layer_norm(config.embed_dim, 1e-5, vb.pp("norm2"))?,
             mlp: Sam3VisionMlp::new(config, vb.pp("mlp"))?,
             window_size,
         })
@@ -251,11 +266,81 @@ impl Sam3VisionBlock {
         } else {
             hidden_states
         };
-        let hidden_states = (residual + hidden_states)?;
+        let hidden_states = (residual + hidden_states)?.contiguous()?;
         let residual = &hidden_states;
         let hidden_states = self.norm2.forward(&hidden_states)?;
         let hidden_states = self.mlp.forward(&hidden_states)?;
-        residual + hidden_states
+        (residual + hidden_states)?.contiguous()
+    }
+
+    fn forward_with_debug(
+        &self,
+        hidden_states: &Tensor,
+        block_index: usize,
+    ) -> Result<(Tensor, BTreeMap<String, Tensor>)> {
+        let mut debug = BTreeMap::new();
+        debug.insert(
+            format!("vision.block_debug.{block_index}.input"),
+            hidden_states.clone(),
+        );
+
+        let residual = hidden_states;
+        let hidden_states = self.norm1.forward(hidden_states)?;
+        debug.insert(
+            format!("vision.block_debug.{block_index}.norm1"),
+            hidden_states.clone(),
+        );
+
+        let original_hw = (hidden_states.dim(1)?, hidden_states.dim(2)?);
+        let (hidden_states, padded_hw) = if self.window_size > 0 {
+            window_partition(&hidden_states, self.window_size)?
+        } else {
+            (hidden_states, original_hw)
+        };
+        let hidden_states = self.attn.forward(&hidden_states)?;
+        let hidden_states = if self.window_size > 0 {
+            window_unpartition(&hidden_states, self.window_size, padded_hw, original_hw)?
+        } else {
+            hidden_states
+        };
+        debug.insert(
+            format!("vision.block_debug.{block_index}.attn_output"),
+            hidden_states.clone(),
+        );
+
+        let hidden_states = (residual + hidden_states)?.contiguous()?;
+        debug.insert(
+            format!("vision.block_debug.{block_index}.post_attn"),
+            hidden_states.clone(),
+        );
+
+        let residual = &hidden_states;
+        let hidden_states = self.norm2.forward(&hidden_states)?;
+        debug.insert(
+            format!("vision.block_debug.{block_index}.norm2"),
+            hidden_states.clone(),
+        );
+
+        let (mlp_fc1, mlp_gelu, mlp_output) = self.mlp.forward_with_debug(&hidden_states)?;
+        debug.insert(
+            format!("vision.block_debug.{block_index}.mlp_fc1"),
+            mlp_fc1.clone(),
+        );
+        debug.insert(
+            format!("vision.block_debug.{block_index}.mlp_gelu"),
+            mlp_gelu.clone(),
+        );
+        debug.insert(
+            format!("vision.block_debug.{block_index}.mlp_output"),
+            mlp_output.clone(),
+        );
+
+        let hidden_states = (residual + mlp_output)?.contiguous()?;
+        debug.insert(
+            format!("vision.block_debug.{block_index}.output"),
+            hidden_states.clone(),
+        );
+        Ok((hidden_states, debug))
     }
 }
 
@@ -263,13 +348,14 @@ fn window_partition(
     hidden_states: &Tensor,
     window_size: usize,
 ) -> Result<(Tensor, (usize, usize))> {
+    let hidden_states = hidden_states.contiguous()?;
     let (batch_size, height, width, channels) = hidden_states.dims4()?;
     let pad_height = (window_size - height % window_size) % window_size;
     let pad_width = (window_size - width % window_size) % window_size;
     let hidden_states = if pad_height > 0 {
         hidden_states.pad_with_zeros(1, 0, pad_height)?
     } else {
-        hidden_states.clone()
+        hidden_states
     };
     let hidden_states = if pad_width > 0 {
         hidden_states.pad_with_zeros(2, 0, pad_width)?
@@ -328,7 +414,7 @@ fn window_unpartition(
     } else {
         hidden_states
     };
-    Ok(hidden_states)
+    hidden_states.contiguous()
 }
 
 fn load_pos_embed(config: &VisionConfig, vb: VarBuilder) -> Result<Tensor> {
@@ -403,11 +489,11 @@ impl Sam3ViTDetTrunk {
             config.image_size / config.patch_size,
             config.image_size / config.patch_size,
         );
-        let pre_layer_norm = if vb.contains_tensor("layer_norm.weight") {
+        let pre_layer_norm = if config.ln_pre && vb.contains_tensor("ln_pre.weight") {
             Some(candle_nn::layer_norm(
                 config.embed_dim,
-                1e-6,
-                vb.pp("layer_norm"),
+                1e-5,
+                vb.pp("ln_pre"),
             )?)
         } else {
             None
@@ -441,6 +527,38 @@ impl Sam3ViTDetTrunk {
     }
 
     pub fn forward(&self, images: &Tensor) -> Result<ViTDetTrunkOutput> {
+        let (output, _, _) = self.forward_impl(images, false, &[])?;
+        Ok(output)
+    }
+
+    pub fn forward_with_block_outputs(
+        &self,
+        images: &Tensor,
+    ) -> Result<(ViTDetTrunkOutput, Vec<Tensor>)> {
+        let (output, block_outputs, _) = self.forward_impl(images, true, &[])?;
+        Ok((output, block_outputs.unwrap_or_default()))
+    }
+
+    pub fn forward_with_debug_blocks(
+        &self,
+        images: &Tensor,
+        debug_blocks: &[usize],
+    ) -> Result<(ViTDetTrunkOutput, Vec<Tensor>, BTreeMap<String, Tensor>)> {
+        let (output, block_outputs, debug_tensors) =
+            self.forward_impl(images, true, debug_blocks)?;
+        Ok((output, block_outputs.unwrap_or_default(), debug_tensors))
+    }
+
+    fn forward_impl(
+        &self,
+        images: &Tensor,
+        collect_block_outputs: bool,
+        debug_blocks: &[usize],
+    ) -> Result<(
+        ViTDetTrunkOutput,
+        Option<Vec<Tensor>>,
+        BTreeMap<String, Tensor>,
+    )> {
         let (_, _, image_height, image_width) = images.dims4()?;
         if image_height % self.config.patch_size != 0 || image_width % self.config.patch_size != 0 {
             candle::bail!(
@@ -458,12 +576,29 @@ impl Sam3ViTDetTrunk {
         if let Some(pre_layer_norm) = &self.pre_layer_norm {
             hidden_states = pre_layer_norm.forward(&hidden_states)?;
         }
-        for block in self.blocks.iter() {
-            hidden_states = block.forward(&hidden_states)?;
+        let mut block_outputs =
+            collect_block_outputs.then(|| Vec::with_capacity(self.blocks.len()));
+        let mut debug_tensors = BTreeMap::new();
+        for (block_index, block) in self.blocks.iter().enumerate() {
+            if debug_blocks.contains(&block_index) {
+                let (next_hidden_states, block_debug) =
+                    block.forward_with_debug(&hidden_states, block_index)?;
+                hidden_states = next_hidden_states;
+                debug_tensors.extend(block_debug);
+            } else {
+                hidden_states = block.forward(&hidden_states)?;
+            }
+            if let Some(block_outputs) = block_outputs.as_mut() {
+                block_outputs.push(hidden_states.clone());
+            }
         }
-        Ok(ViTDetTrunkOutput {
-            stage_features: vec![hidden_states],
-        })
+        Ok((
+            ViTDetTrunkOutput {
+                stage_features: vec![hidden_states],
+            },
+            block_outputs,
+            debug_tensors,
+        ))
     }
 }
 

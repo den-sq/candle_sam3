@@ -4,6 +4,8 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
+mod parity;
+
 use anyhow::{bail, Context, Error as E, Result};
 use clap::Parser;
 
@@ -37,6 +39,14 @@ struct Args {
     /// Directory used for rendered overlay, mask, and summary outputs.
     #[arg(long, default_value = "candle-examples/examples/sam3/output")]
     output_dir: String,
+
+    /// Optional parity bundle directory or `reference.safetensors` file.
+    #[arg(long)]
+    parity_bundle: Option<String>,
+
+    /// Absolute tolerance used for stage-by-stage parity comparisons.
+    #[arg(long, default_value_t = 1e-4f32)]
+    parity_atol: f32,
 
     /// Optional text prompt for the text-encoder smoke test.
     #[arg(long)]
@@ -582,13 +592,25 @@ pub fn main() -> anyhow::Result<()> {
     if (args.image.is_some()
         || args.prompt.is_some()
         || !args.points.is_empty()
-        || !args.boxes.is_empty())
+        || !args.boxes.is_empty()
+        || args.parity_bundle.is_some())
         && checkpoint_source.is_none()
     {
         bail!("running implemented SAM3 stages currently requires `--checkpoint <sam3.pt>`")
     }
     if (!args.points.is_empty() || !args.boxes.is_empty()) && args.image.is_none() {
         bail!("`--point` and `--box` prompts require `--image` so the geometry encoder has image features")
+    }
+    if args.parity_bundle.is_some()
+        && (args.image.is_some()
+            || args.prompt.is_some()
+            || args.tokenizer.is_some()
+            || !args.points.is_empty()
+            || !args.boxes.is_empty())
+    {
+        bail!(
+            "`--parity-bundle` uses the exported reference inputs directly; omit `--image`, `--prompt`, `--tokenizer`, `--point`, and `--box`"
+        )
     }
 
     let model = if let Some(checkpoint) = checkpoint_source.as_ref() {
@@ -599,6 +621,21 @@ pub fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+
+    if let Some(bundle_path) = args.parity_bundle.as_deref() {
+        parity::run(
+            model
+                .as_ref()
+                .context("SAM3 parity mode requires `--checkpoint <sam3.pt>`")?,
+            &parity::ParityOptions {
+                bundle_path: PathBuf::from(bundle_path),
+                output_dir: PathBuf::from(&args.output_dir),
+                atol: args.parity_atol,
+            },
+            &device,
+        )?;
+        return Ok(());
+    }
 
     let geometry_prompt = build_geometry_prompt(&args, &device)?;
 

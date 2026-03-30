@@ -119,11 +119,11 @@ struct FusionEncoderLayer {
 impl FusionEncoderLayer {
     fn new(config: &EncoderConfig, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            norm1: candle_nn::layer_norm(config.d_model, 1e-6, vb.pp("norm1"))?,
+            norm1: candle_nn::layer_norm(config.d_model, 1e-5, vb.pp("norm1"))?,
             self_attn: FusionAttention::new(config, vb.pp("self_attn"))?,
-            norm2: candle_nn::layer_norm(config.d_model, 1e-6, vb.pp("norm2"))?,
+            norm2: candle_nn::layer_norm(config.d_model, 1e-5, vb.pp("norm2"))?,
             cross_attn_prompt: FusionAttention::new(config, vb.pp("cross_attn_image"))?,
-            norm3: candle_nn::layer_norm(config.d_model, 1e-6, vb.pp("norm3"))?,
+            norm3: candle_nn::layer_norm(config.d_model, 1e-5, vb.pp("norm3"))?,
             linear1: candle_nn::linear(config.d_model, config.dim_feedforward, vb.pp("linear1"))?,
             linear2: candle_nn::linear(config.dim_feedforward, config.d_model, vb.pp("linear2"))?,
         })

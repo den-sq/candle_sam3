@@ -102,7 +102,7 @@ impl Sam3TextMlp {
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        self.c_proj.forward(&self.c_fc.forward(xs)?.gelu()?)
+        self.c_proj.forward(&self.c_fc.forward(xs)?.gelu_erf()?)
     }
 }
 

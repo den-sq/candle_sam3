@@ -47,3 +47,7 @@ out.wav
 bria.mp3
 bria.safetensors
 bria.wav
+
+# Test python environment for debugging
+.venv
+candle-examples/examples/sam3/output
