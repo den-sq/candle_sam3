@@ -352,33 +352,40 @@ fn preprocess_image_for_sam3(
     preprocess_mode: PreprocessMode,
     device: &Device,
 ) -> Result<Tensor> {
-    let data = match preprocess_mode {
-        PreprocessMode::Exact => image::ImageReader::open(image_path)?
-            .decode()
-            .map_err(E::msg)?
-            .resize_exact(
-                image_size as u32,
-                image_size as u32,
-                image::imageops::FilterType::Triangle,
-            )
-            .to_rgb8()
-            .into_raw(),
+    let image = match preprocess_mode {
+        PreprocessMode::Exact => {
+            // Upstream SAM3 applies Resize on an image tensor before float
+            // conversion and normalization. Using Candle's bilinear tensor
+            // resize with align_corners=false matches torchvision's tensor
+            // interpolation semantics more closely than the image crate's
+            // DynamicImage resize path.
+            let rgb = image::ImageReader::open(image_path)?
+                .decode()
+                .map_err(E::msg)?
+                .to_rgb8();
+            let (width, height) = rgb.dimensions();
+            let image = Tensor::from_vec(
+                rgb.into_raw(),
+                (height as usize, width as usize, 3),
+                &Device::Cpu,
+            )?
+            .permute((2, 0, 1))?
+            .to_device(device)?
+            .to_dtype(DType::F32)?
+            .unsqueeze(0)?
+            .upsample_bilinear2d(image_size, image_size, false)?;
+            (image / 255.)?
+        }
         PreprocessMode::CropFill => {
-            candle_examples::load_image_and_resize(image_path, image_size, image_size)?
-                .permute((1, 2, 0))?
-                .flatten_all()?
-                .to_vec1::<u8>()?
+            let image = candle_examples::load_image_and_resize(image_path, image_size, image_size)?
+                .to_device(device)?
+                .to_dtype(DType::F32)?;
+            (image / 255.)?.unsqueeze(0)?
         }
     };
-    let image =
-        Tensor::from_vec(data, (image_size, image_size, 3), &Device::Cpu)?.permute((2, 0, 1))?;
-    let image = image.to_device(device)?;
-    let mean = Tensor::from_vec(config.image.image_mean.to_vec(), (3, 1, 1), device)?;
-    let std = Tensor::from_vec(config.image.image_std.to_vec(), (3, 1, 1), device)?;
-    let image = (image.to_dtype(DType::F32)? / 255.)?
-        .broadcast_sub(&mean)?
-        .broadcast_div(&std)?
-        .unsqueeze(0)?;
+    let mean = Tensor::from_vec(config.image.image_mean.to_vec(), (1, 3, 1, 1), device)?;
+    let std = Tensor::from_vec(config.image.image_std.to_vec(), (1, 3, 1, 1), device)?;
+    let image = image.broadcast_sub(&mean)?.broadcast_div(&std)?;
     Ok(image)
 }
 
