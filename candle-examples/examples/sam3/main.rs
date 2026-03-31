@@ -177,6 +177,8 @@ struct ReferenceComparisonEntry {
     mask_iou_threshold_0_5: f32,
     prediction_overlay_mean_abs_diff: Option<f32>,
     prediction_overlay_rmse: Option<f32>,
+    prediction_overlay_one_minus_sigmoid_threshold_0_5_mean_abs_diff: Option<f32>,
+    prediction_overlay_one_minus_sigmoid_threshold_0_5_rmse: Option<f32>,
 }
 
 impl ResizeToFillTransform {
@@ -1797,6 +1799,38 @@ fn run_reference_comparison(
         } else {
             candle_selected.best_box_xyxy.clone()
         };
+        let prediction_overlay_metrics =
+            if let Some(reference_overlay) = reference_prediction_overlay_all_kept.as_ref() {
+                let candle_overlay = load_render_image(
+                    &mode_output_dir
+                        .join("prediction_overlay.png")
+                        .display()
+                        .to_string(),
+                )?;
+                Some(image_diff_metrics(
+                    &candle_overlay,
+                    reference_overlay,
+                    compared_region,
+                )?)
+            } else {
+                None
+            };
+        let prediction_overlay_one_minus_sigmoid_threshold_0_5_metrics =
+            if let Some(reference_overlay) = reference_prediction_overlay_all_kept.as_ref() {
+                let candle_overlay = load_render_image(
+                    &mode_output_dir
+                        .join("prediction_overlay_one_minus_sigmoid_threshold_0_5.png")
+                        .display()
+                        .to_string(),
+                )?;
+                Some(image_diff_metrics(
+                    &candle_overlay,
+                    reference_overlay,
+                    compared_region,
+                )?)
+            } else {
+                None
+            };
 
         let entry = ReferenceComparisonEntry {
             preprocess_mode: preprocess_mode.as_str().to_string(),
@@ -1825,32 +1859,12 @@ fn run_reference_comparison(
                 0.5,
                 compared_region,
             )?,
-            prediction_overlay_mean_abs_diff: if let Some(reference_overlay) =
-                reference_prediction_overlay_all_kept.as_ref()
-            {
-                let candle_overlay = load_render_image(
-                    &mode_output_dir
-                        .join("prediction_overlay.png")
-                        .display()
-                        .to_string(),
-                )?;
-                Some(image_diff_metrics(&candle_overlay, reference_overlay, compared_region)?.0)
-            } else {
-                None
-            },
-            prediction_overlay_rmse: if let Some(reference_overlay) =
-                reference_prediction_overlay_all_kept.as_ref()
-            {
-                let candle_overlay = load_render_image(
-                    &mode_output_dir
-                        .join("prediction_overlay.png")
-                        .display()
-                        .to_string(),
-                )?;
-                Some(image_diff_metrics(&candle_overlay, reference_overlay, compared_region)?.1)
-            } else {
-                None
-            },
+            prediction_overlay_mean_abs_diff: prediction_overlay_metrics.map(|metrics| metrics.0),
+            prediction_overlay_rmse: prediction_overlay_metrics.map(|metrics| metrics.1),
+            prediction_overlay_one_minus_sigmoid_threshold_0_5_mean_abs_diff:
+                prediction_overlay_one_minus_sigmoid_threshold_0_5_metrics.map(|metrics| metrics.0),
+            prediction_overlay_one_minus_sigmoid_threshold_0_5_rmse:
+                prediction_overlay_one_minus_sigmoid_threshold_0_5_metrics.map(|metrics| metrics.1),
         };
         comparisons.push(entry);
 
