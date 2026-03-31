@@ -732,14 +732,28 @@ fn sample_points_nearest(vision_feats: &Tensor, points_xy: &Tensor) -> Result<Te
     let (batch_size, channels, height, width) = vision_feats.dims4()?;
     let points = points_xy.to_vec3::<f32>()?;
     let seq_len = points.len();
-    let mut samples = Vec::with_capacity(batch_size * seq_len);
+    let mut samples = Vec::with_capacity(batch_size * seq_len * channels);
+    
     for seq_points in points.iter() {
         for (batch_idx, point) in seq_points.iter().enumerate() {
-            let x = normalized_to_index(point[0], width);
-            let y = normalized_to_index(point[1], height);
-            samples.push(vision_feats.i((batch_idx, .., y, x))?);
+            // Convert from normalized [0, 1] to pixel coordinates
+            let x_pixel = point[0] * width as f32;
+            let y_pixel = point[1] * height as f32;
+            
+            // Perform bilinear interpolation
+            let sample = bilinear_sample(
+                vision_feats,
+                batch_idx,
+                x_pixel,
+                y_pixel,
+                width,
+                height,
+                channels,
+            )?;
+            samples.push(sample);
         }
     }
+    
     let sample_refs = samples.iter().collect::<Vec<_>>();
     Tensor::stack(&sample_refs, 0)?.reshape((seq_len, batch_size, channels))
 }
@@ -766,12 +780,19 @@ fn sample_boxes_nearest(
             let mut rows = Vec::with_capacity(roi_size);
             for roi_y in 0..roi_size {
                 let sample_y = y0 + (roi_y as f32 + 0.5) * box_h / roi_size as f32;
-                let sample_y = sample_y.clamp(0.0, (height.saturating_sub(1)) as f32) as usize;
                 let mut cols = Vec::with_capacity(roi_size);
                 for roi_x in 0..roi_size {
                     let sample_x = x0 + (roi_x as f32 + 0.5) * box_w / roi_size as f32;
-                    let sample_x = sample_x.clamp(0.0, (width.saturating_sub(1)) as f32) as usize;
-                    cols.push(vision_feats.i((batch_idx, .., sample_y, sample_x))?);
+                    let sample = bilinear_sample(
+                        vision_feats,
+                        batch_idx,
+                        sample_x,
+                        sample_y,
+                        width,
+                        height,
+                        channels,
+                    )?;
+                    cols.push(sample);
                 }
                 let col_refs = cols.iter().collect::<Vec<_>>();
                 rows.push(Tensor::stack(&col_refs, 1)?);
@@ -787,6 +808,76 @@ fn sample_boxes_nearest(
 fn normalized_to_index(coord: f32, size: usize) -> usize {
     let max_idx = size.saturating_sub(1) as f32;
     (coord * size as f32).clamp(0.0, max_idx).round() as usize
+}
+
+fn bilinear_sample(
+    vision_feats: &Tensor,
+    batch_idx: usize,
+    x_pixel: f32,
+    y_pixel: f32,
+    width: usize,
+    height: usize,
+    channels: usize,
+) -> Result<Tensor> {
+    // Convert pixel coordinates as per grid_sample with align_corners=False:
+    // For normalized [0, 1] coordinates:
+    // pixel = norm_coord * size - 0.5
+    // This matches PyTorch grid_sample behavior
+    let x = x_pixel - 0.5;
+    let y = y_pixel - 0.5;
+    
+    // Clamp to valid range (-0.5, size-0.5)
+    let max_x = (width as f32) - 0.5;
+    let max_y = (height as f32) - 0.5;
+    let x = x.clamp(-0.5, max_x);
+    let y = y.clamp(-0.5, max_y);
+    
+    // Get integer and fractional parts
+    let x0 = x.floor() as i32;
+    let y0 = y.floor() as i32;
+    let mut x0_usize = x0.max(0) as usize;
+    let mut y0_usize = y0.max(0) as usize;
+    let mut x1_usize = ((x0 + 1).min(width as i32 - 1)).max(0) as usize;
+    let mut y1_usize = ((y0 + 1).min(height as i32 - 1)).max(0) as usize;
+    
+    // Handle edge cases where coordinates are outside the image
+    if x0 < 0 {
+        x0_usize = 0;
+        x1_usize = 0;
+    }
+    if y0 < 0 {
+        y0_usize = 0;
+        y1_usize = 0;
+    }
+    
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+    let fx = fx.max(0.0).min(1.0);
+    let fy = fy.max(0.0).min(1.0);
+    let fx_inv = 1.0 - fx;
+    let fy_inv = 1.0 - fy;
+    
+    // Get the four neighboring values as vectors (in f32 for computation)
+    let v00 = vision_feats.i((batch_idx, .., y0_usize, x0_usize))?.to_vec1::<f32>()?;
+    let v01 = vision_feats.i((batch_idx, .., y0_usize, x1_usize))?.to_vec1::<f32>()?;
+    let v10 = vision_feats.i((batch_idx, .., y1_usize, x0_usize))?.to_vec1::<f32>()?;
+    let v11 = vision_feats.i((batch_idx, .., y1_usize, x1_usize))?.to_vec1::<f32>()?;
+    
+    // Perform bilinear interpolation: f(x,y) = f00*(1-fx)*(1-fy) + f01*fx*(1-fy) + f10*(1-fx)*fy + f11*fx*fy
+    let w00 = fx_inv * fy_inv;
+    let w01 = fx * fy_inv;
+    let w10 = fx_inv * fy;
+    let w11 = fx * fy;
+    
+    let mut result = vec![0.0f32; channels];
+    for c in 0..channels {
+        result[c] = v00[c] * w00 + v01[c] * w01 + v10[c] * w10 + v11[c] * w11;
+    }
+    
+    let device = vision_feats.device();
+    let result_tensor = Tensor::from_vec(result, (channels,), device)?;
+    // Convert back to original dtype to match vision_feats
+    result_tensor.to_dtype(vision_feats.dtype())
 }
 
 fn cxcywh_to_xyxy(cx: f32, cy: f32, w: f32, h: f32) -> (f32, f32, f32, f32) {
