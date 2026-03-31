@@ -17,6 +17,7 @@ The rendered outputs are:
 - `exact/` and `crop_fill/`: one subdirectory per preprocessing mode for each sample
 - `overlay.png`: rendered on the original image aspect ratio; by default this is the prediction overlay, while `--image-predictor-example` box jobs use notebook-style prompt visualization here
 - `prediction_overlay.png`: prediction overlay with the selected mask and box on the original image
+- `prediction_overlay_all_kept.png`: notebook-style overlay of all kept predictions above the confidence threshold
 - `mask.png`: grayscale `sigmoid(mask_logits)` image used by the default overlay path
 - `mask_sigmoid.png`: explicit grayscale `sigmoid(mask_logits)` dump
 - `mask_one_minus_sigmoid.png`: explicit grayscale `1 - sigmoid(mask_logits)` dump
@@ -295,7 +296,9 @@ keeps that existing value by appending `:$LD_LIBRARY_PATH`.
 
 Step 11 is implemented as a stage-by-stage parity harness. It compares the Rust
 pipeline against a reference bundle exported from upstream PyTorch for one fixed
-image/prompt pair.
+image/prompt pair. The examples below use the
+`sam3_image_predictor_example.ipynb` single-positive-box case as the baseline
+parity scenario.
 
 The parity bundle contains:
 
@@ -332,8 +335,9 @@ And a local checkout of the official `facebookresearch/sam3` repo.
 python candle-examples/examples/sam3/export_reference.py \
   --sam3-repo /home/dnorthover/extcode/sam3_baseline \
   --checkpoint /home/dnorthover/extcode/hf_sam3 \
-  --image candle-examples/examples/wuerstchen/assets/cat.jpg \
-  --prompt "a cat" \
+  --image /home/dnorthover/extcode/sam3_baseline/assets/images/test_image.jpg \
+  --box 0.41796875,0.6527777778,0.0859375,0.5 \
+  --box-label 1 \
   --output-dir candle-examples/examples/sam3/reference
 ```
 
@@ -341,11 +345,28 @@ This writes:
 
 - `candle-examples/examples/sam3/reference/reference.safetensors`
 - `candle-examples/examples/sam3/reference/reference.json`
+- `candle-examples/examples/sam3/reference/overlay.png`
+- `candle-examples/examples/sam3/reference/prediction_overlay.png`
+- `candle-examples/examples/sam3/reference/prediction_overlay_all_kept.png`
+- `candle-examples/examples/sam3/reference/mask.png`
 
 That is the true upstream parity mode. It uses the same exact square resize as
 the Python SAM3 image processor.
 
-### Export Diagnostic Crop-Fill Parity Bundle
+### Export `shoe` Text Reference Bundle
+
+This matches the text-prompt part of `sam3_image_predictor_example.ipynb`.
+
+```bash
+python candle-examples/examples/sam3/export_reference.py \
+  --sam3-repo /home/dnorthover/extcode/sam3_baseline \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --image /home/dnorthover/extcode/sam3_baseline/assets/images/test_image.jpg \
+  --prompt "shoe" \
+  --output-dir candle-examples/examples/sam3/reference_shoe
+```
+
+### Export Diagnostic Crop-Fill Same-Input Bundle
 
 If you want to compare Candle's non-upstream `crop_fill` example mode against a
 matching Python-side bundle, export it explicitly:
@@ -354,9 +375,8 @@ matching Python-side bundle, export it explicitly:
 python candle-examples/examples/sam3/export_reference.py \
   --sam3-repo /home/dnorthover/extcode/sam3_baseline \
   --checkpoint /home/dnorthover/extcode/hf_sam3 \
-  --image candle-examples/examples/wuerstchen/assets/cat.jpg \
-  --prompt "a cat" \
-  --box 0.5,0.5,0.45,0.45 \
+  --image /home/dnorthover/extcode/sam3_baseline/assets/images/test_image.jpg \
+  --box 0.41796875,0.6527777778,0.0859375,0.5 \
   --box-label 1 \
   --preprocess-mode crop_fill \
   --output-dir candle-examples/examples/sam3/reference_crop_fill
@@ -369,7 +389,73 @@ In this mode, the exporter:
 - writes those remapped model-space boxes into the bundle
 
 This is a local diagnostic mode for the Candle example, not the upstream SAM3
-preprocessing contract.
+preprocessing contract. It is useful for same-input tensor checks, but not for
+comparing Candle `crop_fill` preprocessing against upstream exact preprocessing.
+The exporter also writes `overlay.png`, `prediction_overlay.png`, and `mask.png`
+for the selected upstream prediction in that output directory, plus
+`prediction_overlay_all_kept.png` which follows the upstream notebook style more
+closely by rendering all kept masks and boxes above the confidence threshold.
+
+### Export Exact Positive/Negative Box Parity Bundles
+
+These are the exact-resize geometry parity checks for the same
+`sam3_image_predictor_example.ipynb` workflow. The positive case above is the
+baseline example; this section provides the explicit positive/negative pair.
+
+Positive box:
+
+```bash
+python candle-examples/examples/sam3/export_reference.py \
+  --sam3-repo /home/dnorthover/extcode/sam3_baseline \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --image /home/dnorthover/extcode/sam3_baseline/assets/images/test_image.jpg \
+  --box 0.41796875,0.6527777778,0.0859375,0.5 \
+  --box-label 1 \
+  --output-dir candle-examples/examples/sam3/reference_box_positive
+```
+
+Negative box:
+
+```bash
+python candle-examples/examples/sam3/export_reference.py \
+  --sam3-repo /home/dnorthover/extcode/sam3_baseline \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --image /home/dnorthover/extcode/sam3_baseline/assets/images/test_image.jpg \
+  --box 0.41796875,0.6527777778,0.0859375,0.5 \
+  --box-label 0 \
+  --output-dir candle-examples/examples/sam3/reference_box_negative
+```
+
+### Export Crop-Fill Positive/Negative Box Parity Bundles
+
+These use the same box-conditioned checks, but preprocess the image with the
+example's non-upstream `crop_fill` mode before exporting the bundle.
+
+Positive box:
+
+```bash
+python candle-examples/examples/sam3/export_reference.py \
+  --sam3-repo /home/dnorthover/extcode/sam3_baseline \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --image /home/dnorthover/extcode/sam3_baseline/assets/images/test_image.jpg \
+  --box 0.41796875,0.6527777778,0.0859375,0.5 \
+  --box-label 1 \
+  --preprocess-mode crop_fill \
+  --output-dir candle-examples/examples/sam3/reference_crop_fill_box_positive
+```
+
+Negative box:
+
+```bash
+python candle-examples/examples/sam3/export_reference.py \
+  --sam3-repo /home/dnorthover/extcode/sam3_baseline \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --image /home/dnorthover/extcode/sam3_baseline/assets/images/test_image.jpg \
+  --box 0.41796875,0.6527777778,0.0859375,0.5 \
+  --box-label 0 \
+  --preprocess-mode crop_fill \
+  --output-dir candle-examples/examples/sam3/reference_crop_fill_box_negative
+```
 
 ### Run Rust Parity Check
 
@@ -380,13 +466,136 @@ cargo run -p candle-examples --example sam3 -- \
   --output-dir candle-examples/examples/sam3/output
 ```
 
-The same command works with a diagnostic crop-fill bundle too:
+The same command works with a diagnostic crop-fill same-input bundle too:
 
 ```bash
 cargo run -p candle-examples --example sam3 -- \
   --checkpoint /home/dnorthover/extcode/hf_sam3 \
   --parity-bundle candle-examples/examples/sam3/reference_crop_fill \
   --output-dir candle-examples/examples/sam3/output_crop_fill
+```
+
+## Reference Comparison Mode
+
+If your goal is to compare Candle's own preprocessing path against the upstream
+exact baseline, do not use `--parity-bundle` with a crop-fill reference bundle.
+That only compares both models on the same preprocessed tensor.
+
+Instead:
+
+1. export the normal upstream exact bundle
+2. run `--compare-reference-bundle` against that exact bundle
+3. let Candle run both `exact` and `crop_fill` itself
+4. compare final boxes, scores, and masks in the generated report
+
+Using the single-positive-box notebook case as the reference:
+
+```bash
+cargo run -p candle-examples --example sam3 --release -- \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --compare-reference-bundle candle-examples/examples/sam3/reference \
+  --output-dir candle-examples/examples/sam3/output/reference_compare
+```
+
+This writes:
+
+- `candle-examples/examples/sam3/output/reference_compare/exact/`
+- `candle-examples/examples/sam3/output/reference_compare/crop_fill/`
+- `candle-examples/examples/sam3/output/reference_compare/reference_comparison_report.json`
+
+The comparison report is output-level, not hidden-state parity. It includes:
+
+- reference and Candle best query indices
+- reference and Candle best scores
+- box mean absolute difference
+- box IoU
+- mask mean absolute difference
+- mask IoU at threshold `0.5`
+- Candle `prediction_overlay.png` vs reference `prediction_overlay_all_kept.png` mean absolute difference
+- Candle `prediction_overlay.png` vs reference `prediction_overlay_all_kept.png` RMSE
+
+For `crop_fill`, these evaluation metrics ignore anything outside the visible
+crop window in the original image. Box metrics are computed on boxes clipped to
+that crop region, and mask/image metrics ignore pixels outside it.
+
+You can run the same comparison mode against the explicit positive/negative box
+reference bundles too. This is the correct way to compare Candle's own
+`crop_fill` preprocessing against the upstream exact baseline for those cases.
+
+Positive box reference comparison:
+
+```bash
+cargo run -p candle-examples --example sam3 --release -- \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --compare-reference-bundle candle-examples/examples/sam3/reference_box_positive \
+  --output-dir candle-examples/examples/sam3/output/reference_compare_box_positive
+```
+
+Negative box reference comparison:
+
+```bash
+cargo run -p candle-examples --example sam3 --release -- \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --compare-reference-bundle candle-examples/examples/sam3/reference_box_negative \
+  --output-dir candle-examples/examples/sam3/output/reference_compare_box_negative
+```
+
+Each run writes both:
+
+- `exact/`
+- `crop_fill/`
+
+plus a top-level `reference_comparison_report.json` for that case.
+
+You can do the same for the `shoe` text example:
+
+```bash
+cargo run -p candle-examples --example sam3 --release -- \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --compare-reference-bundle candle-examples/examples/sam3/reference_shoe \
+  --output-dir candle-examples/examples/sam3/output/reference_compare_shoe
+```
+
+For the box-conditioned geometry checks above, run parity like this.
+
+Exact positive:
+
+```bash
+cargo run -p candle-examples --example sam3 --release -- \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --parity-bundle candle-examples/examples/sam3/reference_box_positive \
+  --output-dir candle-examples/examples/sam3/output/parity_box_positive \
+  --cpu
+```
+
+Exact negative:
+
+```bash
+cargo run -p candle-examples --example sam3 --release -- \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --parity-bundle candle-examples/examples/sam3/reference_box_negative \
+  --output-dir candle-examples/examples/sam3/output/parity_box_negative \
+  --cpu
+```
+
+Crop-fill positive:
+
+```bash
+cargo run -p candle-examples --example sam3 --release -- \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --parity-bundle candle-examples/examples/sam3/reference_crop_fill_box_positive \
+  --output-dir candle-examples/examples/sam3/output/parity_crop_fill_box_positive \
+  --cpu
+```
+
+Crop-fill negative:
+
+```bash
+cargo run -p candle-examples --example sam3 --release -- \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --parity-bundle candle-examples/examples/sam3/reference_crop_fill_box_negative \
+  --output-dir candle-examples/examples/sam3/output/parity_crop_fill_box_negative \
+  --cpu
 ```
 
 The parity report is written to:

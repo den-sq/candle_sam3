@@ -39,6 +39,8 @@ pub struct ParityBundleMetadata {
     #[serde(default)]
     pub image_size: Option<usize>,
     #[serde(default)]
+    pub preprocess_mode: Option<String>,
+    #[serde(default)]
     pub stage_order: Vec<String>,
 }
 
@@ -139,6 +141,10 @@ impl ParityBundle {
         self.tensors
             .get(key)
             .ok_or_else(|| anyhow::anyhow!("parity bundle is missing tensor `{key}`"))
+    }
+
+    pub fn tensor_opt(&self, key: &str) -> Option<&Tensor> {
+        self.tensors.get(key)
     }
 }
 

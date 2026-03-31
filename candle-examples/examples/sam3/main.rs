@@ -45,6 +45,10 @@ struct Args {
     #[arg(long)]
     parity_bundle: Option<String>,
 
+    /// Optional upstream exact reference bundle used for output-level comparison against Candle preprocessing.
+    #[arg(long)]
+    compare_reference_bundle: Option<String>,
+
     /// Absolute tolerance used for stage-by-stage parity comparisons.
     #[arg(long, default_value_t = 1e-4f32)]
     parity_atol: f32,
@@ -126,6 +130,14 @@ impl PreprocessMode {
             Self::CropFill => "crop_fill",
         }
     }
+
+    fn from_bundle_metadata(value: Option<&str>) -> Result<Self> {
+        match value.unwrap_or("exact") {
+            "exact" => Ok(Self::Exact),
+            "crop_fill" => Ok(Self::CropFill),
+            other => bail!("unsupported preprocess mode `{other}` in reference bundle metadata"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -137,6 +149,34 @@ struct ResizeToFillTransform {
     target_size: usize,
     original_width: usize,
     original_height: usize,
+}
+
+#[derive(Clone, Debug)]
+struct SelectedPrediction {
+    best_idx: usize,
+    best_score: f32,
+    best_box_xyxy: Vec<f32>,
+    mask_probs: Vec<Vec<f32>>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ReferenceComparisonEntry {
+    preprocess_mode: String,
+    bundle_preprocess_mode: String,
+    compared_region_xyxy_normalized: Option<Vec<f32>>,
+    reference_best_query_index: usize,
+    candle_best_query_index: usize,
+    reference_best_score: f32,
+    candle_best_score: f32,
+    score_abs_diff: f32,
+    reference_best_box_xyxy: Vec<f32>,
+    candle_best_box_xyxy: Vec<f32>,
+    box_l1_mean_abs_diff: f32,
+    box_iou: f32,
+    mask_mean_abs_diff: f32,
+    mask_iou_threshold_0_5: f32,
+    prediction_overlay_mean_abs_diff: Option<f32>,
+    prediction_overlay_rmse: Option<f32>,
 }
 
 impl ResizeToFillTransform {
@@ -168,6 +208,10 @@ impl ResizeToFillTransform {
             ((self.crop_x as f32) + box_xyxy[2] * target) / resized_w,
             ((self.crop_y as f32) + box_xyxy[3] * target) / resized_h,
         ]
+    }
+
+    fn visible_region_in_original(self) -> [f32; 4] {
+        self.map_box_to_original([0.0, 0.0, 1.0, 1.0])
     }
 }
 
@@ -345,6 +389,17 @@ fn load_render_image(image_path: &str) -> Result<RgbaImage> {
         .to_rgba8())
 }
 
+fn resolve_reference_render_path(bundle_path: &str, file_name: &str) -> PathBuf {
+    let path = PathBuf::from(bundle_path);
+    if path.is_dir() {
+        path.join(file_name)
+    } else {
+        path.parent()
+            .map(|parent| parent.join(file_name))
+            .unwrap_or_else(|| PathBuf::from(file_name))
+    }
+}
+
 fn best_kept_query(scores: &Tensor, threshold: f32) -> Result<(usize, f32)> {
     let scores = scores.to_vec3::<f32>()?;
     let mut best_kept: Option<(usize, f32)> = None;
@@ -362,6 +417,34 @@ fn best_kept_query(scores: &Tensor, threshold: f32) -> Result<(usize, f32)> {
         }
     }
     Ok(best_kept.unwrap_or(best_any))
+}
+
+fn kept_queries(scores: &Tensor, threshold: f32) -> Result<Vec<(usize, f32)>> {
+    let scores = scores.to_vec3::<f32>()?;
+    Ok(scores[0]
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, score)| {
+            let score = score[0];
+            (score > threshold).then_some((idx, score))
+        })
+        .collect())
+}
+
+fn palette_color(index: usize) -> [u8; 3] {
+    const PALETTE: [[u8; 3]; 10] = [
+        [31, 119, 180],
+        [255, 127, 14],
+        [44, 160, 44],
+        [214, 39, 40],
+        [148, 103, 189],
+        [140, 86, 75],
+        [227, 119, 194],
+        [127, 127, 127],
+        [188, 189, 34],
+        [23, 190, 207],
+    ];
+    PALETTE[index % PALETTE.len()]
 }
 
 fn normalized_box_to_rect(box_xyxy: [f32; 4], image_width: usize, image_height: usize) -> Rect {
@@ -524,6 +607,341 @@ fn decode_scores(decoder: &sam3::DecoderOutput) -> Result<Tensor> {
     }
 }
 
+fn decode_scores_from_tensors(
+    pred_logits: &Tensor,
+    presence_logits: Option<&Tensor>,
+) -> Result<Tensor> {
+    let class_scores = pred_logits.apply(&candle_nn::ops::sigmoid)?;
+    match presence_logits {
+        Some(presence_logits) => {
+            let batch_size = presence_logits.dim(0)?;
+            let presence_scores = presence_logits
+                .apply(&candle_nn::ops::sigmoid)?
+                .reshape((batch_size, 1, 1))?;
+            Ok(class_scores.broadcast_mul(&presence_scores)?)
+        }
+        None => Ok(class_scores),
+    }
+}
+
+fn upsample_mask_probs_to_render(
+    mask_logits: &Tensor,
+    image_size: usize,
+    image_path: &str,
+    preprocess_mode: PreprocessMode,
+) -> Result<Vec<Vec<f32>>> {
+    let render_image = load_render_image(image_path)?;
+    let render_width = render_image.width() as usize;
+    let render_height = render_image.height() as usize;
+    let crop_fill_transform = if preprocess_mode == PreprocessMode::CropFill {
+        Some(ResizeToFillTransform::from_original(
+            render_width,
+            render_height,
+            image_size,
+        ))
+    } else {
+        None
+    };
+    let best_mask_logits = mask_logits
+        .unsqueeze(0)?
+        .unsqueeze(0)?
+        .upsample_bilinear2d(image_size, image_size, false)?
+        .i((0, 0))?;
+    let best_mask_probs = candle_nn::ops::sigmoid(&best_mask_logits)?;
+    let best_mask_probs = best_mask_probs.to_vec2::<f32>()?;
+    if let Some(transform) = crop_fill_transform {
+        restore_crop_fill_mask_probs(&best_mask_probs, transform)
+    } else {
+        let best_mask_probs = Tensor::from_vec(
+            best_mask_probs
+                .iter()
+                .flat_map(|row| row.iter().copied())
+                .collect::<Vec<_>>(),
+            (image_size, image_size),
+            &Device::Cpu,
+        )?
+        .unsqueeze(0)?
+        .unsqueeze(0)?
+        .upsample_bilinear2d(render_height, render_width, false)?
+        .i((0, 0))?;
+        Ok(best_mask_probs.to_vec2::<f32>()?)
+    }
+}
+
+fn select_prediction_from_cxcywh_tensors(
+    image_path: &str,
+    image_size: usize,
+    preprocess_mode: PreprocessMode,
+    pred_boxes_cxcywh: &Tensor,
+    mask_logits: &Tensor,
+    scores: &Tensor,
+) -> Result<SelectedPrediction> {
+    let render_image = load_render_image(image_path)?;
+    let render_width = render_image.width() as usize;
+    let render_height = render_image.height() as usize;
+    let crop_fill_transform = if preprocess_mode == PreprocessMode::CropFill {
+        Some(ResizeToFillTransform::from_original(
+            render_width,
+            render_height,
+            image_size,
+        ))
+    } else {
+        None
+    };
+    let (best_idx, best_score) = best_kept_query(scores, DEFAULT_CONFIDENCE_THRESHOLD)?;
+    let pred_boxes = pred_boxes_cxcywh.to_vec3::<f32>()?;
+    let best_box_cxcywh = &pred_boxes[0][best_idx];
+    let best_box_model = cxcywh_to_xyxy(&BoxArg {
+        cx: best_box_cxcywh[0],
+        cy: best_box_cxcywh[1],
+        w: best_box_cxcywh[2],
+        h: best_box_cxcywh[3],
+    })
+    .to_vec();
+    let best_box_xyxy = if let Some(transform) = crop_fill_transform {
+        transform
+            .map_box_to_original([
+                best_box_model[0],
+                best_box_model[1],
+                best_box_model[2],
+                best_box_model[3],
+            ])
+            .to_vec()
+    } else {
+        best_box_model
+    };
+    let selected_mask_logits = mask_logits.i((0, best_idx))?;
+    let mask_probs = upsample_mask_probs_to_render(
+        &selected_mask_logits,
+        image_size,
+        image_path,
+        preprocess_mode,
+    )?;
+    Ok(SelectedPrediction {
+        best_idx,
+        best_score,
+        best_box_xyxy,
+        mask_probs,
+    })
+}
+
+fn select_prediction_from_xyxy_tensors(
+    image_path: &str,
+    image_size: usize,
+    preprocess_mode: PreprocessMode,
+    pred_boxes_xyxy: &Tensor,
+    mask_logits: &Tensor,
+    scores: &Tensor,
+) -> Result<SelectedPrediction> {
+    let (best_idx, best_score) = best_kept_query(scores, DEFAULT_CONFIDENCE_THRESHOLD)?;
+    let pred_boxes = pred_boxes_xyxy.to_vec3::<f32>()?;
+    let best_box_xyxy = pred_boxes[0][best_idx].clone();
+    let selected_mask_logits = mask_logits.i((0, best_idx))?;
+    let mask_probs = upsample_mask_probs_to_render(
+        &selected_mask_logits,
+        image_size,
+        image_path,
+        preprocess_mode,
+    )?;
+    Ok(SelectedPrediction {
+        best_idx,
+        best_score,
+        best_box_xyxy,
+        mask_probs,
+    })
+}
+
+fn crop_fill_comparison_region(
+    image_path: &str,
+    image_size: usize,
+    preprocess_mode: PreprocessMode,
+) -> Result<Option<[f32; 4]>> {
+    if preprocess_mode != PreprocessMode::CropFill {
+        return Ok(None);
+    }
+    let render_image = load_render_image(image_path)?;
+    let transform = ResizeToFillTransform::from_original(
+        render_image.width() as usize,
+        render_image.height() as usize,
+        image_size,
+    );
+    Ok(Some(transform.visible_region_in_original()))
+}
+
+fn clip_box_to_region(box_xyxy: &[f32], region: [f32; 4]) -> Vec<f32> {
+    let x0 = box_xyxy[0].min(box_xyxy[2]).clamp(region[0], region[2]);
+    let y0 = box_xyxy[1].min(box_xyxy[3]).clamp(region[1], region[3]);
+    let x1 = box_xyxy[0].max(box_xyxy[2]).clamp(region[0], region[2]);
+    let y1 = box_xyxy[1].max(box_xyxy[3]).clamp(region[1], region[3]);
+    vec![x0, y0, x1, y1]
+}
+
+fn box_iou(a: &[f32], b: &[f32]) -> f32 {
+    let ax0 = a[0].min(a[2]);
+    let ay0 = a[1].min(a[3]);
+    let ax1 = a[0].max(a[2]);
+    let ay1 = a[1].max(a[3]);
+    let bx0 = b[0].min(b[2]);
+    let by0 = b[1].min(b[3]);
+    let bx1 = b[0].max(b[2]);
+    let by1 = b[1].max(b[3]);
+    let ix0 = ax0.max(bx0);
+    let iy0 = ay0.max(by0);
+    let ix1 = ax1.min(bx1);
+    let iy1 = ay1.min(by1);
+    let iw = (ix1 - ix0).max(0.0);
+    let ih = (iy1 - iy0).max(0.0);
+    let inter = iw * ih;
+    let area_a = (ax1 - ax0).max(0.0) * (ay1 - ay0).max(0.0);
+    let area_b = (bx1 - bx0).max(0.0) * (by1 - by0).max(0.0);
+    let union = area_a + area_b - inter;
+    if union <= 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
+}
+
+fn mean_abs_box_diff(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(lhs, rhs)| (lhs - rhs).abs())
+        .sum::<f32>()
+        / a.len().max(1) as f32
+}
+
+fn mask_comparison_bounds(
+    width: usize,
+    height: usize,
+    region: Option<[f32; 4]>,
+) -> (usize, usize, usize, usize) {
+    match region {
+        Some(region) => {
+            let x0 = (region[0].clamp(0.0, 1.0) * width as f32)
+                .floor()
+                .clamp(0.0, width as f32) as usize;
+            let y0 = (region[1].clamp(0.0, 1.0) * height as f32)
+                .floor()
+                .clamp(0.0, height as f32) as usize;
+            let x1 = (region[2].clamp(0.0, 1.0) * width as f32)
+                .ceil()
+                .clamp(0.0, width as f32) as usize;
+            let y1 = (region[3].clamp(0.0, 1.0) * height as f32)
+                .ceil()
+                .clamp(0.0, height as f32) as usize;
+            (x0.min(width), y0.min(height), x1.min(width), y1.min(height))
+        }
+        None => (0, 0, width, height),
+    }
+}
+
+fn mask_mean_abs_diff(a: &[Vec<f32>], b: &[Vec<f32>], region: Option<[f32; 4]>) -> Result<f32> {
+    if a.len() != b.len() || a.first().map(Vec::len) != b.first().map(Vec::len) {
+        bail!(
+            "mask shape mismatch for comparison: lhs={}x{}, rhs={}x{}",
+            a.first().map(Vec::len).unwrap_or(0),
+            a.len(),
+            b.first().map(Vec::len).unwrap_or(0),
+            b.len()
+        )
+    }
+    let height = a.len();
+    let width = a.first().map(Vec::len).unwrap_or(0);
+    let (x0, y0, x1, y1) = mask_comparison_bounds(width, height, region);
+    let mut total = 0.0f32;
+    let mut count = 0usize;
+    for y in y0..y1 {
+        let lhs_row = &a[y];
+        let rhs_row = &b[y];
+        for x in x0..x1 {
+            let lhs = lhs_row[x];
+            let rhs = rhs_row[x];
+            total += (lhs - rhs).abs();
+            count += 1;
+        }
+    }
+    Ok(total / count.max(1) as f32)
+}
+
+fn mask_iou_at_threshold(
+    a: &[Vec<f32>],
+    b: &[Vec<f32>],
+    threshold: f32,
+    region: Option<[f32; 4]>,
+) -> Result<f32> {
+    if a.len() != b.len() || a.first().map(Vec::len) != b.first().map(Vec::len) {
+        bail!(
+            "mask shape mismatch for threshold IoU: lhs={}x{}, rhs={}x{}",
+            a.first().map(Vec::len).unwrap_or(0),
+            a.len(),
+            b.first().map(Vec::len).unwrap_or(0),
+            b.len()
+        )
+    }
+    let height = a.len();
+    let width = a.first().map(Vec::len).unwrap_or(0);
+    let (x0, y0, x1, y1) = mask_comparison_bounds(width, height, region);
+    let mut inter = 0usize;
+    let mut union = 0usize;
+    for y in y0..y1 {
+        let lhs_row = &a[y];
+        let rhs_row = &b[y];
+        for x in x0..x1 {
+            let lhs_on = lhs_row[x] >= threshold;
+            let rhs_on = rhs_row[x] >= threshold;
+            if lhs_on && rhs_on {
+                inter += 1;
+            }
+            if lhs_on || rhs_on {
+                union += 1;
+            }
+        }
+    }
+    Ok(if union == 0 {
+        1.0
+    } else {
+        inter as f32 / union as f32
+    })
+}
+
+fn image_diff_metrics(
+    lhs: &RgbaImage,
+    rhs: &RgbaImage,
+    region: Option<[f32; 4]>,
+) -> Result<(f32, f32)> {
+    let lhs_width = lhs.width() as usize;
+    let lhs_height = lhs.height() as usize;
+    let rhs_width = rhs.width() as usize;
+    let rhs_height = rhs.height() as usize;
+    if lhs_width != rhs_width || lhs_height != rhs_height {
+        bail!(
+            "image size mismatch for comparison: lhs={}x{}, rhs={}x{}",
+            lhs_width,
+            lhs_height,
+            rhs_width,
+            rhs_height
+        )
+    }
+    let (x0, y0, x1, y1) = mask_comparison_bounds(lhs_width, lhs_height, region);
+    let mut abs_total = 0.0f32;
+    let mut sq_total = 0.0f32;
+    let mut count = 0usize;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let lhs_px = lhs.get_pixel(x as u32, y as u32);
+            let rhs_px = rhs.get_pixel(x as u32, y as u32);
+            for channel in 0..4 {
+                let diff = (lhs_px[channel] as f32 - rhs_px[channel] as f32).abs() / 255.0;
+                abs_total += diff;
+                sq_total += diff * diff;
+                count += 1;
+            }
+        }
+    }
+    let denom = count.max(1) as f32;
+    Ok((abs_total / denom, (sq_total / denom).sqrt()))
+}
+
 fn prompt_color(label: u32, style: RenderStyle) -> Rgba<u8> {
     match style {
         RenderStyle::Combined => {
@@ -585,21 +1003,12 @@ fn save_render_outputs(
     input_boxes: &[BoxArg],
     input_box_labels: &[u32],
     render_style: RenderStyle,
-) -> Result<()> {
+) -> Result<SelectedPrediction> {
     std::fs::create_dir_all(output_dir)?;
     let mut overlay = load_render_image(image_path)?;
     let mut prediction_overlay = load_render_image(image_path)?;
     let render_width = overlay.width() as usize;
     let render_height = overlay.height() as usize;
-    let crop_fill_transform = if preprocess_mode == PreprocessMode::CropFill {
-        Some(ResizeToFillTransform::from_original(
-            render_width,
-            render_height,
-            image_size,
-        ))
-    } else {
-        None
-    };
     draw_prompt_annotations(
         &mut overlay,
         input_points,
@@ -619,28 +1028,17 @@ fn save_render_outputs(
         );
     }
 
-    let (best_idx, best_score) = best_kept_query(scores, DEFAULT_CONFIDENCE_THRESHOLD)?;
-    let pred_boxes = decoder.pred_boxes.to_vec3::<f32>()?;
-    let best_box_cxcywh = &pred_boxes[0][best_idx];
-    let best_box_model = cxcywh_to_xyxy(&BoxArg {
-        cx: best_box_cxcywh[0],
-        cy: best_box_cxcywh[1],
-        w: best_box_cxcywh[2],
-        h: best_box_cxcywh[3],
-    })
-    .to_vec();
-    let best_box = if let Some(transform) = crop_fill_transform {
-        transform
-            .map_box_to_original([
-                best_box_model[0],
-                best_box_model[1],
-                best_box_model[2],
-                best_box_model[3],
-            ])
-            .to_vec()
-    } else {
-        best_box_model.clone()
-    };
+    let selected = select_prediction_from_cxcywh_tensors(
+        image_path,
+        image_size,
+        preprocess_mode,
+        &decoder.pred_boxes,
+        &segmentation.mask_logits,
+        scores,
+    )?;
+    let best_idx = selected.best_idx;
+    let best_score = selected.best_score;
+    let best_box = selected.best_box_xyxy.clone();
     draw_hollow_rect_mut(
         &mut prediction_overlay,
         normalized_box_to_rect(
@@ -651,37 +1049,61 @@ fn save_render_outputs(
         Rgba([56, 201, 84, 255]),
     );
 
-    let best_mask_logits = segmentation
-        .mask_logits
-        .i((0, best_idx))?
-        .unsqueeze(0)?
-        .unsqueeze(0)?
-        .upsample_bilinear2d(image_size, image_size, false)?
-        .i((0, 0))?;
-    let best_mask_probs = candle_nn::ops::sigmoid(&best_mask_logits)?;
-    let best_mask_probs = best_mask_probs.to_vec2::<f32>()?;
-    let best_mask_probs = if let Some(transform) = crop_fill_transform {
-        restore_crop_fill_mask_probs(&best_mask_probs, transform)?
-    } else {
-        let best_mask_probs = Tensor::from_vec(
-            best_mask_probs
-                .iter()
-                .flat_map(|row| row.iter().copied())
-                .collect::<Vec<_>>(),
-            (image_size, image_size),
-            &Device::Cpu,
-        )?
-        .unsqueeze(0)?
-        .unsqueeze(0)?
-        .upsample_bilinear2d(render_height, render_width, false)?
-        .i((0, 0))?;
-        best_mask_probs.to_vec2::<f32>()?
-    };
+    let best_mask_probs = selected.mask_probs;
     let inverted_mask_probs = best_mask_probs
         .iter()
         .map(|row| row.iter().map(|prob| 1.0f32 - prob).collect::<Vec<_>>())
         .collect::<Vec<_>>();
     let mask = blend_mask(&mut prediction_overlay, &best_mask_probs, [56, 201, 84])?;
+
+    let mut prediction_overlay_all_kept = load_render_image(image_path)?;
+    let kept = kept_queries(scores, DEFAULT_CONFIDENCE_THRESHOLD)?;
+    let pred_boxes = decoder.pred_boxes.to_vec3::<f32>()?;
+    for (rank, (query_idx, query_score)) in kept.iter().enumerate() {
+        let box_cxcywh = &pred_boxes[0][*query_idx];
+        let box_model = cxcywh_to_xyxy(&BoxArg {
+            cx: box_cxcywh[0],
+            cy: box_cxcywh[1],
+            w: box_cxcywh[2],
+            h: box_cxcywh[3],
+        })
+        .to_vec();
+        let box_xyxy = if preprocess_mode == PreprocessMode::CropFill {
+            let transform =
+                ResizeToFillTransform::from_original(render_width, render_height, image_size);
+            transform
+                .map_box_to_original([box_model[0], box_model[1], box_model[2], box_model[3]])
+                .to_vec()
+        } else {
+            box_model
+        };
+        let query_mask_probs = upsample_mask_probs_to_render(
+            &segmentation.mask_logits.i((0, *query_idx))?,
+            image_size,
+            image_path,
+            preprocess_mode,
+        )?;
+        let color = palette_color(rank);
+        blend_mask_with_threshold(
+            &mut prediction_overlay_all_kept,
+            &query_mask_probs,
+            color,
+            0.5,
+        );
+        draw_hollow_rect_mut(
+            &mut prediction_overlay_all_kept,
+            normalized_box_to_rect(
+                [box_xyxy[0], box_xyxy[1], box_xyxy[2], box_xyxy[3]],
+                render_width,
+                render_height,
+            ),
+            Rgba([color[0], color[1], color[2], 255]),
+        );
+        println!(
+            "  kept query {rank}: idx={}, score={query_score:.4}, box={:?}",
+            query_idx, box_xyxy
+        );
+    }
 
     if matches!(render_style, RenderStyle::Combined) {
         overlay = prediction_overlay.clone();
@@ -689,11 +1111,13 @@ fn save_render_outputs(
 
     let overlay_path = output_dir.join("overlay.png");
     let prediction_overlay_path = output_dir.join("prediction_overlay.png");
+    let prediction_overlay_all_kept_path = output_dir.join("prediction_overlay_all_kept.png");
     let mask_path = output_dir.join("mask.png");
     let mask_sigmoid_path = output_dir.join("mask_sigmoid.png");
     let mask_one_minus_sigmoid_path = output_dir.join("mask_one_minus_sigmoid.png");
     overlay.save(&overlay_path)?;
     prediction_overlay.save(&prediction_overlay_path)?;
+    prediction_overlay_all_kept.save(&prediction_overlay_all_kept_path)?;
     mask.save(&mask_path)?;
     mask_probs_to_gray_image(&best_mask_probs).save(&mask_sigmoid_path)?;
     mask_probs_to_gray_image(&inverted_mask_probs).save(&mask_one_minus_sigmoid_path)?;
@@ -780,6 +1204,7 @@ fn save_render_outputs(
         "input_box_labels": input_box_labels,
         "overlay_path": overlay_path.display().to_string(),
         "prediction_overlay_path": prediction_overlay_path.display().to_string(),
+        "prediction_overlay_all_kept_path": prediction_overlay_all_kept_path.display().to_string(),
         "mask_path": mask_path.display().to_string(),
         "mask_sigmoid_path": mask_sigmoid_path.display().to_string(),
         "mask_one_minus_sigmoid_path": mask_one_minus_sigmoid_path.display().to_string(),
@@ -798,6 +1223,10 @@ fn save_render_outputs(
         "  prediction overlay: {}",
         prediction_overlay_path.display()
     );
+    println!(
+        "  prediction overlay all kept: {}",
+        prediction_overlay_all_kept_path.display()
+    );
     println!("  mask: {}", mask_path.display());
     println!("  mask sigmoid: {}", mask_sigmoid_path.display());
     println!(
@@ -805,7 +1234,12 @@ fn save_render_outputs(
         mask_one_minus_sigmoid_path.display()
     );
     println!("  summary: {}", summary_path.display());
-    Ok(())
+    Ok(SelectedPrediction {
+        best_idx,
+        best_score,
+        best_box_xyxy: best_box,
+        mask_probs: best_mask_probs,
+    })
 }
 
 fn build_geometry_prompt_from_parts(
@@ -903,6 +1337,36 @@ fn geometry_inputs_from_cli(args: &Args, device: &Device) -> Result<Option<Geome
         &args.box_labels,
         device,
     )
+}
+
+fn geometry_inputs_from_bundle(
+    metadata: &parity::ParityBundleMetadata,
+    device: &Device,
+) -> Result<Option<GeometryInputs>> {
+    let boxes = metadata
+        .boxes_cxcywh
+        .iter()
+        .map(|bbox| -> Result<BoxArg> {
+            if bbox.len() != 4 {
+                bail!(
+                    "reference bundle box metadata expected cx,cy,w,h, got {} values",
+                    bbox.len()
+                )
+            }
+            Ok(BoxArg {
+                cx: bbox[0],
+                cy: bbox[1],
+                w: bbox[2],
+                h: bbox[3],
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let box_labels = metadata
+        .box_labels
+        .iter()
+        .map(|label| if *label { 1u32 } else { 0u32 })
+        .collect::<Vec<_>>();
+    build_geometry_prompt_from_parts(&[], &[], &boxes, &box_labels, device)
 }
 
 fn prompt_label(text_prompt: Option<&str>, geometry_inputs: Option<&GeometryInputs>) -> String {
@@ -1079,7 +1543,7 @@ fn run_vision_and_geometry(
     geometry_inputs: Option<&GeometryInputs>,
     render_style: RenderStyle,
     device: &Device,
-) -> Result<()> {
+) -> Result<Option<SelectedPrediction>> {
     let config = model.config();
     let (original_image, initial_h, initial_w) = candle_examples::load_image(image_path, None)?;
     let mut state = model.set_image(&original_image)?;
@@ -1207,7 +1671,7 @@ fn run_vision_and_geometry(
             .map(|inputs| inputs.box_labels.as_slice())
             .unwrap_or(&[]);
         let label = prompt_label(text_prompt, geometry_inputs);
-        save_render_outputs(
+        let selected = save_render_outputs(
             image_path,
             image_size,
             output_dir,
@@ -1223,8 +1687,194 @@ fn run_vision_and_geometry(
             geometry_box_labels,
             render_style,
         )?;
+        return Ok(Some(selected));
     }
 
+    Ok(None)
+}
+
+fn run_reference_comparison(
+    model: &sam3::Sam3ImageModel,
+    bundle_path: &str,
+    output_dir: &Path,
+    device: &Device,
+) -> Result<()> {
+    let bundle = parity::ParityBundle::load(Path::new(bundle_path))?;
+    let reference_prediction_overlay_all_kept_path =
+        resolve_reference_render_path(bundle_path, "prediction_overlay_all_kept.png");
+    let reference_prediction_overlay_all_kept =
+        if reference_prediction_overlay_all_kept_path.exists() {
+            Some(load_render_image(
+                &reference_prediction_overlay_all_kept_path
+                    .display()
+                    .to_string(),
+            )?)
+        } else {
+            None
+        };
+    let image_path = bundle
+        .metadata
+        .image_path
+        .as_deref()
+        .context("reference comparison requires `image_path` in reference bundle metadata")?;
+    let image_size = bundle
+        .metadata
+        .image_size
+        .unwrap_or(model.config().image.image_size);
+    let reference_preprocess_mode =
+        PreprocessMode::from_bundle_metadata(bundle.metadata.preprocess_mode.as_deref())?;
+    let text_prompt_for_render = bundle
+        .metadata
+        .prompt
+        .as_deref()
+        .or(bundle.metadata.effective_prompt.as_deref());
+    let geometry_inputs = geometry_inputs_from_bundle(&bundle.metadata, device)?;
+    let geometry_points = geometry_inputs
+        .as_ref()
+        .map(|inputs| inputs.points.as_slice())
+        .unwrap_or(&[]);
+    let geometry_point_labels = geometry_inputs
+        .as_ref()
+        .map(|inputs| inputs.point_labels.as_slice())
+        .unwrap_or(&[]);
+    let geometry_boxes = geometry_inputs
+        .as_ref()
+        .map(|inputs| inputs.boxes.as_slice())
+        .unwrap_or(&[]);
+    let geometry_box_labels = geometry_inputs
+        .as_ref()
+        .map(|inputs| inputs.box_labels.as_slice())
+        .unwrap_or(&[]);
+
+    let input_ids = bundle.tensor("inputs.input_ids")?.to_device(device)?;
+    let attention_mask = bundle.tensor("inputs.attention_mask")?.to_device(device)?;
+    let text_encoding = model.encode_text_tokens(&input_ids, &attention_mask)?;
+
+    let reference_scores = decode_scores_from_tensors(
+        bundle.tensor("decoder.pred_logits")?,
+        bundle.tensor_opt("decoder.presence_logits"),
+    )?;
+    let reference_selected = select_prediction_from_xyxy_tensors(
+        image_path,
+        image_size,
+        reference_preprocess_mode,
+        bundle.tensor("decoder.pred_boxes_xyxy")?,
+        bundle.tensor("segmentation.mask_logits")?,
+        &reference_scores,
+    )?;
+
+    let mut comparisons = Vec::new();
+    for preprocess_mode in [PreprocessMode::Exact, PreprocessMode::CropFill] {
+        let mode_output_dir = output_dir.join(preprocess_mode.as_str());
+        let candle_selected = run_vision_and_geometry(
+            model,
+            image_path,
+            Some(image_size),
+            &mode_output_dir,
+            preprocess_mode,
+            text_prompt_for_render,
+            Some(&text_encoding),
+            geometry_inputs.as_ref(),
+            RenderStyle::Combined,
+            device,
+        )?
+        .context("reference comparison expected a rendered prediction for this bundle")?;
+        let compared_region = crop_fill_comparison_region(image_path, image_size, preprocess_mode)?;
+        let reference_box_for_metrics = if let Some(region) = compared_region {
+            clip_box_to_region(&reference_selected.best_box_xyxy, region)
+        } else {
+            reference_selected.best_box_xyxy.clone()
+        };
+        let candle_box_for_metrics = if let Some(region) = compared_region {
+            clip_box_to_region(&candle_selected.best_box_xyxy, region)
+        } else {
+            candle_selected.best_box_xyxy.clone()
+        };
+
+        let entry = ReferenceComparisonEntry {
+            preprocess_mode: preprocess_mode.as_str().to_string(),
+            bundle_preprocess_mode: reference_preprocess_mode.as_str().to_string(),
+            compared_region_xyxy_normalized: compared_region.map(|region| region.to_vec()),
+            reference_best_query_index: reference_selected.best_idx,
+            candle_best_query_index: candle_selected.best_idx,
+            reference_best_score: reference_selected.best_score,
+            candle_best_score: candle_selected.best_score,
+            score_abs_diff: (reference_selected.best_score - candle_selected.best_score).abs(),
+            reference_best_box_xyxy: reference_selected.best_box_xyxy.clone(),
+            candle_best_box_xyxy: candle_selected.best_box_xyxy.clone(),
+            box_l1_mean_abs_diff: mean_abs_box_diff(
+                &reference_box_for_metrics,
+                &candle_box_for_metrics,
+            ),
+            box_iou: box_iou(&reference_box_for_metrics, &candle_box_for_metrics),
+            mask_mean_abs_diff: mask_mean_abs_diff(
+                &reference_selected.mask_probs,
+                &candle_selected.mask_probs,
+                compared_region,
+            )?,
+            mask_iou_threshold_0_5: mask_iou_at_threshold(
+                &reference_selected.mask_probs,
+                &candle_selected.mask_probs,
+                0.5,
+                compared_region,
+            )?,
+            prediction_overlay_mean_abs_diff: if let Some(reference_overlay) =
+                reference_prediction_overlay_all_kept.as_ref()
+            {
+                let candle_overlay = load_render_image(
+                    &mode_output_dir
+                        .join("prediction_overlay.png")
+                        .display()
+                        .to_string(),
+                )?;
+                Some(image_diff_metrics(&candle_overlay, reference_overlay, compared_region)?.0)
+            } else {
+                None
+            },
+            prediction_overlay_rmse: if let Some(reference_overlay) =
+                reference_prediction_overlay_all_kept.as_ref()
+            {
+                let candle_overlay = load_render_image(
+                    &mode_output_dir
+                        .join("prediction_overlay.png")
+                        .display()
+                        .to_string(),
+                )?;
+                Some(image_diff_metrics(&candle_overlay, reference_overlay, compared_region)?.1)
+            } else {
+                None
+            },
+        };
+        comparisons.push(entry);
+
+        let summary_path = mode_output_dir.join("reference_comparison.json");
+        std::fs::write(
+            &summary_path,
+            serde_json::to_string_pretty(comparisons.last().unwrap())?,
+        )?;
+        println!(
+            "reference comparison ({}) written to {}",
+            preprocess_mode.as_str(),
+            summary_path.display()
+        );
+    }
+
+    let summary = json!({
+        "mode": "reference_comparison",
+        "reference_bundle": Path::new(bundle_path).display().to_string(),
+        "reference_preprocess_mode": reference_preprocess_mode.as_str(),
+        "image_path": image_path,
+        "text_prompt": text_prompt_for_render,
+        "input_boxes_cxcywh_normalized": geometry_boxes.iter().map(|bbox| vec![bbox.cx, bbox.cy, bbox.w, bbox.h]).collect::<Vec<_>>(),
+        "input_box_labels": geometry_box_labels,
+        "input_points_xy_normalized": geometry_points.iter().map(|point| vec![point.x, point.y]).collect::<Vec<_>>(),
+        "input_point_labels": geometry_point_labels,
+        "comparisons": comparisons,
+    });
+    let summary_path = output_dir.join("reference_comparison_report.json");
+    std::fs::create_dir_all(output_dir)?;
+    std::fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)?;
+    println!("reference comparison report: {}", summary_path.display());
     Ok(())
 }
 
@@ -1354,6 +2004,7 @@ pub fn main() -> anyhow::Result<()> {
         || !args.points.is_empty()
         || !args.boxes.is_empty()
         || args.parity_bundle.is_some()
+        || args.compare_reference_bundle.is_some()
         || args.batch_manifest.is_some()
         || args.image_predictor_example)
         && checkpoint_source.is_none()
@@ -1362,6 +2013,22 @@ pub fn main() -> anyhow::Result<()> {
     }
     if (!args.points.is_empty() || !args.boxes.is_empty()) && args.image.is_none() {
         bail!("`--point` and `--box` prompts require `--image` so the geometry encoder has image features")
+    }
+    if args.parity_bundle.is_some() && args.compare_reference_bundle.is_some() {
+        bail!("use either `--parity-bundle` or `--compare-reference-bundle`, not both")
+    }
+    if args.compare_reference_bundle.is_some()
+        && (args.image.is_some()
+            || args.prompt.is_some()
+            || args.tokenizer.is_some()
+            || !args.points.is_empty()
+            || !args.boxes.is_empty()
+            || args.batch_manifest.is_some()
+            || args.image_predictor_example)
+    {
+        bail!(
+            "`--compare-reference-bundle` derives image/prompt inputs from the exported bundle; omit `--image`, `--prompt`, `--tokenizer`, `--point`, `--box`, `--batch-manifest`, and `--image-predictor-example`"
+        )
     }
     if args.parity_bundle.is_some()
         && (args.image.is_some()
@@ -1409,6 +2076,18 @@ pub fn main() -> anyhow::Result<()> {
                 output_dir: PathBuf::from(&args.output_dir),
                 atol: args.parity_atol,
             },
+            &device,
+        )?;
+        return Ok(());
+    }
+
+    if let Some(bundle_path) = args.compare_reference_bundle.as_deref() {
+        run_reference_comparison(
+            model
+                .as_ref()
+                .context("SAM3 reference comparison mode requires `--checkpoint <sam3.pt>`")?,
+            bundle_path,
+            Path::new(&args.output_dir),
             &device,
         )?;
         return Ok(());
