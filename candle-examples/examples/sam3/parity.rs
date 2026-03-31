@@ -12,6 +12,8 @@ const REFERENCE_METADATA_FILE: &str = "reference.json";
 const INPUT_IMAGE_KEY: &str = "inputs.image";
 const INPUT_IDS_KEY: &str = "inputs.input_ids";
 const INPUT_ATTENTION_MASK_KEY: &str = "inputs.attention_mask";
+const INPUT_BOXES_KEY: &str = "inputs.boxes_cxcywh";
+const INPUT_BOX_LABELS_KEY: &str = "inputs.box_labels";
 
 #[derive(Debug, Clone)]
 pub struct ParityOptions {
@@ -28,6 +30,12 @@ pub struct ParityBundleMetadata {
     pub image_path: Option<String>,
     #[serde(default)]
     pub prompt: Option<String>,
+    #[serde(default)]
+    pub effective_prompt: Option<String>,
+    #[serde(default)]
+    pub boxes_cxcywh: Vec<Vec<f32>>,
+    #[serde(default)]
+    pub box_labels: Vec<bool>,
     #[serde(default)]
     pub image_size: Option<usize>,
     #[serde(default)]
@@ -207,6 +215,25 @@ fn resolve_bundle_paths(path: &Path) -> (PathBuf, PathBuf) {
     }
 }
 
+fn geometry_prompt_from_bundle(
+    bundle: &ParityBundle,
+    device: &Device,
+) -> Result<sam3::GeometryPrompt> {
+    let boxes = match bundle.tensors.get(INPUT_BOXES_KEY) {
+        Some(boxes) => Some(boxes.to_device(device)?.to_dtype(DType::F32)?),
+        None => None,
+    };
+    let box_labels = match bundle.tensors.get(INPUT_BOX_LABELS_KEY) {
+        Some(labels) => Some(labels.to_device(device)?.to_dtype(DType::U32)?),
+        None => None,
+    };
+    Ok(sam3::GeometryPrompt {
+        boxes_cxcywh: boxes,
+        box_labels,
+        ..Default::default()
+    })
+}
+
 fn compute_actual_stages(
     model: &sam3::Sam3ImageModel,
     bundle: &ParityBundle,
@@ -224,6 +251,7 @@ fn compute_actual_stages(
         .tensor(INPUT_ATTENTION_MASK_KEY)?
         .to_device(device)?
         .to_dtype(DType::U8)?;
+    let geometry_prompt = geometry_prompt_from_bundle(bundle, device)?;
 
     let text = model.encode_text_tokens(&input_ids, &attention_mask)?;
     let expects_block_outputs = bundle
@@ -248,7 +276,7 @@ fn compute_actual_stages(
             (model.encode_image_trunk(&image)?, None, BTreeMap::new())
         };
     let visual = model.encode_image_features(&image)?;
-    let geometry = model.encode_geometry_prompt(&sam3::GeometryPrompt::default(), &visual)?;
+    let geometry = model.encode_geometry_prompt(&geometry_prompt, &visual)?;
     let prompt = sam3::EncodedPrompt {
         features: Tensor::cat(&[&text.memory, &geometry.features], 0)?,
         padding_mask: Tensor::cat(&[&text.attention_mask, &geometry.padding_mask], 1)?,
@@ -283,6 +311,11 @@ fn compute_actual_stages(
     for (idx, feature_map) in visual.backbone_fpn.iter().enumerate() {
         stages.insert(format!("vision.backbone_fpn.{idx}"), feature_map.clone());
     }
+    stages.insert("geometry.features".to_owned(), geometry.features.clone());
+    stages.insert(
+        "geometry.padding_mask".to_owned(),
+        geometry.padding_mask.to_dtype(DType::U8)?,
+    );
     stages.insert("fusion.memory".to_owned(), fused.memory.clone());
     stages.insert("fusion.pos_embed".to_owned(), fused.pos_embed.clone());
     stages.insert(
