@@ -1068,6 +1068,7 @@ fn save_render_outputs(
     let mut prediction_overlay_all_kept = load_render_image(image_path)?;
     let kept = kept_queries(scores, DEFAULT_CONFIDENCE_THRESHOLD)?;
     let pred_boxes = decoder.pred_boxes.to_vec3::<f32>()?;
+    let mut kept_queries_debug = Vec::with_capacity(kept.len());
     for (rank, (query_idx, query_score)) in kept.iter().enumerate() {
         let box_cxcywh = &pred_boxes[0][*query_idx];
         let box_model = cxcywh_to_xyxy(&BoxArg {
@@ -1086,6 +1087,12 @@ fn save_render_outputs(
         } else {
             box_model
         };
+        kept_queries_debug.push(json!({
+            "rank": rank,
+            "query_index": query_idx,
+            "score": query_score,
+            "box_xyxy_normalized": box_xyxy,
+        }));
         let query_mask_probs = upsample_mask_probs_to_render(
             &segmentation.mask_logits.i((0, *query_idx))?,
             image_size,
@@ -1207,6 +1214,11 @@ fn save_render_outputs(
         "best_query_index": best_idx,
         "best_score": best_score,
         "best_box_xyxy_normalized": best_box,
+        "kept_queries_debug": if preprocess_mode == PreprocessMode::Exact {
+            serde_json::Value::Array(kept_queries_debug)
+        } else {
+            serde_json::Value::Null
+        },
         "input_points_xy_normalized": input_points.iter().map(|point| vec![point.x, point.y]).collect::<Vec<_>>(),
         "input_point_labels": input_point_labels,
         "input_boxes_cxcywh_normalized": input_boxes.iter().map(|bbox| vec![bbox.cx, bbox.cy, bbox.w, bbox.h]).collect::<Vec<_>>(),
