@@ -174,29 +174,47 @@ impl GeometryEncoderLayer {
     ) -> Result<Tensor> {
         let residual = prompt_feats;
         let hidden_states = self.norm1.forward(prompt_feats)?;
+        eprintln!("[PHASE4] After norm1");
+        
         let hidden_states = self.self_attn.forward(
             &hidden_states,
             &hidden_states,
             Some(prompt_padding_mask),
             None,
         )?;
+        eprintln!("[PHASE4] After self_attn");
+        
         let hidden_states = (hidden_states + residual)?;
+        eprintln!("[PHASE4] After self_attn residual");
 
         let residual = &hidden_states;
         let hidden_states = self.norm2.forward(&hidden_states)?;
+        eprintln!("[PHASE4] After norm2");
+        
         let hidden_states = self.cross_attn_image.forward(
             &hidden_states,
             vision_feats,
             None,
             Some(vision_pos_encoding),
         )?;
+        eprintln!("[PHASE4] After cross_attn");
+        
         let hidden_states = (hidden_states + residual)?;
+        eprintln!("[PHASE4] After cross_attn residual");
 
         let residual = &hidden_states;
         let hidden_states = self.norm3.forward(&hidden_states)?;
+        eprintln!("[PHASE4] After norm3");
+        
         let hidden_states = self.linear1.forward(&hidden_states)?.relu()?;
+        eprintln!("[PHASE4] After linear1+relu");
+        
         let hidden_states = self.linear2.forward(&hidden_states)?;
-        hidden_states + residual
+        eprintln!("[PHASE4] After linear2");
+        
+        let result = (hidden_states + residual)?;
+        eprintln!("[PHASE4] After FFN residual");
+        Ok(result)
     }
 }
 
@@ -398,12 +416,18 @@ impl SequenceGeometryEncoder {
             features = final_proj.forward(&features)?;
         }
         features = self.norm.forward(&features)?;
-        for layer in self.encode.iter() {
+        eprintln!("[PHASE3] After initial norm, features shape: {:?}", features.dims());
+        
+        for (layer_idx, layer) in self.encode.iter().enumerate() {
+            eprintln!("[PHASE3] Before layer {}", layer_idx);
             features =
                 layer.forward(&features, &vision_feats, &vision_pos_embeds, &padding_mask)?;
+            eprintln!("[PHASE3] After layer {}, features shape: {:?}", layer_idx, features.dims());
         }
+        
         if let Some(encode_norm) = &self.encode_norm {
             features = encode_norm.forward(&features)?;
+            eprintln!("[PHASE3] After encode_norm");
         }
         Ok(EncodedPrompt {
             features,
@@ -516,23 +540,35 @@ impl SequenceGeometryEncoder {
             boxes_cxcywh.device(),
         )?;
         let label_embed = self.label_embed.forward(&box_labels)?;
-        let mut box_features = label_embed;
+        eprintln!("[PHASE2] label_embed shape: {:?}", label_embed.dims());
+        let mut box_features = label_embed.clone();
 
         if let Some(boxes_direct_project) = &self.boxes_direct_project {
-            box_features =
-                box_features.broadcast_add(&boxes_direct_project.forward(&boxes_cxcywh)?)?;
+            let direct_proj = boxes_direct_project.forward(&boxes_cxcywh)?;
+            eprintln!("[PHASE2] direct_proj shape: {:?}", direct_proj.dims());
+            box_features = box_features.broadcast_add(&direct_proj)?;
+            eprintln!("[PHASE2] After adding direct_proj");
         }
         if let Some(boxes_pool_project) = &self.boxes_pool_project {
             let pooled_boxes =
                 sample_boxes_nearest(vision_feats, &boxes_cxcywh, self.config.roi_size)?;
             let pooled_boxes = boxes_pool_project.forward(&pooled_boxes)?;
             let pooled_boxes = pooled_boxes.reshape((seq_len, batch_size, self.config.d_model))?;
+            eprintln!("[PHASE2] pool_proj shape: {:?}", pooled_boxes.dims());
             box_features = box_features.broadcast_add(&pooled_boxes)?;
+            eprintln!("[PHASE2] After adding pool_proj");
         }
         if let Some(boxes_pos_enc_project) = &self.boxes_pos_enc_project {
             let pos_enc = encode_boxes_position(&boxes_cxcywh, self.config.d_model)?;
-            box_features = box_features.broadcast_add(&boxes_pos_enc_project.forward(&pos_enc)?)?;
+            eprintln!("[PHASE2] pos_enc shape: {:?}", pos_enc.dims());
+            let pos_enc_proj = boxes_pos_enc_project.forward(&pos_enc)?;
+            eprintln!("[PHASE2] pos_enc_proj shape: {:?}", pos_enc_proj.dims());
+            box_features = box_features.broadcast_add(&pos_enc_proj)?;
+            eprintln!("[PHASE2] After adding pos_enc_proj");
         }
+        
+        eprintln!("[PHASE2] FINAL box_features shape: {:?}", box_features.dims());
+        
         Ok((
             box_features,
             Tensor::zeros((batch_size, seq_len), DType::U8, boxes_cxcywh.device())?,
@@ -683,6 +719,13 @@ fn encode_boxes_position(boxes_cxcywh: &Tensor, d_model: usize) -> Result<Tensor
     let batch_first = boxes_cxcywh.transpose(0, 1)?.contiguous()?;
     let boxes = batch_first.to_vec3::<f32>()?;
     let num_pos_feats = d_model / 2;
+    
+    // DEBUG: Print input box
+    if !boxes.is_empty() && !boxes[0].is_empty() {
+        eprintln!("[encode_boxes_position] boxes[0][0] = [{}, {}, {}, {}] (cx, cy, w, h)", 
+            boxes[0][0][0], boxes[0][0][1], boxes[0][0][2], boxes[0][0][3]);
+    }
+    
     let total = boxes.len() * boxes[0].len();
     let mut pos_y = vec![0f32; total * num_pos_feats];
     let mut pos_x = vec![0f32; total * num_pos_feats];
@@ -704,27 +747,57 @@ fn encode_boxes_position(boxes_cxcywh: &Tensor, d_model: usize) -> Result<Tensor
             hw[flat_idx * 2 + 1] = box_coords[2];
         }
     }
+    
+    // DEBUG: Print specific position encoding values
+    if total > 0 {
+        eprintln!("[encode_boxes_position] pos_y[26]={}, pos_x[26]={}", 
+            pos_y.get(26).copied().unwrap_or(-999.0),
+            pos_x.get(26).copied().unwrap_or(-999.0));
+    }
+    
     let device = boxes_cxcywh.device();
     let pos_y = Tensor::from_slice(&pos_y, (boxes.len(), boxes[0].len(), num_pos_feats), device)?;
     let pos_x = Tensor::from_slice(&pos_x, (boxes.len(), boxes[0].len(), num_pos_feats), device)?;
     let hw = Tensor::from_slice(&hw, (boxes.len(), boxes[0].len(), 2), device)?;
-    Tensor::cat(&[&pos_y, &pos_x, &hw], 2)?
+    
+    // DEBUG: Print tensor shapes and first values
+    eprintln!("[encode_boxes_position] pos_y shape: {:?}, pos_x shape: {:?}", pos_y.dims(), pos_x.dims());
+    
+    let result = Tensor::cat(&[&pos_y, &pos_x, &hw], 2)?
         .transpose(0, 1)?
         .contiguous()?
-        .to_dtype(boxes_cxcywh.dtype())
+        .to_dtype(boxes_cxcywh.dtype())?;
+    
+    // DEBUG: Print final shape
+    eprintln!("[encode_boxes_position] Final output shape: {:?}", result.dims());
+    
+    Ok(result)
 }
 
 fn encode_1d_position(coord: f32, num_pos_feats: usize, out: &mut [f32]) {
     let temperature = 10_000f32;
-    let coord = coord * 2.0 * PI;
+    let coord_scaled = coord * 2.0 * PI;
+    
+    // DEBUG: Print first few and specific indices
+    let debug_this = coord > 0.64 && coord < 0.66; // cy=0.653 range
+    if debug_this {
+        eprintln!("[encode_1d] input_coord={}, scaled_coord={}, num_pos_feats={}", coord, coord_scaled, num_pos_feats);
+    }
+    
     for idx in 0..num_pos_feats {
         let exponent = 2.0 * (idx / 2) as f32 / num_pos_feats as f32;
-        let angle = coord / temperature.powf(exponent);
+        let angle = coord_scaled / temperature.powf(exponent);
         out[idx] = if idx % 2 == 0 {
             angle.sin()
         } else {
             angle.cos()
         };
+        
+        // DEBUG: Print specific indices
+        if debug_this && (idx == 26 || (idx >= 0 && idx < 3)) {
+            eprintln!("[encode_1d] idx={}, exponent={}, angle={}, out[{}]={}", 
+                idx, exponent, angle, idx, out[idx]);
+        }
     }
 }
 
@@ -819,51 +892,45 @@ fn bilinear_sample(
     height: usize,
     channels: usize,
 ) -> Result<Tensor> {
-    // Convert pixel coordinates as per grid_sample with align_corners=False:
-    // For normalized [0, 1] coordinates:
-    // pixel = norm_coord * size - 0.5
-    // This matches PyTorch grid_sample behavior
+    // Implement bilinear interpolation matching PyTorch grid_sample with align_corners=False
+    // For normalized [0, 1] coordinates: pixel = norm_coord * size - 0.5
+    
     let x = x_pixel - 0.5;
     let y = y_pixel - 0.5;
     
-    // Clamp to valid range (-0.5, size-0.5)
-    let max_x = (width as f32) - 0.5;
-    let max_y = (height as f32) - 0.5;
-    let x = x.clamp(-0.5, max_x);
-    let y = y.clamp(-0.5, max_y);
+    // Get floor and ceil integer coordinates
+    let x0_i32 = x.floor() as i32;
+    let y0_i32 = y.floor() as i32;
+    let x1_i32 = x0_i32 + 1;
+    let y1_i32 = y0_i32 + 1;
     
-    // Get integer and fractional parts
-    let x0 = x.floor() as i32;
-    let y0 = y.floor() as i32;
-    let mut x0_usize = x0.max(0) as usize;
-    let mut y0_usize = y0.max(0) as usize;
-    let mut x1_usize = ((x0 + 1).min(width as i32 - 1)).max(0) as usize;
-    let mut y1_usize = ((y0 + 1).min(height as i32 - 1)).max(0) as usize;
-    
-    // Handle edge cases where coordinates are outside the image
-    if x0 < 0 {
-        x0_usize = 0;
-        x1_usize = 0;
-    }
-    if y0 < 0 {
-        y0_usize = 0;
-        y1_usize = 0;
-    }
-    
-    let fx = x - x0 as f32;
-    let fy = y - y0 as f32;
+    // Get interpolation weights
+    let fx = x - x0_i32 as f32;
+    let fy = y - y0_i32 as f32;
     let fx = fx.max(0.0).min(1.0);
     let fy = fy.max(0.0).min(1.0);
     let fx_inv = 1.0 - fx;
     let fy_inv = 1.0 - fy;
     
-    // Get the four neighboring values as vectors (in f32 for computation)
-    let v00 = vision_feats.i((batch_idx, .., y0_usize, x0_usize))?.to_vec1::<f32>()?;
-    let v01 = vision_feats.i((batch_idx, .., y0_usize, x1_usize))?.to_vec1::<f32>()?;
-    let v10 = vision_feats.i((batch_idx, .., y1_usize, x0_usize))?.to_vec1::<f32>()?;
-    let v11 = vision_feats.i((batch_idx, .., y1_usize, x1_usize))?.to_vec1::<f32>()?;
+    // Helper to safely get values with out-of-bounds handling (zero padding)
+    let get_value = |xi: i32, yi: i32| -> Result<Vec<f32>> {
+        if xi < 0 || xi >= width as i32 || yi < 0 || yi >= height as i32 {
+            // Out of bounds: return zeros
+            Ok(vec![0.0f32; channels])
+        } else {
+            vision_feats
+                .i((batch_idx, .., yi as usize, xi as usize))?
+                .to_vec1::<f32>()
+        }
+    };
     
-    // Perform bilinear interpolation: f(x,y) = f00*(1-fx)*(1-fy) + f01*fx*(1-fy) + f10*(1-fx)*fy + f11*fx*fy
+    // Get the four neighboring values
+    let v00 = get_value(x0_i32, y0_i32)?;
+    let v01 = get_value(x1_i32, y0_i32)?;
+    let v10 = get_value(x0_i32, y1_i32)?;
+    let v11 = get_value(x1_i32, y1_i32)?;
+    
+    // Perform bilinear interpolation
     let w00 = fx_inv * fy_inv;
     let w01 = fx * fy_inv;
     let w10 = fx_inv * fy;
@@ -876,7 +943,6 @@ fn bilinear_sample(
     
     let device = vision_feats.device();
     let result_tensor = Tensor::from_vec(result, (channels,), device)?;
-    // Convert back to original dtype to match vision_feats
     result_tensor.to_dtype(vision_feats.dtype())
 }
 
