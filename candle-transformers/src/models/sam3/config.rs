@@ -60,6 +60,7 @@ pub struct VisionConfig {
     pub use_rope: bool,
     pub use_interp_rope: bool,
     pub rope_theta: f64,
+    pub rope_pt_size: usize,
     pub retain_cls_token: bool,
     pub ln_pre: bool,
 }
@@ -81,6 +82,7 @@ impl Default for VisionConfig {
             use_rope: true,
             use_interp_rope: true,
             rope_theta: 10_000.0,
+            rope_pt_size: 24,
             retain_cls_token: false,
             ln_pre: true,
         }
