@@ -51,3 +51,4 @@ bria.wav
 # Test python environment for debugging
 .venv
 candle-examples/examples/sam3/output
+candle-examples/examples/sam3/reference*
