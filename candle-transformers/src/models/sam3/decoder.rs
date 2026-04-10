@@ -4,6 +4,7 @@ use candle::{DType, IndexOp, Result, Tensor};
 use candle_nn::{LayerNorm, Linear, Module, VarBuilder};
 
 use super::config::DecoderConfig;
+use super::debug;
 use super::encoder::FusionEncoderOutput;
 
 #[derive(Debug)]
@@ -122,6 +123,16 @@ struct MlpHead {
 
 impl MlpHead {
     fn new(dims: &[usize], residual: bool, out_norm: bool, vb: VarBuilder) -> Result<Self> {
+        Self::new_with_out_norm_eps(dims, residual, out_norm, 1e-6, vb)
+    }
+
+    fn new_with_out_norm_eps(
+        dims: &[usize],
+        residual: bool,
+        out_norm: bool,
+        out_norm_eps: f64,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         if dims.len() < 2 {
             candle::bail!("sam3 mlp head requires at least two dimensions")
         }
@@ -136,7 +147,7 @@ impl MlpHead {
         let out_norm = if out_norm {
             Some(candle_nn::layer_norm(
                 *dims.last().unwrap(),
-                1e-6,
+                out_norm_eps,
                 vb.pp("out_norm"),
             )?)
         } else {
@@ -183,10 +194,11 @@ struct DotProductScoringHead {
 impl DotProductScoringHead {
     fn new(config: &DecoderConfig, vb: VarBuilder) -> Result<Self> {
         let prompt_mlp = if vb.contains_tensor("prompt_mlp.layers.0.weight") {
-            Some(MlpHead::new(
+            Some(MlpHead::new_with_out_norm_eps(
                 &[config.d_model, config.dim_feedforward, config.d_model],
                 true,
                 true,
+                1e-5,
                 vb.pp("prompt_mlp"),
             )?)
         } else {
@@ -208,12 +220,19 @@ impl DotProductScoringHead {
             Some(prompt_mlp) => prompt_mlp.forward(prompt)?,
             None => prompt.clone(),
         };
+        debug::capture_tensor("decoder.dotprod.prompt_after_mlp", &prompt)?;
         let pooled_prompt = mean_pool_prompt(&prompt, prompt_mask)?;
+        debug::capture_tensor("decoder.dotprod.pooled_prompt", &pooled_prompt)?;
         let pooled_prompt = self.prompt_proj.forward(&pooled_prompt)?;
+        debug::capture_tensor("decoder.dotprod.prompt_proj", &pooled_prompt)?;
         let queries = self.hs_proj.forward(queries)?;
+        debug::capture_tensor("decoder.dotprod.query_proj", &queries)?;
         let scores = queries.matmul(&pooled_prompt.reshape((batch_size, hidden_size, 1))?)?;
         let scores = (scores * self.scale)?;
-        scores.clamp(-12.0, 12.0)
+        debug::capture_tensor("decoder.dotprod.scores_pre_clamp", &scores)?;
+        let scores = scores.clamp(-12.0, 12.0)?;
+        debug::capture_tensor("decoder.dotprod.scores", &scores)?;
+        Ok(scores)
     }
 }
 
@@ -259,6 +278,7 @@ impl DecoderLayer {
 
     fn forward(
         &self,
+        layer_idx: usize,
         tgt: &Tensor,
         tgt_query_pos: &Tensor,
         memory_text: &Tensor,
@@ -276,6 +296,14 @@ impl DecoderLayer {
             ),
             None => (tgt.clone(), tgt_query_pos.clone()),
         };
+        debug::capture_tensor(
+            &format!("decoder.layer.{layer_idx}.input_with_presence"),
+            &tgt,
+        )?;
+        debug::capture_tensor(
+            &format!("decoder.layer.{layer_idx}.query_pos_with_presence"),
+            &tgt_query_pos,
+        )?;
         let self_attn_out = self.self_attn.forward(
             &tgt,
             &tgt,
@@ -284,7 +312,12 @@ impl DecoderLayer {
             Some(&tgt_query_pos),
             None,
         )?;
+        debug::capture_tensor(
+            &format!("decoder.layer.{layer_idx}.self_attn_output"),
+            &self_attn_out,
+        )?;
         tgt = self.norm2.forward(&(tgt + self_attn_out)?)?;
+        debug::capture_tensor(&format!("decoder.layer.{layer_idx}.post_self_attn"), &tgt)?;
 
         if let (Some(text_cross_attn), Some(catext_norm)) =
             (&self.text_cross_attn, &self.catext_norm)
@@ -297,7 +330,12 @@ impl DecoderLayer {
                 None,
                 None,
             )?;
+            debug::capture_tensor(
+                &format!("decoder.layer.{layer_idx}.text_attn_output"),
+                &text_attn_out,
+            )?;
             tgt = catext_norm.forward(&(tgt + text_attn_out)?)?;
+            debug::capture_tensor(&format!("decoder.layer.{layer_idx}.post_text_cross"), &tgt)?;
         }
 
         let cross_attn_mask = match (presence_token, cross_attn_mask) {
@@ -313,6 +351,9 @@ impl DecoderLayer {
             (_, Some(cross_attn_mask)) => Some(cross_attn_mask.clone()),
             _ => None,
         };
+        if let Some(mask) = &cross_attn_mask {
+            debug::capture_tensor(&format!("decoder.layer.{layer_idx}.cross_attn_mask"), mask)?;
+        }
 
         let image_attn_out = self.cross_attn_image.forward(
             &tgt,
@@ -322,16 +363,37 @@ impl DecoderLayer {
             Some(memory_pos),
             cross_attn_mask.as_ref(),
         )?;
+        debug::capture_tensor(
+            &format!("decoder.layer.{layer_idx}.image_attn_output"),
+            &image_attn_out,
+        )?;
         tgt = self.norm1.forward(&(tgt + image_attn_out)?)?;
+        debug::capture_tensor(&format!("decoder.layer.{layer_idx}.post_image_cross"), &tgt)?;
 
-        let ffn_out = self.linear2.forward(&self.linear1.forward(&tgt)?.relu()?)?;
+        let ffn_hidden = self.linear1.forward(&tgt)?.relu()?;
+        debug::capture_tensor(
+            &format!("decoder.layer.{layer_idx}.ffn_hidden"),
+            &ffn_hidden,
+        )?;
+        let ffn_out = self.linear2.forward(&ffn_hidden)?;
+        debug::capture_tensor(&format!("decoder.layer.{layer_idx}.ffn_output"), &ffn_out)?;
         tgt = self.norm3.forward(&(tgt + ffn_out)?)?;
+        debug::capture_tensor(&format!("decoder.layer.{layer_idx}.output"), &tgt)?;
 
         if presence_token.is_some() {
             let presence_out = tgt.i(0)?.unsqueeze(0)?;
             let queries = tgt.i(1..)?.contiguous()?;
+            debug::capture_tensor(
+                &format!("decoder.layer.{layer_idx}.queries_output"),
+                &queries,
+            )?;
+            debug::capture_tensor(
+                &format!("decoder.layer.{layer_idx}.presence_output"),
+                &presence_out,
+            )?;
             Ok((queries, Some(presence_out)))
         } else {
+            debug::capture_tensor(&format!("decoder.layer.{layer_idx}.queries_output"), &tgt)?;
             Ok((tgt, None))
         }
     }
@@ -468,13 +530,16 @@ impl Sam3TransformerDecoder {
             .query_embed
             .reshape((self.config.num_queries, 1, self.config.d_model))?
             .repeat((1, batch_size, 1))?;
+        debug::capture_tensor("decoder.initial_queries", &queries)?;
         let mut reference_boxes = self
             .reference_points
             .reshape((self.config.num_queries, 1, 4))?
             .repeat((1, batch_size, 1))?
             .apply(&candle_nn::ops::sigmoid)?;
+        debug::capture_tensor("decoder.initial_reference_boxes", &reference_boxes)?;
         let valid_ratios_twice =
             Tensor::cat(&[&encoder_out.valid_ratios, &encoder_out.valid_ratios], 2)?;
+        debug::capture_tensor("decoder.valid_ratios_twice", &valid_ratios_twice)?;
         let mut presence_state = match &self.presence_token {
             Some(presence_token) => Some(
                 presence_token
@@ -483,6 +548,9 @@ impl Sam3TransformerDecoder {
             ),
             None => None,
         };
+        if let Some(presence_state) = &presence_state {
+            debug::capture_tensor("decoder.initial_presence_state", presence_state)?;
+        }
         let mut final_queries = None;
         let mut final_reference_boxes = None;
         let mut final_pred_boxes = None;
@@ -490,19 +558,39 @@ impl Sam3TransformerDecoder {
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let layer_reference_boxes = reference_boxes.clone();
+            debug::capture_tensor(
+                &format!("decoder.layer.{layer_idx}.reference_boxes"),
+                &layer_reference_boxes,
+            )?;
             let reference_points_input = layer_reference_boxes
                 .unsqueeze(2)?
                 .broadcast_mul(&valid_ratios_twice.unsqueeze(0)?)?;
+            debug::capture_tensor(
+                &format!("decoder.layer.{layer_idx}.reference_points_input"),
+                &reference_points_input,
+            )?;
             let query_sine_embed = gen_sineembed_for_position(
                 &reference_points_input.i((.., .., 0, ..))?,
                 self.config.d_model,
             )?;
+            debug::capture_tensor(
+                &format!("decoder.layer.{layer_idx}.query_sine_embed"),
+                &query_sine_embed,
+            )?;
             let query_pos = self.ref_point_head.forward(&query_sine_embed)?;
+            debug::capture_tensor(&format!("decoder.layer.{layer_idx}.query_pos"), &query_pos)?;
             let cross_attn_mask = self.build_box_relative_position_bias(
                 &layer_reference_boxes,
                 &encoder_out.spatial_shapes,
             )?;
+            if let Some(cross_attn_mask) = &cross_attn_mask {
+                debug::capture_tensor(
+                    &format!("decoder.layer.{layer_idx}.cross_attn_mask_pre_presence"),
+                    cross_attn_mask,
+                )?;
+            }
             let (next_queries, next_presence_state) = layer.forward(
+                layer_idx,
                 &queries,
                 &query_pos,
                 prompt_features,
@@ -517,9 +605,18 @@ impl Sam3TransformerDecoder {
             presence_state = next_presence_state;
 
             let normed_queries = self.output_norm.forward(&queries)?;
+            debug::capture_tensor(
+                &format!("decoder.layer.{layer_idx}.normed_queries"),
+                &normed_queries,
+            )?;
             let box_delta = self.bbox_embed.forward(&normed_queries)?;
+            debug::capture_tensor(&format!("decoder.layer.{layer_idx}.box_delta"), &box_delta)?;
             let pred_boxes = (inverse_sigmoid(&layer_reference_boxes)? + box_delta)?
                 .apply(&candle_nn::ops::sigmoid)?;
+            debug::capture_tensor(
+                &format!("decoder.layer.{layer_idx}.pred_boxes"),
+                &pred_boxes,
+            )?;
             if layer_idx + 1 == self.layers.len() {
                 final_queries = Some(normed_queries.transpose(0, 1)?.contiguous()?);
                 final_reference_boxes = Some(layer_reference_boxes.transpose(0, 1)?.contiguous()?);
@@ -531,11 +628,11 @@ impl Sam3TransformerDecoder {
                 ) {
                     let presence_logits = presence_head
                         .forward(&presence_out_norm.forward(presence_state)?)?
-                        .squeeze(0)?
-                        .clamp(
-                            -self.config.clamp_presence_logit_max,
-                            self.config.clamp_presence_logit_max,
-                        )?;
+                        .squeeze(0)?;
+                    debug::capture_tensor(
+                        &format!("decoder.layer.{layer_idx}.presence_logits"),
+                        &presence_logits,
+                    )?;
                     final_presence_logits = Some(presence_logits);
                 }
             } else {
@@ -549,9 +646,17 @@ impl Sam3TransformerDecoder {
         let pred_boxes =
             final_pred_boxes.expect("sam3 decoder requires at least one refined box state");
         let pred_boxes_xyxy = box_cxcywh_to_xyxy(&pred_boxes)?;
+        debug::capture_tensor("decoder.final_queries", &queries)?;
+        debug::capture_tensor("decoder.final_reference_boxes", &reference_boxes)?;
+        debug::capture_tensor("decoder.final_pred_boxes", &pred_boxes)?;
+        debug::capture_tensor("decoder.final_pred_boxes_xyxy", &pred_boxes_xyxy)?;
+        if let Some(presence_logits) = &final_presence_logits {
+            debug::capture_tensor("decoder.final_presence_logits", presence_logits)?;
+        }
         let pred_logits = self
             .dot_prod_scoring
             .forward(&queries, prompt_features, prompt_mask)?;
+        debug::capture_tensor("decoder.pred_logits", &pred_logits)?;
         Ok(DecoderOutput {
             queries,
             reference_boxes,
@@ -714,11 +819,10 @@ fn gen_sineembed_for_position(pos_tensor: &Tensor, d_model: usize) -> Result<Ten
     }
     let (num_queries, batch_size, coord_dim) = pos_tensor.dims3()?;
     let num_feats = d_model / 2;
-    let half_feats = num_feats / 2;
     let scale = 2.0 * PI as f32;
-    let mut dim_t = Vec::with_capacity(half_feats);
-    for idx in 0..half_feats {
-        dim_t.push(10000f32.powf((2 * (idx / 2)) as f32 / half_feats as f32));
+    let mut dim_t = Vec::with_capacity(num_feats);
+    for idx in 0..num_feats {
+        dim_t.push(10000f32.powf((2 * (idx / 2)) as f32 / num_feats as f32));
     }
     let coords = pos_tensor.to_vec3::<f32>()?;
     let out_dim = match coord_dim {
@@ -807,12 +911,17 @@ fn box_cxcywh_to_xyxy(boxes: &Tensor) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use candle::{DType, Device, Result, Tensor};
+    use candle::{DType, Device, IndexOp, Result, Tensor};
     use candle_nn::VarBuilder;
+    use serde::Deserialize;
 
-    use super::{DecoderOutput, Sam3TransformerDecoder};
+    use super::{gen_sineembed_for_position, DecoderOutput, Sam3TransformerDecoder};
     use crate::models::sam3::config::DecoderConfig;
+    use crate::models::sam3::debug::{self, DebugExporter};
     use crate::models::sam3::encoder::FusionEncoderOutput;
 
     #[test]
@@ -829,6 +938,131 @@ mod tests {
         let prompt_mask = Tensor::zeros((1, 3), DType::U8, &device)?;
         let output = decoder.forward(&encoder_out, &prompt, &prompt_mask)?;
         assert_decoder_output(output, &config)
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct DecoderFixtureMetadata {
+        d_model: usize,
+        num_heads: usize,
+        dim_feedforward: usize,
+        num_layers: usize,
+        num_queries: usize,
+        height: usize,
+        width: usize,
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn decoder_fixture_helper_parity_matches_upstream() -> Result<()> {
+        let fixture = load_decoder_fixture_tensors("fixture.safetensors")?;
+        let reference_boxes = fixture_tensor(&fixture, "decoder.initial_reference_boxes")?;
+        let valid_ratios_twice = fixture_tensor(&fixture, "decoder.valid_ratios_twice")?;
+        let reference_points_input = reference_boxes
+            .unsqueeze(2)?
+            .broadcast_mul(&valid_ratios_twice.unsqueeze(0)?)?;
+        assert_tensor_close(
+            &gen_sineembed_for_position(
+                &reference_points_input.i((.., .., 0, ..))?,
+                fixture_metadata()?.d_model,
+            )?,
+            fixture_tensor(&fixture, "decoder.layer.0.query_sine_embed")?,
+            1e-5,
+            "decoder.layer.0.query_sine_embed",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn decoder_fixture_layer_parity_matches_upstream() -> Result<()> {
+        let (_output, debug_tensors) = run_fixture_decoder()?;
+        let expected = load_decoder_fixture_tensors("fixture.safetensors")?;
+        let keys = [
+            "decoder.layer.0.reference_boxes",
+            "decoder.layer.0.query_sine_embed",
+            "decoder.layer.0.query_pos",
+            "decoder.layer.0.cross_attn_mask_pre_presence",
+            "decoder.layer.0.input_with_presence",
+            "decoder.layer.0.self_attn_output",
+            "decoder.layer.0.post_self_attn",
+            "decoder.layer.0.text_attn_output",
+            "decoder.layer.0.post_text_cross",
+            "decoder.layer.0.cross_attn_mask",
+            "decoder.layer.0.image_attn_output",
+            "decoder.layer.0.post_image_cross",
+            "decoder.layer.0.ffn_hidden",
+            "decoder.layer.0.ffn_output",
+            "decoder.layer.0.output",
+            "decoder.layer.0.queries_output",
+            "decoder.layer.0.presence_output",
+            "decoder.layer.0.normed_queries",
+            "decoder.layer.0.box_delta",
+            "decoder.layer.0.pred_boxes",
+            "decoder.layer.0.presence_logits",
+        ];
+        assert_debug_keys_close(&debug_tensors, &expected, &keys, 1e-5)
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn decoder_fixture_final_parity_matches_upstream() -> Result<()> {
+        let (output, debug_tensors) = run_fixture_decoder()?;
+        let expected = load_decoder_fixture_tensors("fixture.safetensors")?;
+        let keys = [
+            "decoder.dotprod.prompt_after_mlp",
+            "decoder.dotprod.pooled_prompt",
+            "decoder.dotprod.prompt_proj",
+            "decoder.dotprod.query_proj",
+            "decoder.dotprod.scores_pre_clamp",
+            "decoder.dotprod.scores",
+            "decoder.final_queries",
+            "decoder.final_reference_boxes",
+            "decoder.final_pred_boxes",
+            "decoder.final_pred_boxes_xyxy",
+            "decoder.final_presence_logits",
+            "decoder.pred_logits",
+        ];
+        assert_debug_keys_close(&debug_tensors, &expected, &keys, 1e-5)?;
+        assert_tensor_close(
+            &output.queries,
+            fixture_tensor(&expected, "decoder.final_queries")?,
+            1e-5,
+            "decoder.final_queries",
+        )?;
+        assert_tensor_close(
+            &output.reference_boxes,
+            fixture_tensor(&expected, "decoder.final_reference_boxes")?,
+            1e-5,
+            "decoder.final_reference_boxes",
+        )?;
+        assert_tensor_close(
+            &output.pred_boxes,
+            fixture_tensor(&expected, "decoder.final_pred_boxes")?,
+            1e-5,
+            "decoder.final_pred_boxes",
+        )?;
+        assert_tensor_close(
+            &output.pred_boxes_xyxy,
+            fixture_tensor(&expected, "decoder.final_pred_boxes_xyxy")?,
+            1e-5,
+            "decoder.final_pred_boxes_xyxy",
+        )?;
+        assert_tensor_close(
+            output
+                .presence_logits
+                .as_ref()
+                .expect("presence logits should exist"),
+            fixture_tensor(&expected, "decoder.final_presence_logits")?,
+            1e-5,
+            "decoder.final_presence_logits",
+        )?;
+        assert_tensor_close(
+            &output.pred_logits,
+            fixture_tensor(&expected, "decoder.pred_logits")?,
+            1e-5,
+            "decoder.pred_logits",
+        )?;
+        Ok(())
     }
 
     fn assert_decoder_output(output: DecoderOutput, config: &DecoderConfig) -> Result<()> {
@@ -858,6 +1092,172 @@ mod tests {
             box_rpb_stride: 14,
             clamp_presence_logit_max: 10.0,
         }
+    }
+
+    fn fixture_metadata() -> Result<DecoderFixtureMetadata> {
+        let path = decoder_fixture_dir().join("metadata.json");
+        let contents = fs::read_to_string(&path).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to read decoder fixture metadata {}: {err}",
+                path.display()
+            ))
+        })?;
+        serde_json::from_str(&contents).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to parse decoder fixture metadata {}: {err}",
+                path.display()
+            ))
+        })
+    }
+
+    fn fixture_config() -> Result<DecoderConfig> {
+        let metadata = fixture_metadata()?;
+        Ok(DecoderConfig {
+            d_model: metadata.d_model,
+            num_layers: metadata.num_layers,
+            num_queries: metadata.num_queries,
+            num_heads: metadata.num_heads,
+            dim_feedforward: metadata.dim_feedforward,
+            presence_token: true,
+            use_text_cross_attention: true,
+            box_rpb_mode: "log".to_owned(),
+            box_rpb_resolution: metadata.height,
+            box_rpb_stride: 1,
+            clamp_presence_logit_max: 10.0,
+        })
+    }
+
+    fn decoder_fixture_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/sam3_decoder_unit")
+    }
+
+    fn load_decoder_fixture_tensors(file_name: &str) -> Result<HashMap<String, Tensor>> {
+        let path = decoder_fixture_dir().join(file_name);
+        candle::safetensors::load(&path, &Device::Cpu).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to load decoder fixture {}: {err}",
+                path.display()
+            ))
+        })
+    }
+
+    fn fixture_tensor<'a>(fixture: &'a HashMap<String, Tensor>, key: &str) -> Result<&'a Tensor> {
+        fixture
+            .get(key)
+            .ok_or_else(|| candle::Error::Msg(format!("decoder fixture is missing tensor `{key}`")))
+    }
+
+    fn unique_temp_dir(label: &str) -> Result<PathBuf> {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| candle::Error::Msg(format!("system clock error: {err}")))?;
+        let path = std::env::temp_dir().join(format!(
+            "sam3_decoder_fixture_{label}_{}_{}",
+            std::process::id(),
+            stamp.as_nanos()
+        ));
+        fs::create_dir_all(&path).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to create temp debug dir {}: {err}",
+                path.display()
+            ))
+        })?;
+        Ok(path)
+    }
+
+    fn fixture_encoder_out(
+        fixture: &HashMap<String, Tensor>,
+        _config: &DecoderConfig,
+    ) -> Result<FusionEncoderOutput> {
+        Ok(FusionEncoderOutput {
+            memory: fixture_tensor(fixture, "inputs/memory")?.clone(),
+            pos_embed: fixture_tensor(fixture, "inputs/pos_embed")?.clone(),
+            padding_mask: fixture_tensor(fixture, "inputs/padding_mask")?.clone(),
+            level_start_index: fixture_tensor(fixture, "inputs/level_start_index")?.clone(),
+            spatial_shapes: fixture_tensor(fixture, "inputs/spatial_shapes")?.clone(),
+            valid_ratios: fixture_tensor(fixture, "inputs/valid_ratios")?.clone(),
+        })
+    }
+
+    fn run_fixture_decoder() -> Result<(DecoderOutput, HashMap<String, Tensor>)> {
+        let device = Device::Cpu;
+        let config = fixture_config()?;
+        let decoder_weights = load_decoder_fixture_tensors("decoder_weights.safetensors")?;
+        let score_weights = load_decoder_fixture_tensors("score_weights.safetensors")?;
+        let fixture = load_decoder_fixture_tensors("fixture.safetensors")?;
+        let decoder_vb = VarBuilder::from_tensors(decoder_weights, DType::F32, &device);
+        let score_vb = VarBuilder::from_tensors(score_weights, DType::F32, &device);
+        let decoder = Sam3TransformerDecoder::new(&config, decoder_vb, score_vb)?;
+        let encoder_out = fixture_encoder_out(&fixture, &config)?;
+        let prompt = fixture_tensor(&fixture, "inputs/prompt")?.clone();
+        let prompt_mask = fixture_tensor(&fixture, "inputs/prompt_mask")?.clone();
+
+        let debug_dir = unique_temp_dir("forward")?;
+        debug::set_exporter(Some(DebugExporter::new(&debug_dir)?));
+        let output = decoder.forward(&encoder_out, &prompt, &prompt_mask)?;
+        debug::finish()?;
+        let debug_tensors =
+            candle::safetensors::load(debug_dir.join("debug_tensors.safetensors"), &device)
+                .map_err(|err| {
+                    candle::Error::Msg(format!(
+                        "failed to load decoder debug tensors from {}: {err}",
+                        debug_dir.display()
+                    ))
+                })?;
+        let _ = fs::remove_dir_all(&debug_dir);
+        Ok((output, debug_tensors))
+    }
+
+    fn assert_debug_keys_close(
+        actual: &HashMap<String, Tensor>,
+        expected: &HashMap<String, Tensor>,
+        keys: &[&str],
+        atol: f32,
+    ) -> Result<()> {
+        let mut failures = Vec::new();
+        for key in keys {
+            let Some(actual_tensor) = actual.get(*key) else {
+                failures.push(format!("{key}: missing from Candle debug output"));
+                continue;
+            };
+            let Some(expected_tensor) = expected.get(*key) else {
+                failures.push(format!("{key}: missing from fixture"));
+                continue;
+            };
+            if let Err(err) = assert_tensor_close(actual_tensor, expected_tensor, atol, key) {
+                failures.push(err.to_string());
+            }
+        }
+        if failures.is_empty() {
+            return Ok(());
+        }
+        candle::bail!("{}", failures.join("\n"));
+    }
+
+    fn assert_tensor_close(
+        actual: &Tensor,
+        expected: &Tensor,
+        atol: f32,
+        name: &str,
+    ) -> Result<()> {
+        if actual.dims() != expected.dims() {
+            candle::bail!(
+                "{name}: shape mismatch actual={:?} expected={:?}",
+                actual.dims(),
+                expected.dims()
+            );
+        }
+        let actual = actual.to_dtype(DType::F32)?;
+        let expected = expected.to_dtype(DType::F32)?;
+        let max_abs_diff = actual
+            .broadcast_sub(&expected)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        if max_abs_diff > atol {
+            candle::bail!("{name}: max_abs_diff={max_abs_diff:.8}");
+        }
+        Ok(())
     }
 
     fn encoder_out(config: &DecoderConfig, device: &Device) -> Result<FusionEncoderOutput> {

@@ -14,6 +14,7 @@
 
 mod checkpoint;
 pub mod config;
+mod debug;
 mod decoder;
 mod encoder;
 mod geometry;
@@ -31,6 +32,7 @@ pub use config::{
     Config, DecoderConfig, EncoderConfig, GeometryConfig, ImageConfig, NeckConfig,
     SegmentationConfig, TextConfig, VisionConfig,
 };
+pub use debug::{capture_tensor, finish, set_exporter, DebugExporter};
 pub use decoder::{DecoderOutput, Sam3TransformerDecoder};
 pub use encoder::{FusionEncoderOutput, Sam3FusionEncoder};
 pub use geometry::{EncodedPrompt, GeometryPrompt, SequenceGeometryEncoder};

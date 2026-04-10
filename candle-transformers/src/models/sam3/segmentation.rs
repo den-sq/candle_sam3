@@ -4,6 +4,7 @@ use candle_nn::{
 };
 
 use super::config::SegmentationConfig;
+use super::debug;
 use super::decoder::DecoderOutput;
 
 const SEGMENTATION_NUM_HEADS: usize = 8;
@@ -104,7 +105,7 @@ struct MaskEmbedMlp {
 
 impl MaskEmbedMlp {
     fn new(hidden_dim: usize, vb: VarBuilder) -> Result<Self> {
-        let dims = [hidden_dim, hidden_dim, hidden_dim];
+        let dims = [hidden_dim, hidden_dim, hidden_dim, hidden_dim];
         let mut layers = Vec::with_capacity(dims.len() - 1);
         for layer_idx in 0..(dims.len() - 1) {
             layers.push(candle_nn::linear(
@@ -149,8 +150,11 @@ impl MaskPredictor {
             )
         }
         let (_, _, height, width) = pixel_shape;
+        debug::capture_tensor("segmentation.mask_predictor.query_input", obj_queries)?;
         let query_embed = self.mask_embed.forward(obj_queries)?;
+        debug::capture_tensor("segmentation.mask_predictor.query_embed", &query_embed)?;
         let pixel_embed = pixel_embed.reshape((batch_size, hidden_dim, height * width))?;
+        debug::capture_tensor("segmentation.mask_predictor.pixel_flat", &pixel_embed)?;
         query_embed
             .matmul(&pixel_embed)?
             .reshape((batch_size, num_queries, height, width))
@@ -220,6 +224,7 @@ impl PixelDecoder {
         let Some(mut prev_fpn) = backbone_feats.last().cloned() else {
             candle::bail!("sam3 segmentation pixel decoder expects at least one feature level")
         };
+        debug::capture_tensor("segmentation.pixel_decoder.initial_prev_fpn", &prev_fpn)?;
         for (layer_idx, curr_fpn) in backbone_feats[..backbone_feats.len().saturating_sub(1)]
             .iter()
             .rev()
@@ -239,10 +244,30 @@ impl PixelDecoder {
                     "sam3 segmentation pixel decoder expected aligned FPN batch/channels, got {curr_shape:?} and {prev_shape:?}"
                 )
             }
-            prev_fpn = curr_fpn
-                .broadcast_add(&prev_fpn.upsample_nearest2d(curr_shape.2, curr_shape.3)?)?;
+            debug::capture_tensor(
+                &format!("segmentation.pixel_decoder.stage.{layer_idx}.curr_fpn"),
+                curr_fpn,
+            )?;
+            let upsampled = prev_fpn.upsample_nearest2d(curr_shape.2, curr_shape.3)?;
+            debug::capture_tensor(
+                &format!("segmentation.pixel_decoder.stage.{layer_idx}.upsampled_prev_fpn"),
+                &upsampled,
+            )?;
+            prev_fpn = curr_fpn.broadcast_add(&upsampled)?;
+            debug::capture_tensor(
+                &format!("segmentation.pixel_decoder.stage.{layer_idx}.sum"),
+                &prev_fpn,
+            )?;
             prev_fpn = self.conv_layers[layer_idx].forward(&prev_fpn)?;
+            debug::capture_tensor(
+                &format!("segmentation.pixel_decoder.stage.{layer_idx}.conv"),
+                &prev_fpn,
+            )?;
             prev_fpn = self.norms[layer_idx].forward(&prev_fpn)?.relu()?;
+            debug::capture_tensor(
+                &format!("segmentation.pixel_decoder.stage.{layer_idx}.output"),
+                &prev_fpn,
+            )?;
         }
         Ok(prev_fpn)
     }
@@ -285,7 +310,7 @@ impl UniversalSegmentationHead {
         let cross_attn_norm = if cross_attend_prompt.is_some() {
             Some(candle_nn::layer_norm(
                 config.hidden_dim,
-                1e-6,
+                1e-5,
                 vb.pp("cross_attn_norm"),
             )?)
         } else {
@@ -339,6 +364,10 @@ impl UniversalSegmentationHead {
         prompt_mask: Option<&Tensor>,
     ) -> Result<SegmentationOutput> {
         let mut encoder_hidden_states = encoder_hidden_states.clone();
+        debug::capture_tensor(
+            "segmentation.encoder_hidden_states_input",
+            &encoder_hidden_states,
+        )?;
         if let (Some(cross_attend_prompt), Some(cross_attn_norm)) =
             (&self.cross_attend_prompt, &self.cross_attn_norm)
         {
@@ -355,9 +384,15 @@ impl UniversalSegmentationHead {
                 )
             })?;
             let normed_encoder = cross_attn_norm.forward(&encoder_hidden_states)?;
+            debug::capture_tensor("segmentation.encoder_hidden_states_normed", &normed_encoder)?;
             let prompt_attn =
                 cross_attend_prompt.forward(&normed_encoder, prompt, Some(prompt_mask))?;
+            debug::capture_tensor("segmentation.prompt_attn", &prompt_attn)?;
             encoder_hidden_states = (prompt_attn + encoder_hidden_states)?;
+            debug::capture_tensor(
+                "segmentation.encoder_hidden_states_after_prompt",
+                &encoder_hidden_states,
+            )?;
         }
 
         let presence_logits = match &self.presence_head {
@@ -365,11 +400,18 @@ impl UniversalSegmentationHead {
             None => None,
         };
         let pixel_embed = self.embed_pixels(backbone_fpn, &encoder_hidden_states)?;
+        debug::capture_tensor("segmentation.pixel_embed", &pixel_embed)?;
         let instance_embeds = self.instance_seg_head.forward(&pixel_embed)?;
+        debug::capture_tensor("segmentation.instance_embeds", &instance_embeds)?;
         let mask_logits = self
             .mask_predictor
             .forward(&decoder_out.queries, &instance_embeds)?;
+        debug::capture_tensor("segmentation.mask_logits", &mask_logits)?;
         let semantic_logits = self.semantic_seg_head.forward(&pixel_embed)?;
+        debug::capture_tensor("segmentation.semantic_logits", &semantic_logits)?;
+        if let Some(presence_logits) = &presence_logits {
+            debug::capture_tensor("segmentation.presence_logits", presence_logits)?;
+        }
         Ok(SegmentationOutput {
             mask_logits,
             semantic_logits,
@@ -409,9 +451,11 @@ impl UniversalSegmentationHead {
         }
         let mut backbone_visual_feats = backbone_fpn.iter().cloned().collect::<Vec<_>>();
         let last_idx = backbone_visual_feats.len() - 1;
-        backbone_visual_feats[last_idx] = encoder_hidden_states
+        let encoder_visual_embed = encoder_hidden_states
             .permute((1, 2, 0))?
             .reshape((batch_size, channels, height, width))?;
+        debug::capture_tensor("segmentation.encoder_visual_embed", &encoder_visual_embed)?;
+        backbone_visual_feats[last_idx] = encoder_visual_embed;
         self.pixel_decoder.forward(&backbone_visual_feats)
     }
 }
@@ -429,13 +473,25 @@ fn normalize_padding_mask(mask: &Tensor, batch_size: usize, seq_len: usize) -> R
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use candle::{DType, Device, Result, Tensor};
     use candle_nn::VarBuilder;
+    use serde::Deserialize;
 
     use super::{SegmentationOutput, UniversalSegmentationHead};
     use crate::models::sam3::config::SegmentationConfig;
+    use crate::models::sam3::debug::{self, DebugExporter};
     use crate::models::sam3::decoder::DecoderOutput;
+
+    #[derive(Debug, Deserialize)]
+    struct SegmentationFixtureMetadata {
+        hidden_dim: usize,
+        upsampling_stages: usize,
+        num_queries: usize,
+    }
 
     #[test]
     fn segmentation_head_returns_mask_and_semantic_logits() -> Result<()> {
@@ -468,6 +524,75 @@ mod tests {
             Some(&prompt_mask),
         )?;
         assert_output(output, &config)
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn segmentation_fixture_pixel_path_matches_upstream() -> Result<()> {
+        let (_output, debug_tensors) = run_fixture_segmentation()?;
+        let expected = load_segmentation_fixture_tensors("fixture.safetensors")?;
+        let keys = [
+            "segmentation.encoder_hidden_states_input",
+            "segmentation.encoder_hidden_states_normed",
+            "segmentation.prompt_attn",
+            "segmentation.encoder_hidden_states_after_prompt",
+            "segmentation.encoder_visual_embed",
+            "segmentation.pixel_decoder.initial_prev_fpn",
+            "segmentation.pixel_decoder.stage.0.curr_fpn",
+            "segmentation.pixel_decoder.stage.0.upsampled_prev_fpn",
+            "segmentation.pixel_decoder.stage.0.sum",
+            "segmentation.pixel_decoder.stage.0.conv",
+            "segmentation.pixel_decoder.stage.0.output",
+            "segmentation.pixel_decoder.stage.1.curr_fpn",
+            "segmentation.pixel_decoder.stage.1.upsampled_prev_fpn",
+            "segmentation.pixel_decoder.stage.1.sum",
+            "segmentation.pixel_decoder.stage.1.conv",
+            "segmentation.pixel_decoder.stage.1.output",
+            "segmentation.pixel_embed",
+        ];
+        assert_debug_keys_close(&debug_tensors, &expected, &keys, 1e-5)
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn segmentation_fixture_mask_predictor_matches_upstream() -> Result<()> {
+        let (_output, debug_tensors) = run_fixture_segmentation()?;
+        let expected = load_segmentation_fixture_tensors("fixture.safetensors")?;
+        let keys = [
+            "segmentation.instance_embeds",
+            "segmentation.mask_predictor.query_input",
+            "segmentation.mask_predictor.query_embed",
+            "segmentation.mask_predictor.pixel_flat",
+            "segmentation.mask_logits",
+        ];
+        assert_debug_keys_close(&debug_tensors, &expected, &keys, 1e-5)
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn segmentation_fixture_final_parity_matches_upstream() -> Result<()> {
+        let (output, debug_tensors) = run_fixture_segmentation()?;
+        let expected = load_segmentation_fixture_tensors("fixture.safetensors")?;
+        let keys = [
+            "segmentation.pixel_embed",
+            "segmentation.instance_embeds",
+            "segmentation.mask_logits",
+            "segmentation.semantic_logits",
+        ];
+        assert_debug_keys_close(&debug_tensors, &expected, &keys, 1e-5)?;
+        assert_tensor_close(
+            &output.mask_logits,
+            fixture_tensor(&expected, "segmentation.mask_logits")?,
+            1e-5,
+            "segmentation.mask_logits",
+        )?;
+        assert_tensor_close(
+            &output.semantic_logits,
+            fixture_tensor(&expected, "segmentation.semantic_logits")?,
+            1e-5,
+            "segmentation.semantic_logits",
+        )?;
+        Ok(())
     }
 
     fn assert_output(output: SegmentationOutput, config: &SegmentationConfig) -> Result<()> {
@@ -518,7 +643,7 @@ mod tests {
                 Tensor::zeros(config.hidden_dim, DType::F32, device)?,
             );
         }
-        for layer_idx in 0..2 {
+        for layer_idx in 0..3 {
             tensors.insert(
                 format!("mask_predictor.mask_embed.layers.{layer_idx}.weight"),
                 Tensor::zeros((config.hidden_dim, config.hidden_dim), DType::F32, device)?,
@@ -577,5 +702,181 @@ mod tests {
             Tensor::zeros(config.hidden_dim, DType::F32, device)?,
         );
         Ok(tensors)
+    }
+
+    fn fixture_metadata() -> Result<SegmentationFixtureMetadata> {
+        let path = segmentation_fixture_dir().join("metadata.json");
+        let contents = fs::read_to_string(&path).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to read segmentation fixture metadata {}: {err}",
+                path.display()
+            ))
+        })?;
+        serde_json::from_str(&contents).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to parse segmentation fixture metadata {}: {err}",
+                path.display()
+            ))
+        })
+    }
+
+    fn fixture_config() -> Result<SegmentationConfig> {
+        let metadata = fixture_metadata()?;
+        Ok(SegmentationConfig {
+            enabled: true,
+            hidden_dim: metadata.hidden_dim,
+            upsampling_stages: metadata.upsampling_stages,
+            aux_masks: false,
+            presence_head: false,
+        })
+    }
+
+    fn segmentation_fixture_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/sam3_segmentation_unit")
+    }
+
+    fn load_segmentation_fixture_tensors(file_name: &str) -> Result<HashMap<String, Tensor>> {
+        let path = segmentation_fixture_dir().join(file_name);
+        candle::safetensors::load(&path, &Device::Cpu).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to load segmentation fixture {}: {err}",
+                path.display()
+            ))
+        })
+    }
+
+    fn fixture_tensor<'a>(fixture: &'a HashMap<String, Tensor>, key: &str) -> Result<&'a Tensor> {
+        fixture.get(key).ok_or_else(|| {
+            candle::Error::Msg(format!("segmentation fixture is missing tensor `{key}`"))
+        })
+    }
+
+    fn unique_temp_dir(label: &str) -> Result<PathBuf> {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| candle::Error::Msg(format!("system clock error: {err}")))?;
+        let path = std::env::temp_dir().join(format!(
+            "sam3_segmentation_fixture_{label}_{}_{}",
+            std::process::id(),
+            stamp.as_nanos()
+        ));
+        fs::create_dir_all(&path).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to create temp debug dir {}: {err}",
+                path.display()
+            ))
+        })?;
+        Ok(path)
+    }
+
+    fn fixture_backbone_fpn(fixture: &HashMap<String, Tensor>) -> Vec<Tensor> {
+        let mut levels = Vec::new();
+        for idx in 0.. {
+            let key = format!("inputs/backbone_fpn.{idx}");
+            let Some(level) = fixture.get(&key) else {
+                break;
+            };
+            levels.push(level.clone());
+        }
+        levels
+    }
+
+    fn run_fixture_segmentation() -> Result<(SegmentationOutput, HashMap<String, Tensor>)> {
+        let device = Device::Cpu;
+        let config = fixture_config()?;
+        let weights = load_segmentation_fixture_tensors("segmentation_weights.safetensors")?;
+        let fixture = load_segmentation_fixture_tensors("fixture.safetensors")?;
+        let vb = VarBuilder::from_tensors(weights, DType::F32, &device);
+        let head = UniversalSegmentationHead::new(&config, vb)?;
+        let backbone_fpn = fixture_backbone_fpn(&fixture);
+        if backbone_fpn.is_empty() {
+            candle::bail!("segmentation fixture did not include any backbone FPN levels");
+        }
+        let num_queries = fixture_metadata()?.num_queries;
+        let decoder_out = DecoderOutput {
+            queries: fixture_tensor(&fixture, "inputs/decoder_queries")?.clone(),
+            reference_boxes: Tensor::zeros((1, num_queries, 4), DType::F32, &device)?,
+            pred_logits: Tensor::zeros((1, num_queries, 1), DType::F32, &device)?,
+            pred_boxes: Tensor::zeros((1, num_queries, 4), DType::F32, &device)?,
+            pred_boxes_xyxy: Tensor::zeros((1, num_queries, 4), DType::F32, &device)?,
+            presence_logits: None,
+        };
+        let encoder_hidden_states =
+            fixture_tensor(&fixture, "inputs/encoder_hidden_states")?.clone();
+        let prompt = fixture_tensor(&fixture, "inputs/prompt")?.clone();
+        let prompt_mask = fixture_tensor(&fixture, "inputs/prompt_mask")?.clone();
+
+        let debug_dir = unique_temp_dir("forward")?;
+        debug::set_exporter(Some(DebugExporter::new(&debug_dir)?));
+        let output = head.forward(
+            &backbone_fpn,
+            &decoder_out,
+            &encoder_hidden_states,
+            Some(&prompt),
+            Some(&prompt_mask),
+        )?;
+        debug::finish()?;
+        let debug_tensors =
+            candle::safetensors::load(debug_dir.join("debug_tensors.safetensors"), &device)
+                .map_err(|err| {
+                    candle::Error::Msg(format!(
+                        "failed to load segmentation debug tensors from {}: {err}",
+                        debug_dir.display()
+                    ))
+                })?;
+        let _ = fs::remove_dir_all(&debug_dir);
+        Ok((output, debug_tensors))
+    }
+
+    fn assert_debug_keys_close(
+        actual: &HashMap<String, Tensor>,
+        expected: &HashMap<String, Tensor>,
+        keys: &[&str],
+        atol: f32,
+    ) -> Result<()> {
+        let mut failures = Vec::new();
+        for key in keys {
+            let Some(actual_tensor) = actual.get(*key) else {
+                failures.push(format!("{key}: missing from Candle debug output"));
+                continue;
+            };
+            let Some(expected_tensor) = expected.get(*key) else {
+                failures.push(format!("{key}: missing from fixture"));
+                continue;
+            };
+            if let Err(err) = assert_tensor_close(actual_tensor, expected_tensor, atol, key) {
+                failures.push(err.to_string());
+            }
+        }
+        if failures.is_empty() {
+            return Ok(());
+        }
+        candle::bail!("{}", failures.join("\n"));
+    }
+
+    fn assert_tensor_close(
+        actual: &Tensor,
+        expected: &Tensor,
+        atol: f32,
+        name: &str,
+    ) -> Result<()> {
+        if actual.dims() != expected.dims() {
+            candle::bail!(
+                "{name}: shape mismatch actual={:?} expected={:?}",
+                actual.dims(),
+                expected.dims()
+            );
+        }
+        let actual = actual.to_dtype(DType::F32)?;
+        let expected = expected.to_dtype(DType::F32)?;
+        let max_abs_diff = actual
+            .broadcast_sub(&expected)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        if max_abs_diff > atol {
+            candle::bail!("{name}: max_abs_diff={max_abs_diff:.8}");
+        }
+        Ok(())
     }
 }

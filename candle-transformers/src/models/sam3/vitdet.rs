@@ -588,33 +588,37 @@ impl Sam3ViTDetTrunk {
             } else {
                 hidden_states = block.forward(&hidden_states)?;
             }
-            
+
             // Numerical debugging for blocks 6-11 to trace divergence point
             if block_index >= 6 && block_index <= 11 {
                 use std::fs::File;
                 use std::io::Write;
-                
+
                 let flat = hidden_states.flatten_all()?;
                 let values = flat.to_vec1::<f32>()?;
                 let mean: f32 = values.iter().sum::<f32>() / values.len() as f32;
-                let std: f32 = (values.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / values.len() as f32).sqrt();
-                
-                eprintln!("[BLOCK_{}] mean={:.9}, std={:.9}, min={:.8}, max={:.8}", 
+                let std: f32 = (values.iter().map(|v| (v - mean).powi(2)).sum::<f32>()
+                    / values.len() as f32)
+                    .sqrt();
+
+                eprintln!(
+                    "[BLOCK_{}] mean={:.9}, std={:.9}, min={:.8}, max={:.8}",
                     block_index,
                     mean,
                     std,
                     values.iter().copied().fold(f32::INFINITY, f32::min),
                     values.iter().copied().fold(f32::NEG_INFINITY, f32::max)
                 );
-                
+
                 // Save first 500 values to file
-                if let Ok(mut file) = File::create(format!("/tmp/candle_block_{}.txt", block_index)) {
+                if let Ok(mut file) = File::create(format!("/tmp/candle_block_{}.txt", block_index))
+                {
                     for val in values.iter().take(500) {
                         let _ = writeln!(file, "{:.15e}", val);
                     }
                 }
             }
-            
+
             if let Some(block_outputs) = block_outputs.as_mut() {
                 block_outputs.push(hidden_states.clone());
             }
