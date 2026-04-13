@@ -66,12 +66,13 @@ What is implemented in this Candle example:
 - mixed text + geometry grounding
 - sequential batch-manifest execution that mirrors the batched notebook workflow at the CLI level
 - a canned `--image-predictor-example` mode that replays the inputs from `sam3_image_predictor_example.ipynb`
+- Phase 12 scaffolding for `--interactive` image refinement and `--video` session runs
 
 What is not implemented here yet:
 
 - Jupyter widget interaction
-- SAM1-style interactive mask refinement
-- video session state and tracking
+- production-ready interactive refinement UX
+- true multi-frame video tracking and object propagation
 - agent / LLM integration
 
 ## Relevant modules
@@ -611,4 +612,4 @@ override that with `--parity-atol 1e-3`.
 - Geometry mask prompts are still not available because the current checkpoint does not
   include a geometry mask-encoder branch.
 - The batch manifest is a sequential inference runner, not a true one-pass multi-image batch.
-- Full video / tracker support is still outside this example.
+- `--interactive` and `--video` are Phase 12 work-in-progress entry points, not full notebook parity yet.

@@ -22,6 +22,7 @@ mod image;
 mod neck;
 mod segmentation;
 mod text;
+mod video;
 mod vitdet;
 
 pub use checkpoint::{
@@ -40,4 +41,8 @@ pub use image::{GroundingOutput, ImageSize, Sam3ImageModel, Sam3ImageState, Sam3
 pub use neck::VisualBackboneOutput;
 pub use segmentation::{SegmentationOutput, UniversalSegmentationHead};
 pub use text::{Sam3TextEncoder, TextEncoding};
+pub use video::{
+    Sam3VideoPredictor, Sam3VideoSession, SessionPrompt, TrackedObject, VideoConfig,
+    VideoOutput, PropagationDirection,
+};
 pub use vitdet::{Sam3ViTDetTrunk, ViTDetTrunkOutput};

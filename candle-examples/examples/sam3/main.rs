@@ -5,6 +5,8 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 mod parity;
+mod interactive;
+mod video;
 
 use anyhow::{bail, Context, Error as E, Result};
 use clap::Parser;
@@ -80,6 +82,22 @@ struct Args {
     /// Optional repeated box labels aligned with `--box`, defaults to `1`.
     #[arg(long = "box-label")]
     box_labels: Vec<u32>,
+
+    /// Optional video file path for video prediction mode.
+    #[arg(long)]
+    video: Option<String>,
+
+    /// Optional text prompt for video prediction.
+    #[arg(long)]
+    video_prompt: Option<String>,
+
+    /// Frame stride for video visualization (show every Nth frame).
+    #[arg(long, default_value = "1")]
+    video_frame_stride: usize,
+
+    /// Enable interactive refinement mode for the specified image.
+    #[arg(long)]
+    interactive: Option<String>,
 
     #[arg(long)]
     cpu: bool,
@@ -345,6 +363,37 @@ fn tokenize_prompt(
     let input_ids = Tensor::new(vec![encoding.get_ids().to_vec()], device)?;
     let attention_mask = Tensor::new(vec![encoding.get_attention_mask().to_vec()], device)?;
     Ok((input_ids, attention_mask))
+}
+
+/// Phase 12 currently uses the exact image preprocessing path that was validated
+/// during parity work so interactive and video modes do not drift onto a
+/// separate inference pipeline.
+pub(crate) fn preprocess_image_path_exact(
+    image_path: &str,
+    model: &sam3::Sam3ImageModel,
+    device: &Device,
+) -> Result<Tensor> {
+    let config = model.config();
+    let image_size = config.image.image_size;
+    let rgb = image::ImageReader::open(image_path)?
+        .decode()
+        .map_err(candle::Error::wrap)?
+        .to_rgb8();
+    let (width, height) = rgb.dimensions();
+    let image = Tensor::from_vec(
+        rgb.into_raw(),
+        (height as usize, width as usize, 3),
+        &Device::Cpu,
+    )?
+    .permute((2, 0, 1))?
+    .to_device(device)?
+    .to_dtype(DType::F32)?
+    .unsqueeze(0)?
+    .upsample_bilinear2d(image_size, image_size, false)?;
+    let image = (image / 255.)?;
+    let mean = Tensor::from_vec(config.image.image_mean.to_vec(), (1, 3, 1, 1), device)?;
+    let std = Tensor::from_vec(config.image.image_std.to_vec(), (1, 3, 1, 1), device)?;
+    image.broadcast_sub(&mean)?.broadcast_div(&std)
 }
 
 fn preprocess_image_for_sam3(
@@ -1911,6 +1960,31 @@ fn run_reference_comparison(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn geometry_prompt_defaults_positive_labels_for_points() -> Result<()> {
+        let device = Device::Cpu;
+        let points = vec![PointArg { x: 0.25, y: 0.5 }, PointArg { x: 0.75, y: 0.9 }];
+        let inputs = build_geometry_prompt_from_parts(&points, &[], &[], &[], &device)?
+            .expect("expected geometry inputs");
+        assert_eq!(inputs.point_labels, vec![1, 1]);
+        assert_eq!(inputs.prompt.point_labels.unwrap().to_vec1::<u32>()?, vec![1, 1]);
+        Ok(())
+    }
+
+    #[test]
+    fn geometry_prompt_rejects_label_count_mismatch() {
+        let device = Device::Cpu;
+        let points = vec![PointArg { x: 0.25, y: 0.5 }, PointArg { x: 0.75, y: 0.9 }];
+        let err = build_geometry_prompt_from_parts(&points, &[1], &[], &[], &device)
+            .expect_err("expected label mismatch error");
+        assert!(err.to_string().contains("point labels"));
+    }
+}
+
 fn run_batch_jobs(
     model: &sam3::Sam3ImageModel,
     tokenizer_path: Option<&str>,
@@ -2044,8 +2118,8 @@ pub fn main() -> anyhow::Result<()> {
     {
         bail!("running implemented SAM3 stages currently requires `--checkpoint <sam3.pt>`")
     }
-    if (!args.points.is_empty() || !args.boxes.is_empty()) && args.image.is_none() {
-        bail!("`--point` and `--box` prompts require `--image` so the geometry encoder has image features")
+    if (!args.points.is_empty() || !args.boxes.is_empty()) && args.image.is_none() && args.video.is_none() {
+        bail!("`--point` and `--box` prompts require `--image` or `--video` so the geometry encoder has image features")
     }
     if args.parity_bundle.is_some() && args.compare_reference_bundle.is_some() {
         bail!("use either `--parity-bundle` or `--compare-reference-bundle`, not both")
@@ -2152,6 +2226,66 @@ pub fn main() -> anyhow::Result<()> {
     }
 
     let geometry_inputs = geometry_inputs_from_cli(&args, &device)?;
+
+    if let Some(video_path) = args.video.as_deref() {
+        let points = geometry_inputs
+            .as_ref()
+            .map(|inputs| inputs.points.iter().map(|p| (p.x, p.y)).collect())
+            .unwrap_or_default();
+        let point_labels = geometry_inputs
+            .as_ref()
+            .map(|inputs| inputs.point_labels.clone())
+            .unwrap_or_default();
+        let boxes = geometry_inputs
+            .as_ref()
+            .map(|inputs| inputs.boxes.iter().map(|b| (b.cx, b.cy, b.w, b.h)).collect())
+            .unwrap_or_default();
+        let box_labels = geometry_inputs
+            .as_ref()
+            .map(|inputs| inputs.box_labels.clone())
+            .unwrap_or_default();
+        let video_mode = video::VideoMode {
+            video_path: video_path.to_string(),
+            prompt_text: args.video_prompt.clone(),
+            points,
+            point_labels,
+            boxes,
+            box_labels,
+            frame_stride: args.video_frame_stride,
+        };
+        video::run_video_prediction(
+            model
+                .as_ref()
+                .context("SAM3 video mode requires `--checkpoint <sam3.pt>`")?,
+            &video_mode,
+            Path::new(&args.output_dir),
+            &device,
+        )?;
+        return Ok(());
+    }
+
+    if let Some(image_path) = args.interactive.as_deref() {
+        let interactive_mode = interactive::InteractiveMode::new(image_path.to_string())
+            .with_initial_points(
+                geometry_inputs
+                    .as_ref()
+                    .map(|inputs| inputs.points.iter().map(|p| (p.x, p.y)).collect())
+                    .unwrap_or_default(),
+                geometry_inputs
+                    .as_ref()
+                    .map(|inputs| inputs.point_labels.clone())
+                    .unwrap_or_default(),
+            );
+        interactive::run_interactive_refinement(
+            model
+                .as_ref()
+                .context("SAM3 interactive mode requires `--checkpoint <sam3.pt>`")?,
+            &interactive_mode,
+            Path::new(&args.output_dir),
+            &device,
+        )?;
+        return Ok(());
+    }
 
     let text_encoding = if let Some(prompt) = args.prompt.as_deref() {
         let tokenizer = args.tokenizer.as_deref().ok_or_else(|| {
