@@ -387,7 +387,17 @@ impl Sam3ImageModel {
         let boxes = decoder_out.pred_boxes_xyxy;
 
         // Select the best prediction (highest score)
-        let best_idx = scores.argmax(1)?.to_scalar::<u32>()? as usize;
+        let best_idx = scores
+            .argmax(1)?
+            .flatten_all()?
+            .to_vec1::<u32>()?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                candle::Error::Msg(
+                    "sam3 grounding did not produce any query indices after argmax".to_string(),
+                )
+            })? as usize;
         let best_score = scores.i((0, best_idx))?;
         let best_box = boxes.i((0, best_idx))?;
 

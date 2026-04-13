@@ -99,6 +99,10 @@ struct Args {
     #[arg(long)]
     interactive: Option<String>,
 
+    /// Optional JSON replay manifest for deterministic interactive refinement.
+    #[arg(long)]
+    interactive_script: Option<String>,
+
     #[arg(long)]
     cpu: bool,
 
@@ -372,7 +376,7 @@ pub(crate) fn preprocess_image_path_exact(
     image_path: &str,
     model: &sam3::Sam3ImageModel,
     device: &Device,
-) -> Result<Tensor> {
+) -> candle::Result<Tensor> {
     let config = model.config();
     let image_size = config.image.image_size;
     let rgb = image::ImageReader::open(image_path)?
@@ -393,7 +397,7 @@ pub(crate) fn preprocess_image_path_exact(
     let image = (image / 255.)?;
     let mean = Tensor::from_vec(config.image.image_mean.to_vec(), (1, 3, 1, 1), device)?;
     let std = Tensor::from_vec(config.image.image_std.to_vec(), (1, 3, 1, 1), device)?;
-    image.broadcast_sub(&mean)?.broadcast_div(&std)
+    Ok(image.broadcast_sub(&mean)?.broadcast_div(&std)?)
 }
 
 fn preprocess_image_for_sam3(
@@ -1981,7 +1985,9 @@ mod tests {
         let points = vec![PointArg { x: 0.25, y: 0.5 }, PointArg { x: 0.75, y: 0.9 }];
         let err = build_geometry_prompt_from_parts(&points, &[1], &[], &[], &device)
             .expect_err("expected label mismatch error");
-        assert!(err.to_string().contains("point labels"));
+        let message = err.to_string();
+        assert!(message.contains("--point-label"));
+        assert!(message.contains("must match"));
     }
 }
 
@@ -2118,8 +2124,14 @@ pub fn main() -> anyhow::Result<()> {
     {
         bail!("running implemented SAM3 stages currently requires `--checkpoint <sam3.pt>`")
     }
-    if (!args.points.is_empty() || !args.boxes.is_empty()) && args.image.is_none() && args.video.is_none() {
-        bail!("`--point` and `--box` prompts require `--image` or `--video` so the geometry encoder has image features")
+    if (!args.points.is_empty() || !args.boxes.is_empty())
+        && args.image.is_none()
+        && args.video.is_none()
+        && args.interactive.is_none()
+    {
+        bail!(
+            "`--point` and `--box` prompts require `--image`, `--interactive`, or `--video` so the geometry encoder has image features"
+        )
     }
     if args.parity_bundle.is_some() && args.compare_reference_bundle.is_some() {
         bail!("use either `--parity-bundle` or `--compare-reference-bundle`, not both")
@@ -2162,6 +2174,9 @@ pub fn main() -> anyhow::Result<()> {
     }
     if args.batch_manifest.is_some() && args.image_predictor_example {
         bail!("use either `--batch-manifest` or `--image-predictor-example`, not both")
+    }
+    if args.interactive_script.is_some() && args.interactive.is_none() {
+        bail!("`--interactive-script` requires `--interactive <image>`")
     }
 
     let model = if let Some(checkpoint) = checkpoint_source.as_ref() {
@@ -2265,6 +2280,11 @@ pub fn main() -> anyhow::Result<()> {
     }
 
     if let Some(image_path) = args.interactive.as_deref() {
+        let replay_steps = if let Some(script_path) = args.interactive_script.as_deref() {
+            interactive::load_replay_steps(script_path)?
+        } else {
+            Vec::new()
+        };
         let interactive_mode = interactive::InteractiveMode::new(image_path.to_string())
             .with_initial_points(
                 geometry_inputs
@@ -2275,6 +2295,26 @@ pub fn main() -> anyhow::Result<()> {
                     .as_ref()
                     .map(|inputs| inputs.point_labels.clone())
                     .unwrap_or_default(),
+            )
+            .with_initial_boxes(
+                geometry_inputs
+                    .as_ref()
+                    .map(|inputs| {
+                        inputs
+                            .boxes
+                            .iter()
+                            .map(|b| (b.cx, b.cy, b.w, b.h))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                geometry_inputs
+                    .as_ref()
+                    .map(|inputs| inputs.box_labels.clone())
+                    .unwrap_or_default(),
+            )
+            .with_replay_steps(
+                replay_steps,
+                args.interactive_script.clone(),
             );
         interactive::run_interactive_refinement(
             model
