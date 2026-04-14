@@ -527,6 +527,25 @@ mod tests {
     }
 
     #[test]
+    fn segmentation_fixture_smoke_final_matches_upstream() -> Result<()> {
+        let output = run_fixture_segmentation_forward()?;
+        let expected = load_segmentation_fixture_tensors("fixture.safetensors")?;
+        assert_tensor_close(
+            &output.mask_logits,
+            fixture_tensor(&expected, "segmentation.mask_logits")?,
+            1e-5,
+            "segmentation.mask_logits",
+        )?;
+        assert_tensor_close(
+            &output.semantic_logits,
+            fixture_tensor(&expected, "segmentation.semantic_logits")?,
+            1e-5,
+            "segmentation.semantic_logits",
+        )?;
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "fixture-driven parity investigation"]
     fn segmentation_fixture_pixel_path_matches_upstream() -> Result<()> {
         let (_output, debug_tensors) = run_fixture_segmentation()?;
@@ -826,6 +845,39 @@ mod tests {
                 })?;
         let _ = fs::remove_dir_all(&debug_dir);
         Ok((output, debug_tensors))
+    }
+
+    fn run_fixture_segmentation_forward() -> Result<SegmentationOutput> {
+        let device = Device::Cpu;
+        let config = fixture_config()?;
+        let weights = load_segmentation_fixture_tensors("segmentation_weights.safetensors")?;
+        let fixture = load_segmentation_fixture_tensors("fixture.safetensors")?;
+        let vb = VarBuilder::from_tensors(weights, DType::F32, &device);
+        let head = UniversalSegmentationHead::new(&config, vb)?;
+        let backbone_fpn = fixture_backbone_fpn(&fixture);
+        if backbone_fpn.is_empty() {
+            candle::bail!("segmentation fixture did not include any backbone FPN levels");
+        }
+        let num_queries = fixture_metadata()?.num_queries;
+        let decoder_out = DecoderOutput {
+            queries: fixture_tensor(&fixture, "inputs/decoder_queries")?.clone(),
+            reference_boxes: Tensor::zeros((1, num_queries, 4), DType::F32, &device)?,
+            pred_logits: Tensor::zeros((1, num_queries, 1), DType::F32, &device)?,
+            pred_boxes: Tensor::zeros((1, num_queries, 4), DType::F32, &device)?,
+            pred_boxes_xyxy: Tensor::zeros((1, num_queries, 4), DType::F32, &device)?,
+            presence_logits: None,
+        };
+        let encoder_hidden_states =
+            fixture_tensor(&fixture, "inputs/encoder_hidden_states")?.clone();
+        let prompt = fixture_tensor(&fixture, "inputs/prompt")?.clone();
+        let prompt_mask = fixture_tensor(&fixture, "inputs/prompt_mask")?.clone();
+        head.forward(
+            &backbone_fpn,
+            &decoder_out,
+            &encoder_hidden_states,
+            Some(&prompt),
+            Some(&prompt_mask),
+        )
     }
 
     fn assert_debug_keys_close(

@@ -1396,6 +1396,25 @@ mod tests {
     }
 
     #[test]
+    fn geometry_fixture_smoke_final_matches_upstream() -> Result<()> {
+        let encoded = run_fixture_geometry_forward()?;
+        let expected = load_geometry_fixture_tensors("fixture.safetensors")?;
+        assert_tensor_close(
+            &encoded.features,
+            fixture_tensor(&expected, "geometry/returned_features")?,
+            1e-5,
+            "geometry/returned_features",
+        )?;
+        assert_tensor_close(
+            &encoded.padding_mask.to_dtype(DType::U8)?,
+            fixture_tensor(&expected, "geometry/padding_mask")?,
+            0.0,
+            "geometry/padding_mask",
+        )?;
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "fixture-driven parity investigation"]
     fn geometry_fixture_point_helpers_match_upstream() -> Result<()> {
         let fixture = load_geometry_fixture_tensors("fixture.safetensors")?;
@@ -1698,6 +1717,23 @@ mod tests {
                 })?;
         let _ = fs::remove_dir_all(&debug_dir);
         Ok((encoded, debug_tensors))
+    }
+
+    fn run_fixture_geometry_forward() -> Result<super::EncodedPrompt> {
+        let device = Device::Cpu;
+        let config = fixture_config()?;
+        let weights = load_geometry_fixture_tensors("weights.safetensors")?;
+        let fixture = load_geometry_fixture_tensors("fixture.safetensors")?;
+        let vb = VarBuilder::from_tensors(weights, DType::F32, &device);
+        let encoder = SequenceGeometryEncoder::new(&config, vb)?;
+        let prompt = GeometryPrompt {
+            boxes_cxcywh: Some(fixture_tensor(&fixture, "inputs/boxes_cxcywh")?.clone()),
+            box_labels: Some(fixture_tensor(&fixture, "inputs/box_labels")?.to_dtype(DType::U32)?),
+            ..Default::default()
+        };
+        let image_features = vec![fixture_tensor(&fixture, "inputs/image_features")?.clone()];
+        let image_pos = vec![fixture_tensor(&fixture, "inputs/image_pos_embeds")?.clone()];
+        encoder.encode(&prompt, &image_features, &image_pos)
     }
 
     fn run_interactive_fixture_geometry_encode(

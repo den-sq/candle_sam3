@@ -435,6 +435,62 @@ mod tests {
     }
 
     #[test]
+    fn fusion_encoder_smoke_fixture_matches_expected_values() -> Result<()> {
+        let device = Device::Cpu;
+        let config = test_config();
+        let vb = VarBuilder::from_tensors(encoder_weights(&config, &device)?, DType::F32, &device);
+        let encoder = Sam3FusionEncoder::new(&config, vb)?;
+        let values = (0..(config.d_model * 2 * 2))
+            .map(|value| value as f32)
+            .collect::<Vec<_>>();
+        let pos_values = (0..(config.d_model * 2 * 2))
+            .map(|value| value as f32 + 100.0)
+            .collect::<Vec<_>>();
+        let visual_features = vec![Tensor::from_vec(
+            values,
+            (1, config.d_model, 2, 2),
+            &device,
+        )?];
+        let visual_pos = vec![Tensor::from_vec(
+            pos_values,
+            (1, config.d_model, 2, 2),
+            &device,
+        )?];
+        let prompt = EncodedPrompt {
+            features: Tensor::zeros((2, 1, config.d_model), DType::F32, &device)?,
+            padding_mask: Tensor::zeros((1, 2), DType::U8, &device)?,
+        };
+
+        let output = encoder.forward(&visual_features, &visual_pos, &prompt)?;
+        let expected_memory =
+            visual_features[0]
+                .permute((2, 3, 0, 1))?
+                .reshape((4, 1, config.d_model))?;
+        let expected_pos = visual_pos[0]
+            .permute((2, 3, 0, 1))?
+            .reshape((4, 1, config.d_model))?;
+
+        assert_tensor_close(&output.memory, &expected_memory, 0.0, "fusion.smoke.memory")?;
+        assert_tensor_close(
+            &output.pos_embed,
+            &expected_pos,
+            0.0,
+            "fusion.smoke.pos_embed",
+        )?;
+        assert_eq!(
+            output.padding_mask.to_vec2::<u8>()?,
+            vec![vec![0], vec![0], vec![0], vec![0]]
+        );
+        assert_eq!(output.spatial_shapes.to_vec2::<u32>()?, vec![vec![2, 2]]);
+        assert_eq!(output.level_start_index.to_vec1::<u32>()?, vec![0]);
+        assert_eq!(
+            output.valid_ratios.to_vec3::<f32>()?,
+            vec![vec![vec![1.0, 1.0]]]
+        );
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "fixture-driven parity investigation"]
     fn fusion_fixture_memory_matches_upstream() -> Result<()> {
         let output = run_fixture_fusion()?;

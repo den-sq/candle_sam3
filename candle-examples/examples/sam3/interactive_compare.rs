@@ -304,12 +304,15 @@ pub fn run_interactive_reference_comparison(
         .metadata
         .image_size
         .unwrap_or(model.config().image.image_size);
-    let preprocess_mode =
-        crate::PreprocessMode::from_bundle_metadata(bundle.metadata.preprocess_mode.as_deref())?;
-    if preprocess_mode != crate::PreprocessMode::Exact {
+    let preprocess_mode = bundle
+        .metadata
+        .preprocess_mode
+        .as_deref()
+        .unwrap_or("exact");
+    if preprocess_mode != "exact" {
         bail!(
             "interactive reference comparison currently expects exact preprocessing, got `{}`",
-            preprocess_mode.as_str()
+            preprocess_mode
         )
     }
 
@@ -397,7 +400,6 @@ pub fn run_interactive_reference_comparison(
         let reference_selected = crate::select_prediction_from_xyxy_tensors(
             &bundle.metadata.image_path,
             image_size,
-            preprocess_mode,
             bundle.tensor(&format!("step.{step_idx}.decoder.pred_boxes_xyxy"))?,
             bundle.tensor(&format!("step.{step_idx}.segmentation.mask_logits"))?,
             &reference_scores,
@@ -405,7 +407,6 @@ pub fn run_interactive_reference_comparison(
         let candle_selected = crate::select_prediction_from_xyxy_tensors(
             &bundle.metadata.image_path,
             image_size,
-            preprocess_mode,
             &candle.decoder_pred_boxes_xyxy,
             &candle.segmentation_mask_logits,
             &candle.scores,
@@ -477,7 +478,7 @@ pub fn run_interactive_reference_comparison(
             bundle_version: bundle.metadata.bundle_version,
             image_path: bundle.metadata.image_path.clone(),
             image_size,
-            preprocess_mode: preprocess_mode.as_str().to_string(),
+            preprocess_mode: preprocess_mode.to_string(),
             replay_script_path: bundle.metadata.replay_script_path.clone(),
             atol,
             all_passed: entries.iter().all(|current| current.all_stages_passed),
@@ -498,7 +499,7 @@ pub fn run_interactive_reference_comparison(
         bundle_version: bundle.metadata.bundle_version,
         image_path: bundle.metadata.image_path.clone(),
         image_size,
-        preprocess_mode: preprocess_mode.as_str().to_string(),
+        preprocess_mode: preprocess_mode.to_string(),
         replay_script_path: bundle.metadata.replay_script_path.clone(),
         atol,
         all_passed: entries.iter().all(|entry| entry.all_stages_passed),

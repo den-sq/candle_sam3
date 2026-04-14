@@ -429,12 +429,8 @@ fn render_iteration(
         3 => grounding.mask_logits.i(0)?,
         rank => bail!("interactive grounding mask logits expected rank 2 or 3, got {rank}"),
     };
-    let mask_probs = crate::upsample_mask_probs_to_render(
-        &best_mask_logits,
-        image_size,
-        image_path,
-        crate::PreprocessMode::Exact,
-    )?;
+    let mask_probs =
+        crate::upsample_mask_probs_to_render(&best_mask_logits, image_size, image_path)?;
     let mask = crate::blend_mask(&mut overlay, &mask_probs, [56, 201, 84])?;
 
     let overlay_path = iteration_dir.join("overlay.png");

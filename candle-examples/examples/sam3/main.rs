@@ -145,40 +145,6 @@ enum RenderStyle {
     NotebookImagePredictor,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PreprocessMode {
-    Exact,
-    CropFill,
-}
-
-impl PreprocessMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Exact => "exact",
-            Self::CropFill => "crop_fill",
-        }
-    }
-
-    fn from_bundle_metadata(value: Option<&str>) -> Result<Self> {
-        match value.unwrap_or("exact") {
-            "exact" => Ok(Self::Exact),
-            "crop_fill" => Ok(Self::CropFill),
-            other => bail!("unsupported preprocess mode `{other}` in reference bundle metadata"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ResizeToFillTransform {
-    resized_width: usize,
-    resized_height: usize,
-    crop_x: usize,
-    crop_y: usize,
-    target_size: usize,
-    original_width: usize,
-    original_height: usize,
-}
-
 #[derive(Clone, Debug)]
 struct SelectedPrediction {
     best_idx: usize,
@@ -189,9 +155,6 @@ struct SelectedPrediction {
 
 #[derive(Debug, serde::Serialize)]
 struct ReferenceComparisonEntry {
-    preprocess_mode: String,
-    bundle_preprocess_mode: String,
-    compared_region_xyxy_normalized: Option<Vec<f32>>,
     reference_best_query_index: usize,
     candle_best_query_index: usize,
     reference_best_score: f32,
@@ -207,42 +170,6 @@ struct ReferenceComparisonEntry {
     prediction_overlay_rmse: Option<f32>,
     prediction_overlay_one_minus_sigmoid_threshold_0_5_mean_abs_diff: Option<f32>,
     prediction_overlay_one_minus_sigmoid_threshold_0_5_rmse: Option<f32>,
-}
-
-impl ResizeToFillTransform {
-    fn from_original(original_width: usize, original_height: usize, target_size: usize) -> Self {
-        let scale = (target_size as f32 / original_width as f32)
-            .max(target_size as f32 / original_height as f32);
-        let resized_width = ((original_width as f32) * scale).round() as usize;
-        let resized_height = ((original_height as f32) * scale).round() as usize;
-        let crop_x = resized_width.saturating_sub(target_size) / 2;
-        let crop_y = resized_height.saturating_sub(target_size) / 2;
-        Self {
-            resized_width,
-            resized_height,
-            crop_x,
-            crop_y,
-            target_size,
-            original_width,
-            original_height,
-        }
-    }
-
-    fn map_box_to_original(self, box_xyxy: [f32; 4]) -> [f32; 4] {
-        let target = self.target_size as f32;
-        let resized_w = self.resized_width as f32;
-        let resized_h = self.resized_height as f32;
-        [
-            ((self.crop_x as f32) + box_xyxy[0] * target) / resized_w,
-            ((self.crop_y as f32) + box_xyxy[1] * target) / resized_h,
-            ((self.crop_x as f32) + box_xyxy[2] * target) / resized_w,
-            ((self.crop_y as f32) + box_xyxy[3] * target) / resized_h,
-        ]
-    }
-
-    fn visible_region_in_original(self) -> [f32; 4] {
-        self.map_box_to_original([0.0, 0.0, 1.0, 1.0])
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -393,21 +320,10 @@ fn preprocess_image_for_sam3(
     image_path: &str,
     image_size: usize,
     config: &sam3::Config,
-    preprocess_mode: PreprocessMode,
     device: &Device,
 ) -> Result<Tensor> {
-    let image = match preprocess_mode {
-        PreprocessMode::Exact => {
-            let image = decode_image_rgb_chw_u8(image_path, device)?;
-            resize_image_exact_for_sam3(&image, image_size)?
-        }
-        PreprocessMode::CropFill => {
-            let image = candle_examples::load_image_and_resize(image_path, image_size, image_size)?
-                .to_device(device)?
-                .to_dtype(DType::F32)?;
-            (image / 255.)?.unsqueeze(0)?
-        }
-    };
+    let image = decode_image_rgb_chw_u8(image_path, device)?;
+    let image = resize_image_exact_for_sam3(&image, image_size)?;
     Ok(normalize_image_for_sam3(&image, config)?)
 }
 
@@ -584,49 +500,6 @@ fn blend_mask(image: &mut RgbaImage, mask_probs: &[Vec<f32>], color: [u8; 3]) ->
     Ok(mask)
 }
 
-fn restore_crop_fill_mask_probs(
-    mask_probs: &[Vec<f32>],
-    transform: ResizeToFillTransform,
-) -> Result<Vec<Vec<f32>>> {
-    let target_h = mask_probs.len();
-    let target_w = mask_probs.first().map(|row| row.len()).unwrap_or(0);
-    if target_h != transform.target_size || target_w != transform.target_size {
-        bail!(
-            "crop-fill mask restoration expected square mask size {}x{}, got {}x{}",
-            transform.target_size,
-            transform.target_size,
-            target_w,
-            target_h
-        )
-    }
-
-    let mask_image = mask_probs_to_gray_image(mask_probs);
-    let mut resized_canvas = GrayImage::new(
-        transform.resized_width as u32,
-        transform.resized_height as u32,
-    );
-    image::imageops::replace(
-        &mut resized_canvas,
-        &mask_image,
-        transform.crop_x as i64,
-        transform.crop_y as i64,
-    );
-    let restored = image::imageops::resize(
-        &resized_canvas,
-        transform.original_width as u32,
-        transform.original_height as u32,
-        image::imageops::FilterType::Triangle,
-    );
-
-    let mut out = vec![vec![0.0f32; transform.original_width]; transform.original_height];
-    for (y, row) in out.iter_mut().enumerate() {
-        for (x, value) in row.iter_mut().enumerate() {
-            *value = f32::from(restored.get_pixel(x as u32, y as u32)[0]) / 255.0;
-        }
-    }
-    Ok(out)
-}
-
 fn mask_probs_to_gray_image(mask_probs: &[Vec<f32>]) -> GrayImage {
     let height = mask_probs.len();
     let width = mask_probs.first().map(|row| row.len()).unwrap_or(0);
@@ -720,20 +593,10 @@ fn upsample_mask_probs_to_render(
     mask_logits: &Tensor,
     image_size: usize,
     image_path: &str,
-    preprocess_mode: PreprocessMode,
 ) -> Result<Vec<Vec<f32>>> {
     let render_image = load_render_image(image_path)?;
     let render_width = render_image.width() as usize;
     let render_height = render_image.height() as usize;
-    let crop_fill_transform = if preprocess_mode == PreprocessMode::CropFill {
-        Some(ResizeToFillTransform::from_original(
-            render_width,
-            render_height,
-            image_size,
-        ))
-    } else {
-        None
-    };
     let best_mask_logits = mask_logits
         .unsqueeze(0)?
         .unsqueeze(0)?
@@ -741,74 +604,40 @@ fn upsample_mask_probs_to_render(
         .i((0, 0))?;
     let best_mask_probs = candle_nn::ops::sigmoid(&best_mask_logits)?;
     let best_mask_probs = best_mask_probs.to_vec2::<f32>()?;
-    if let Some(transform) = crop_fill_transform {
-        restore_crop_fill_mask_probs(&best_mask_probs, transform)
-    } else {
-        let best_mask_probs = Tensor::from_vec(
-            best_mask_probs
-                .iter()
-                .flat_map(|row| row.iter().copied())
-                .collect::<Vec<_>>(),
-            (image_size, image_size),
-            &Device::Cpu,
-        )?
-        .unsqueeze(0)?
-        .unsqueeze(0)?
-        .upsample_bilinear2d(render_height, render_width, false)?
-        .i((0, 0))?;
-        Ok(best_mask_probs.to_vec2::<f32>()?)
-    }
+    let best_mask_probs = Tensor::from_vec(
+        best_mask_probs
+            .iter()
+            .flat_map(|row| row.iter().copied())
+            .collect::<Vec<_>>(),
+        (image_size, image_size),
+        &Device::Cpu,
+    )?
+    .unsqueeze(0)?
+    .unsqueeze(0)?
+    .upsample_bilinear2d(render_height, render_width, false)?
+    .i((0, 0))?;
+    Ok(best_mask_probs.to_vec2::<f32>()?)
 }
 
 fn select_prediction_from_cxcywh_tensors(
     image_path: &str,
     image_size: usize,
-    preprocess_mode: PreprocessMode,
     pred_boxes_cxcywh: &Tensor,
     mask_logits: &Tensor,
     scores: &Tensor,
 ) -> Result<SelectedPrediction> {
-    let render_image = load_render_image(image_path)?;
-    let render_width = render_image.width() as usize;
-    let render_height = render_image.height() as usize;
-    let crop_fill_transform = if preprocess_mode == PreprocessMode::CropFill {
-        Some(ResizeToFillTransform::from_original(
-            render_width,
-            render_height,
-            image_size,
-        ))
-    } else {
-        None
-    };
     let (best_idx, best_score) = best_kept_query(scores, DEFAULT_CONFIDENCE_THRESHOLD)?;
     let pred_boxes = pred_boxes_cxcywh.to_vec3::<f32>()?;
     let best_box_cxcywh = &pred_boxes[0][best_idx];
-    let best_box_model = cxcywh_to_xyxy(&BoxArg {
+    let best_box_xyxy = cxcywh_to_xyxy(&BoxArg {
         cx: best_box_cxcywh[0],
         cy: best_box_cxcywh[1],
         w: best_box_cxcywh[2],
         h: best_box_cxcywh[3],
     })
     .to_vec();
-    let best_box_xyxy = if let Some(transform) = crop_fill_transform {
-        transform
-            .map_box_to_original([
-                best_box_model[0],
-                best_box_model[1],
-                best_box_model[2],
-                best_box_model[3],
-            ])
-            .to_vec()
-    } else {
-        best_box_model
-    };
     let selected_mask_logits = mask_logits.i((0, best_idx))?;
-    let mask_probs = upsample_mask_probs_to_render(
-        &selected_mask_logits,
-        image_size,
-        image_path,
-        preprocess_mode,
-    )?;
+    let mask_probs = upsample_mask_probs_to_render(&selected_mask_logits, image_size, image_path)?;
     Ok(SelectedPrediction {
         best_idx,
         best_score,
@@ -820,7 +649,6 @@ fn select_prediction_from_cxcywh_tensors(
 fn select_prediction_from_xyxy_tensors(
     image_path: &str,
     image_size: usize,
-    preprocess_mode: PreprocessMode,
     pred_boxes_xyxy: &Tensor,
     mask_logits: &Tensor,
     scores: &Tensor,
@@ -829,43 +657,13 @@ fn select_prediction_from_xyxy_tensors(
     let pred_boxes = pred_boxes_xyxy.to_vec3::<f32>()?;
     let best_box_xyxy = pred_boxes[0][best_idx].clone();
     let selected_mask_logits = mask_logits.i((0, best_idx))?;
-    let mask_probs = upsample_mask_probs_to_render(
-        &selected_mask_logits,
-        image_size,
-        image_path,
-        preprocess_mode,
-    )?;
+    let mask_probs = upsample_mask_probs_to_render(&selected_mask_logits, image_size, image_path)?;
     Ok(SelectedPrediction {
         best_idx,
         best_score,
         best_box_xyxy,
         mask_probs,
     })
-}
-
-fn crop_fill_comparison_region(
-    image_path: &str,
-    image_size: usize,
-    preprocess_mode: PreprocessMode,
-) -> Result<Option<[f32; 4]>> {
-    if preprocess_mode != PreprocessMode::CropFill {
-        return Ok(None);
-    }
-    let render_image = load_render_image(image_path)?;
-    let transform = ResizeToFillTransform::from_original(
-        render_image.width() as usize,
-        render_image.height() as usize,
-        image_size,
-    );
-    Ok(Some(transform.visible_region_in_original()))
-}
-
-fn clip_box_to_region(box_xyxy: &[f32], region: [f32; 4]) -> Vec<f32> {
-    let x0 = box_xyxy[0].min(box_xyxy[2]).clamp(region[0], region[2]);
-    let y0 = box_xyxy[1].min(box_xyxy[3]).clamp(region[1], region[3]);
-    let x1 = box_xyxy[0].max(box_xyxy[2]).clamp(region[0], region[2]);
-    let y1 = box_xyxy[1].max(box_xyxy[3]).clamp(region[1], region[3]);
-    vec![x0, y0, x1, y1]
 }
 
 fn box_iou(a: &[f32], b: &[f32]) -> f32 {
@@ -1084,7 +882,6 @@ fn save_render_outputs(
     image_path: &str,
     image_size: usize,
     output_dir: &Path,
-    preprocess_mode: PreprocessMode,
     prompt_label: &str,
     text_prompt: Option<&str>,
     decoder: &sam3::DecoderOutput,
@@ -1123,7 +920,6 @@ fn save_render_outputs(
     let selected = select_prediction_from_cxcywh_tensors(
         image_path,
         image_size,
-        preprocess_mode,
         &decoder.pred_boxes,
         &segmentation.mask_logits,
         scores,
@@ -1161,15 +957,7 @@ fn save_render_outputs(
             h: box_cxcywh[3],
         })
         .to_vec();
-        let box_xyxy = if preprocess_mode == PreprocessMode::CropFill {
-            let transform =
-                ResizeToFillTransform::from_original(render_width, render_height, image_size);
-            transform
-                .map_box_to_original([box_model[0], box_model[1], box_model[2], box_model[3]])
-                .to_vec()
-        } else {
-            box_model
-        };
+        let box_xyxy = box_model;
         kept_queries_debug.push(json!({
             "rank": rank,
             "query_index": query_idx,
@@ -1180,7 +968,6 @@ fn save_render_outputs(
             &segmentation.mask_logits.i((0, *query_idx))?,
             image_size,
             image_path,
-            preprocess_mode,
         )?;
         let color = palette_color(rank);
         blend_mask_with_threshold(
@@ -1292,16 +1079,12 @@ fn save_render_outputs(
             "width": render_width,
             "height": render_height,
         },
-        "preprocess_mode": preprocess_mode.as_str(),
+        "preprocess_mode": "exact",
         "model_input_size": image_size,
         "best_query_index": best_idx,
         "best_score": best_score,
         "best_box_xyxy_normalized": best_box,
-        "kept_queries_debug": if preprocess_mode == PreprocessMode::Exact {
-            serde_json::Value::Array(kept_queries_debug)
-        } else {
-            serde_json::Value::Null
-        },
+        "kept_queries_debug": serde_json::Value::Array(kept_queries_debug),
         "input_points_xy_normalized": input_points.iter().map(|point| vec![point.x, point.y]).collect::<Vec<_>>(),
         "input_point_labels": input_point_labels,
         "input_boxes_cxcywh_normalized": input_boxes.iter().map(|bbox| vec![bbox.cx, bbox.cy, bbox.w, bbox.h]).collect::<Vec<_>>(),
@@ -1318,7 +1101,7 @@ fn save_render_outputs(
     std::fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)?;
 
     println!("rendered outputs:");
-    println!("  preprocess mode: {}", preprocess_mode.as_str());
+    println!("  preprocess mode: exact");
     println!("  best query index: {best_idx}");
     println!("  best score: {best_score:.4}");
     println!("  best box xyxy (normalized): {:?}", best_box);
@@ -1641,7 +1424,6 @@ fn run_vision_and_geometry(
     image_path: &str,
     smoke_image_size: Option<usize>,
     output_dir: &Path,
-    preprocess_mode: PreprocessMode,
     text_prompt: Option<&str>,
     text_encoding: Option<&sam3::TextEncoding>,
     geometry_inputs: Option<&GeometryInputs>,
@@ -1670,11 +1452,11 @@ fn run_vision_and_geometry(
     );
 
     let image_size = smoke_image_size.unwrap_or(config.image.image_size);
-    let image = preprocess_image_for_sam3(image_path, image_size, config, preprocess_mode, device)?;
+    let image = preprocess_image_for_sam3(image_path, image_size, config, device)?;
     println!("vision stage:");
     println!("  preprocessed image shape: {:?}", image.dims());
     println!("  smoke resize: {image_size}x{image_size}");
-    println!("  preprocess mode: {}", preprocess_mode.as_str());
+    println!("  preprocess mode: exact");
     let visual = model.encode_image_features(&image)?;
     println!("  backbone_fpn levels: {}", visual.backbone_fpn.len());
     for (level_idx, (features, pos)) in visual
@@ -1779,7 +1561,6 @@ fn run_vision_and_geometry(
             image_path,
             image_size,
             output_dir,
-            preprocess_mode,
             &label,
             text_prompt,
             &decoder,
@@ -1825,8 +1606,16 @@ fn run_reference_comparison(
         .metadata
         .image_size
         .unwrap_or(model.config().image.image_size);
-    let reference_preprocess_mode =
-        PreprocessMode::from_bundle_metadata(bundle.metadata.preprocess_mode.as_deref())?;
+    let reference_preprocess_mode = bundle
+        .metadata
+        .preprocess_mode
+        .as_deref()
+        .unwrap_or("exact");
+    if reference_preprocess_mode != "exact" {
+        bail!(
+            "reference comparison currently expects exact preprocessing in the bundle, got `{reference_preprocess_mode}`"
+        );
+    }
     let text_prompt_for_render = bundle
         .metadata
         .prompt
@@ -1861,131 +1650,107 @@ fn run_reference_comparison(
     let reference_selected = select_prediction_from_xyxy_tensors(
         image_path,
         image_size,
-        reference_preprocess_mode,
         bundle.tensor("decoder.pred_boxes_xyxy")?,
         bundle.tensor("segmentation.mask_logits")?,
         &reference_scores,
     )?;
 
-    let mut comparisons = Vec::new();
-    for preprocess_mode in [PreprocessMode::Exact, PreprocessMode::CropFill] {
-        let mode_output_dir = output_dir.join(preprocess_mode.as_str());
-        let candle_selected = run_vision_and_geometry(
-            model,
-            image_path,
-            Some(image_size),
-            &mode_output_dir,
-            preprocess_mode,
-            text_prompt_for_render,
-            Some(&text_encoding),
-            geometry_inputs.as_ref(),
-            RenderStyle::Combined,
-            device,
-        )?
-        .context("reference comparison expected a rendered prediction for this bundle")?;
-        let compared_region = crop_fill_comparison_region(image_path, image_size, preprocess_mode)?;
-        let reference_box_for_metrics = if let Some(region) = compared_region {
-            clip_box_to_region(&reference_selected.best_box_xyxy, region)
+    let candle_selected = run_vision_and_geometry(
+        model,
+        image_path,
+        Some(image_size),
+        output_dir,
+        text_prompt_for_render,
+        Some(&text_encoding),
+        geometry_inputs.as_ref(),
+        RenderStyle::Combined,
+        device,
+    )?
+    .context("reference comparison expected a rendered prediction for this bundle")?;
+    let prediction_overlay_metrics =
+        if let Some(reference_overlay) = reference_prediction_overlay_all_kept.as_ref() {
+            let candle_overlay = load_render_image(
+                &output_dir
+                    .join("prediction_overlay.png")
+                    .display()
+                    .to_string(),
+            )?;
+            Some(image_diff_metrics(
+                &candle_overlay,
+                reference_overlay,
+                None,
+            )?)
         } else {
-            reference_selected.best_box_xyxy.clone()
+            None
         };
-        let candle_box_for_metrics = if let Some(region) = compared_region {
-            clip_box_to_region(&candle_selected.best_box_xyxy, region)
+    let prediction_overlay_one_minus_sigmoid_threshold_0_5_metrics =
+        if let Some(reference_overlay) = reference_prediction_overlay_all_kept.as_ref() {
+            let candle_overlay = load_render_image(
+                &output_dir
+                    .join("prediction_overlay_one_minus_sigmoid_threshold_0_5.png")
+                    .display()
+                    .to_string(),
+            )?;
+            Some(image_diff_metrics(
+                &candle_overlay,
+                reference_overlay,
+                None,
+            )?)
         } else {
-            candle_selected.best_box_xyxy.clone()
+            None
         };
-        let prediction_overlay_metrics =
-            if let Some(reference_overlay) = reference_prediction_overlay_all_kept.as_ref() {
-                let candle_overlay = load_render_image(
-                    &mode_output_dir
-                        .join("prediction_overlay.png")
-                        .display()
-                        .to_string(),
-                )?;
-                Some(image_diff_metrics(
-                    &candle_overlay,
-                    reference_overlay,
-                    compared_region,
-                )?)
-            } else {
-                None
-            };
-        let prediction_overlay_one_minus_sigmoid_threshold_0_5_metrics =
-            if let Some(reference_overlay) = reference_prediction_overlay_all_kept.as_ref() {
-                let candle_overlay = load_render_image(
-                    &mode_output_dir
-                        .join("prediction_overlay_one_minus_sigmoid_threshold_0_5.png")
-                        .display()
-                        .to_string(),
-                )?;
-                Some(image_diff_metrics(
-                    &candle_overlay,
-                    reference_overlay,
-                    compared_region,
-                )?)
-            } else {
-                None
-            };
 
-        let entry = ReferenceComparisonEntry {
-            preprocess_mode: preprocess_mode.as_str().to_string(),
-            bundle_preprocess_mode: reference_preprocess_mode.as_str().to_string(),
-            compared_region_xyxy_normalized: compared_region.map(|region| region.to_vec()),
-            reference_best_query_index: reference_selected.best_idx,
-            candle_best_query_index: candle_selected.best_idx,
-            reference_best_score: reference_selected.best_score,
-            candle_best_score: candle_selected.best_score,
-            score_abs_diff: (reference_selected.best_score - candle_selected.best_score).abs(),
-            reference_best_box_xyxy: reference_selected.best_box_xyxy.clone(),
-            candle_best_box_xyxy: candle_selected.best_box_xyxy.clone(),
-            box_l1_mean_abs_diff: mean_abs_box_diff(
-                &reference_box_for_metrics,
-                &candle_box_for_metrics,
-            ),
-            box_iou: box_iou(&reference_box_for_metrics, &candle_box_for_metrics),
-            mask_mean_abs_diff: mask_mean_abs_diff(
-                &reference_selected.mask_probs,
-                &candle_selected.mask_probs,
-                compared_region,
-            )?,
-            mask_iou_threshold_0_5: mask_iou_at_threshold(
-                &reference_selected.mask_probs,
-                &candle_selected.mask_probs,
-                0.5,
-                compared_region,
-            )?,
-            prediction_overlay_mean_abs_diff: prediction_overlay_metrics.map(|metrics| metrics.0),
-            prediction_overlay_rmse: prediction_overlay_metrics.map(|metrics| metrics.1),
-            prediction_overlay_one_minus_sigmoid_threshold_0_5_mean_abs_diff:
-                prediction_overlay_one_minus_sigmoid_threshold_0_5_metrics.map(|metrics| metrics.0),
-            prediction_overlay_one_minus_sigmoid_threshold_0_5_rmse:
-                prediction_overlay_one_minus_sigmoid_threshold_0_5_metrics.map(|metrics| metrics.1),
-        };
-        comparisons.push(entry);
+    let comparison = ReferenceComparisonEntry {
+        reference_best_query_index: reference_selected.best_idx,
+        candle_best_query_index: candle_selected.best_idx,
+        reference_best_score: reference_selected.best_score,
+        candle_best_score: candle_selected.best_score,
+        score_abs_diff: (reference_selected.best_score - candle_selected.best_score).abs(),
+        reference_best_box_xyxy: reference_selected.best_box_xyxy.clone(),
+        candle_best_box_xyxy: candle_selected.best_box_xyxy.clone(),
+        box_l1_mean_abs_diff: mean_abs_box_diff(
+            &reference_selected.best_box_xyxy,
+            &candle_selected.best_box_xyxy,
+        ),
+        box_iou: box_iou(
+            &reference_selected.best_box_xyxy,
+            &candle_selected.best_box_xyxy,
+        ),
+        mask_mean_abs_diff: mask_mean_abs_diff(
+            &reference_selected.mask_probs,
+            &candle_selected.mask_probs,
+            None,
+        )?,
+        mask_iou_threshold_0_5: mask_iou_at_threshold(
+            &reference_selected.mask_probs,
+            &candle_selected.mask_probs,
+            0.5,
+            None,
+        )?,
+        prediction_overlay_mean_abs_diff: prediction_overlay_metrics.map(|metrics| metrics.0),
+        prediction_overlay_rmse: prediction_overlay_metrics.map(|metrics| metrics.1),
+        prediction_overlay_one_minus_sigmoid_threshold_0_5_mean_abs_diff:
+            prediction_overlay_one_minus_sigmoid_threshold_0_5_metrics.map(|metrics| metrics.0),
+        prediction_overlay_one_minus_sigmoid_threshold_0_5_rmse:
+            prediction_overlay_one_minus_sigmoid_threshold_0_5_metrics.map(|metrics| metrics.1),
+    };
 
-        let summary_path = mode_output_dir.join("reference_comparison.json");
-        std::fs::write(
-            &summary_path,
-            serde_json::to_string_pretty(comparisons.last().unwrap())?,
-        )?;
-        println!(
-            "reference comparison ({}) written to {}",
-            preprocess_mode.as_str(),
-            summary_path.display()
-        );
-    }
+    let summary_path = output_dir.join("reference_comparison.json");
+    std::fs::create_dir_all(output_dir)?;
+    std::fs::write(&summary_path, serde_json::to_string_pretty(&comparison)?)?;
+    println!("reference comparison written to {}", summary_path.display());
 
     let summary = json!({
         "mode": "reference_comparison",
         "reference_bundle": Path::new(bundle_path).display().to_string(),
-        "reference_preprocess_mode": reference_preprocess_mode.as_str(),
+        "reference_preprocess_mode": reference_preprocess_mode,
         "image_path": image_path,
         "text_prompt": text_prompt_for_render,
         "input_boxes_cxcywh_normalized": geometry_boxes.iter().map(|bbox| vec![bbox.cx, bbox.cy, bbox.w, bbox.h]).collect::<Vec<_>>(),
         "input_box_labels": geometry_box_labels,
         "input_points_xy_normalized": geometry_points.iter().map(|point| vec![point.x, point.y]).collect::<Vec<_>>(),
         "input_point_labels": geometry_point_labels,
-        "comparisons": comparisons,
+        "comparison": comparison,
     });
     let summary_path = output_dir.join("reference_comparison_report.json");
     std::fs::create_dir_all(output_dir)?;
@@ -2040,13 +1805,7 @@ mod tests {
             .expect("interactive visual fixture image_size should be an integer")
             as usize;
         let config = sam3::Config::default();
-        let actual = preprocess_image_for_sam3(
-            image_path,
-            image_size,
-            &config,
-            PreprocessMode::Exact,
-            &Device::Cpu,
-        )?;
+        let actual = preprocess_image_for_sam3(image_path, image_size, &config, &Device::Cpu)?;
         let expected = fixture
             .get("inputs.image_preprocessed")
             .expect("interactive visual fixture should include inputs.image_preprocessed");
@@ -2337,22 +2096,17 @@ fn run_batch_jobs(
         } else {
             None
         };
-        for preprocess_mode in [PreprocessMode::Exact, PreprocessMode::CropFill] {
-            let mode_output_dir = job_output_dir.join(preprocess_mode.as_str());
-            println!("  preprocess mode: {}", preprocess_mode.as_str());
-            run_vision_and_geometry(
-                model,
-                &job.image,
-                job.smoke_image_size,
-                &mode_output_dir,
-                preprocess_mode,
-                job.prompt.as_deref(),
-                text_encoding.as_ref(),
-                geometry_inputs.as_ref(),
-                render_style,
-                device,
-            )?;
-        }
+        run_vision_and_geometry(
+            model,
+            &job.image,
+            job.smoke_image_size,
+            &job_output_dir,
+            job.prompt.as_deref(),
+            text_encoding.as_ref(),
+            geometry_inputs.as_ref(),
+            render_style,
+            device,
+        )?;
     }
     Ok(())
 }
@@ -2690,22 +2444,19 @@ pub fn main() -> anyhow::Result<()> {
     };
 
     if let Some(image_path) = args.image.as_deref() {
-        for preprocess_mode in [PreprocessMode::Exact, PreprocessMode::CropFill] {
-            run_vision_and_geometry(
-                model
-                    .as_ref()
-                    .context("SAM3 vision stage requires `--checkpoint <sam3.pt>`")?,
-                image_path,
-                args.smoke_image_size,
-                &Path::new(&args.output_dir).join(preprocess_mode.as_str()),
-                preprocess_mode,
-                args.prompt.as_deref(),
-                text_encoding.as_ref(),
-                geometry_inputs.as_ref(),
-                RenderStyle::Combined,
-                &device,
-            )?;
-        }
+        run_vision_and_geometry(
+            model
+                .as_ref()
+                .context("SAM3 vision stage requires `--checkpoint <sam3.pt>`")?,
+            image_path,
+            args.smoke_image_size,
+            Path::new(&args.output_dir),
+            args.prompt.as_deref(),
+            text_encoding.as_ref(),
+            geometry_inputs.as_ref(),
+            RenderStyle::Combined,
+            &device,
+        )?;
     }
 
     Ok(())

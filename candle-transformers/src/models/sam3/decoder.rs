@@ -952,6 +952,25 @@ mod tests {
     }
 
     #[test]
+    fn decoder_fixture_smoke_final_matches_upstream() -> Result<()> {
+        let output = run_fixture_decoder_forward()?;
+        let expected = load_decoder_fixture_tensors("fixture.safetensors")?;
+        assert_tensor_close(
+            &output.pred_logits,
+            fixture_tensor(&expected, "decoder.pred_logits")?,
+            1e-5,
+            "decoder.pred_logits",
+        )?;
+        assert_tensor_close(
+            &output.pred_boxes_xyxy,
+            fixture_tensor(&expected, "decoder.final_pred_boxes_xyxy")?,
+            1e-5,
+            "decoder.final_pred_boxes_xyxy",
+        )?;
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "fixture-driven parity investigation"]
     fn decoder_fixture_helper_parity_matches_upstream() -> Result<()> {
         let fixture = load_decoder_fixture_tensors("fixture.safetensors")?;
@@ -1206,6 +1225,21 @@ mod tests {
                 })?;
         let _ = fs::remove_dir_all(&debug_dir);
         Ok((output, debug_tensors))
+    }
+
+    fn run_fixture_decoder_forward() -> Result<DecoderOutput> {
+        let device = Device::Cpu;
+        let config = fixture_config()?;
+        let decoder_weights = load_decoder_fixture_tensors("decoder_weights.safetensors")?;
+        let score_weights = load_decoder_fixture_tensors("score_weights.safetensors")?;
+        let fixture = load_decoder_fixture_tensors("fixture.safetensors")?;
+        let decoder_vb = VarBuilder::from_tensors(decoder_weights, DType::F32, &device);
+        let score_vb = VarBuilder::from_tensors(score_weights, DType::F32, &device);
+        let decoder = Sam3TransformerDecoder::new(&config, decoder_vb, score_vb)?;
+        let encoder_out = fixture_encoder_out(&fixture, &config)?;
+        let prompt = fixture_tensor(&fixture, "inputs/prompt")?.clone();
+        let prompt_mask = fixture_tensor(&fixture, "inputs/prompt_mask")?.clone();
+        decoder.forward(&encoder_out, &prompt, &prompt_mask)
     }
 
     fn assert_debug_keys_close(

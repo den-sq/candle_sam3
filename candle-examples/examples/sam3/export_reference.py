@@ -73,12 +73,6 @@ def parse_args():
         help="Square image size used by the upstream processor.",
     )
     parser.add_argument(
-        "--preprocess-mode",
-        choices=["exact", "crop_fill"],
-        default="exact",
-        help="Image preprocessing used for the exported bundle. `exact` matches upstream SAM3; `crop_fill` is an example-specific diagnostic mode.",
-    )
-    parser.add_argument(
         "--device",
         default=None,
         help="Explicit torch device, e.g. cpu or cuda. Defaults to cuda when available.",
@@ -122,64 +116,16 @@ def to_cpu_nchw(tensor):
     return to_cpu_contiguous(tensor.permute(0, 3, 1, 2))
 
 
-def build_preprocessed_image(v2, image_tensor, image_size: int, preprocess_mode: str):
-    if preprocess_mode == "exact":
-        image = v2.functional.resize(
-            image_tensor,
-            [image_size, image_size],
-            interpolation=v2.InterpolationMode.BILINEAR,
-            antialias=True,
-        )
-        image = v2.functional.to_dtype(image, torch.float32, scale=True)
-        image = v2.functional.normalize(image, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-        return image.unsqueeze(0), None
-
-    orig_h, orig_w = image_tensor.shape[-2:]
-    scale = max(image_size / orig_h, image_size / orig_w)
-    resized_h = round(orig_h * scale)
-    resized_w = round(orig_w * scale)
-    crop_y = max(0, (resized_h - image_size) // 2)
-    crop_x = max(0, (resized_w - image_size) // 2)
+def build_preprocessed_image(v2, image_tensor, image_size: int):
     image = v2.functional.resize(
         image_tensor,
-        [resized_h, resized_w],
+        [image_size, image_size],
         interpolation=v2.InterpolationMode.BILINEAR,
         antialias=True,
     )
-    image = v2.functional.crop(image, crop_y, crop_x, image_size, image_size)
     image = v2.functional.to_dtype(image, torch.float32, scale=True)
     image = v2.functional.normalize(image, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-    transform = {
-        "resized_h": resized_h,
-        "resized_w": resized_w,
-        "crop_y": crop_y,
-        "crop_x": crop_x,
-        "image_size": image_size,
-        "orig_h": orig_h,
-        "orig_w": orig_w,
-    }
-    return image.unsqueeze(0), transform
-
-
-def map_box_to_crop_fill(box, transform):
-    cx, cy, w, h = box
-    x0 = cx - w * 0.5
-    y0 = cy - h * 0.5
-    x1 = cx + w * 0.5
-    y1 = cy + h * 0.5
-    x0 = ((x0 * transform["resized_w"]) - transform["crop_x"]) / transform["image_size"]
-    y0 = ((y0 * transform["resized_h"]) - transform["crop_y"]) / transform["image_size"]
-    x1 = ((x1 * transform["resized_w"]) - transform["crop_x"]) / transform["image_size"]
-    y1 = ((y1 * transform["resized_h"]) - transform["crop_y"]) / transform["image_size"]
-    return [(x0 + x1) * 0.5, (y0 + y1) * 0.5, x1 - x0, y1 - y0]
-
-
-def map_box_from_crop_fill(box_xyxy, transform):
-    x0 = (transform["crop_x"] + box_xyxy[0] * transform["image_size"]) / transform["resized_w"]
-    y0 = (transform["crop_y"] + box_xyxy[1] * transform["image_size"]) / transform["resized_h"]
-    x1 = (transform["crop_x"] + box_xyxy[2] * transform["image_size"]) / transform["resized_w"]
-    y1 = (transform["crop_y"] + box_xyxy[3] * transform["image_size"]) / transform["resized_h"]
-    return [x0, y0, x1, y1]
+    return image.unsqueeze(0)
 
 
 def normalized_box_to_pixels(box_xyxy, width, height):
@@ -235,17 +181,7 @@ def best_kept_query(scores, threshold=0.5):
     return best_kept if best_kept is not None else (best_any_idx, best_any_score)
 
 
-def restore_crop_fill_mask(mask_probs, transform):
-    from PIL import Image
-
-    target_size = transform["image_size"]
-    mask_image = Image.fromarray((mask_probs.clip(0.0, 1.0) * 255.0).round().astype("uint8"), mode="L")
-    canvas = Image.new("L", (transform["resized_w"], transform["resized_h"]), 0)
-    canvas.paste(mask_image, (transform["crop_x"], transform["crop_y"]))
-    return canvas.resize((transform["orig_w"], transform["orig_h"]), Image.Resampling.BILINEAR)
-
-
-def upsample_mask_to_original(mask_logits, image_size, image_size_hw, crop_fill_transform):
+def upsample_mask_to_original(mask_logits, image_size, image_size_hw):
     from PIL import Image
     import torch.nn.functional as F
 
@@ -258,9 +194,6 @@ def upsample_mask_to_original(mask_logits, image_size, image_size_hw, crop_fill_
             align_corners=False,
         )[0, 0]
     ).detach().cpu().numpy()
-    if crop_fill_transform is not None:
-        restored = restore_crop_fill_mask(probs, crop_fill_transform)
-        return restored, probs
     image = Image.fromarray((probs.clip(0.0, 1.0) * 255.0).round().astype("uint8"), mode="L")
     return image.resize((orig_w, orig_h), Image.Resampling.BILINEAR), probs
 
@@ -335,8 +268,6 @@ def main():
     )
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    exported_boxes = list(args.box)
-
     device = torch.device(
         args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
     )
@@ -513,16 +444,7 @@ def main():
 
     with torch.inference_mode():
         image_tensor = v2.functional.to_image(image).to(device)
-        preprocessed_image, crop_fill_transform = build_preprocessed_image(
-            v2, image_tensor, args.image_size, args.preprocess_mode
-        )
-        if args.box:
-            exported_boxes = [
-                map_box_to_crop_fill(box, crop_fill_transform)
-                if crop_fill_transform is not None
-                else box
-                for box in args.box
-            ]
+        preprocessed_image = build_preprocessed_image(v2, image_tensor, args.image_size)
         trunk_outputs, block_outputs, debug_tensors = run_trunk_with_debug(
             model.backbone.vision_backbone.trunk,
             preprocessed_image,
@@ -551,7 +473,7 @@ def main():
                 box_labels = (
                     args.box_label if args.box_label else [True for _ in args.box]
                 )
-                for model_box, label in zip(exported_boxes, box_labels):
+                for model_box, label in zip(args.box, box_labels):
                     boxes = torch.tensor(
                         model_box, device=device, dtype=torch.float32
                     ).view(1, 1, 4)
@@ -605,7 +527,7 @@ def main():
             dtype=torch.uint8,
         )
         tensors["inputs.boxes_cxcywh"] = to_cpu_contiguous(
-            torch.tensor(exported_boxes, dtype=torch.float32)
+            torch.tensor(args.box, dtype=torch.float32)
         )
         tensors["inputs.box_labels"] = to_cpu_contiguous(box_label_tensor)
     if not args.vision_only:
@@ -710,14 +632,11 @@ def main():
         kept_indices = (kept_scores > 0.5).nonzero(as_tuple=False).flatten().tolist()
 
         prediction_box = out["pred_boxes_xyxy"][0, best_idx].detach().cpu().tolist()
-        if crop_fill_transform is not None:
-            prediction_box = map_box_from_crop_fill(prediction_box, crop_fill_transform)
 
         restored_mask, _raw_mask_probs = upsample_mask_to_original(
             out["pred_masks"][0, best_idx],
             args.image_size,
             (image.height, image.width),
-            crop_fill_transform,
         )
         prediction_overlay = image.convert("RGBA")
         prediction_overlay = blend_mask_on_image(prediction_overlay, restored_mask)
@@ -741,13 +660,10 @@ def main():
         all_kept_overlay = image.convert("RGBA")
         for kept_rank, kept_idx in enumerate(kept_indices):
             kept_box = out["pred_boxes_xyxy"][0, kept_idx].detach().cpu().tolist()
-            if crop_fill_transform is not None:
-                kept_box = map_box_from_crop_fill(kept_box, crop_fill_transform)
             kept_mask, _ = upsample_mask_to_original(
                 out["pred_masks"][0, kept_idx],
                 args.image_size,
                 (image.height, image.width),
-                crop_fill_transform,
             )
             color = palette_color(kept_rank)
             all_kept_overlay = blend_mask_on_image(all_kept_overlay, kept_mask, color=color)
@@ -775,10 +691,9 @@ def main():
         "prompt": args.prompt,
         "effective_prompt": effective_prompt,
         "boxes_cxcywh": args.box,
-        "model_boxes_cxcywh": exported_boxes if args.box else [],
         "box_labels": args.box_label if args.box_label else [True for _ in args.box],
         "image_size": args.image_size,
-        "preprocess_mode": args.preprocess_mode,
+        "preprocess_mode": "exact",
         "checkpoint_path": str(checkpoint_path),
         "bpe_path": str(bpe_path),
         "stage_order": stage_order,
