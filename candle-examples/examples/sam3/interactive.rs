@@ -117,7 +117,10 @@ impl<'a> Sam3InteractiveSession<'a> {
             mask_labels: existing_prompt.mask_labels,
         };
 
-        self.image_state = self.image_state.clone().with_geometry_prompt(refined_prompt);
+        self.image_state = self
+            .image_state
+            .clone()
+            .with_geometry_prompt(refined_prompt);
         let output = self.model.ground_geometry(&self.image_state)?;
         self.image_state = self.image_state.clone().with_last_output(output.clone());
         if self.initial_state.is_none() {
@@ -160,7 +163,9 @@ pub struct InteractiveReplayStep {
 #[serde(untagged)]
 enum InteractiveReplayFile {
     Steps(Vec<InteractiveReplayStepFile>),
-    Named { steps: Vec<InteractiveReplayStepFile> },
+    Named {
+        steps: Vec<InteractiveReplayStepFile>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -448,10 +453,7 @@ fn render_iteration(
         iteration_index,
         step_name: step_name.to_string(),
         script_step_index,
-        added_points_xy_normalized: step_points
-            .iter()
-            .map(|(x, y)| vec![*x, *y])
-            .collect(),
+        added_points_xy_normalized: step_points.iter().map(|(x, y)| vec![*x, *y]).collect(),
         added_point_labels: step_point_labels.to_vec(),
         accumulated_points_xy_normalized: accumulated_points
             .iter()
@@ -615,7 +617,10 @@ pub fn run_interactive_refinement(
         iterations: summaries,
     };
     let summary_path = output_dir.join("interactive_session.json");
-    std::fs::write(&summary_path, serde_json::to_string_pretty(&replay_summary)?)?;
+    std::fs::write(
+        &summary_path,
+        serde_json::to_string_pretty(&replay_summary)?,
+    )?;
 
     println!("interactive refinement complete");
     println!("  image: {}", interactive_mode.image_path);
@@ -797,13 +802,9 @@ mod tests {
             &tiny_segmentation_config(),
             VarBuilder::zeros(DType::F32, &device),
         )?;
-        let interactive_mode = InteractiveMode::new(
-            image_path.to_str().expect("utf8 fixture path").to_string(),
-        )
-        .with_replay_steps(
-            replay_steps,
-            Some(manifest_path.display().to_string()),
-        );
+        let interactive_mode =
+            InteractiveMode::new(image_path.to_str().expect("utf8 fixture path").to_string())
+                .with_replay_steps(replay_steps, Some(manifest_path.display().to_string()));
 
         run_interactive_refinement(&model, &interactive_mode, &output_dir, &device)?;
 
@@ -825,7 +826,11 @@ mod tests {
                         .as_str()
                         .expect("artifact path should be a string"),
                 );
-                assert!(path.exists(), "expected artifact {} to exist", path.display());
+                assert!(
+                    path.exists(),
+                    "expected artifact {} to exist",
+                    path.display()
+                );
             }
         }
 

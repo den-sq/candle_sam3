@@ -4,9 +4,9 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-mod parity;
 mod interactive;
 mod interactive_compare;
+mod parity;
 mod video;
 
 use anyhow::{bail, Context, Error as E, Result};
@@ -383,26 +383,9 @@ pub(crate) fn preprocess_image_path_exact(
     device: &Device,
 ) -> candle::Result<Tensor> {
     let config = model.config();
-    let image_size = config.image.image_size;
-    let rgb = image::ImageReader::open(image_path)?
-        .decode()
-        .map_err(candle::Error::wrap)?
-        .to_rgb8();
-    let (width, height) = rgb.dimensions();
-    let image = Tensor::from_vec(
-        rgb.into_raw(),
-        (height as usize, width as usize, 3),
-        &Device::Cpu,
-    )?
-    .permute((2, 0, 1))?
-    .to_device(device)?
-    .to_dtype(DType::F32)?
-    .unsqueeze(0)?
-    .upsample_bilinear2d(image_size, image_size, false)?;
-    let image = (image / 255.)?;
-    let mean = Tensor::from_vec(config.image.image_mean.to_vec(), (1, 3, 1, 1), device)?;
-    let std = Tensor::from_vec(config.image.image_std.to_vec(), (1, 3, 1, 1), device)?;
-    Ok(image.broadcast_sub(&mean)?.broadcast_div(&std)?)
+    let image = decode_image_rgb_chw_u8(image_path, device)?;
+    let image = resize_image_exact_for_sam3(&image, config.image.image_size)?;
+    normalize_image_for_sam3(&image, config)
 }
 
 fn preprocess_image_for_sam3(
@@ -414,27 +397,8 @@ fn preprocess_image_for_sam3(
 ) -> Result<Tensor> {
     let image = match preprocess_mode {
         PreprocessMode::Exact => {
-            // Upstream SAM3 applies Resize on an image tensor before float
-            // conversion and normalization. Using Candle's bilinear tensor
-            // resize with align_corners=false matches torchvision's tensor
-            // interpolation semantics more closely than the image crate's
-            // DynamicImage resize path.
-            let rgb = image::ImageReader::open(image_path)?
-                .decode()
-                .map_err(E::msg)?
-                .to_rgb8();
-            let (width, height) = rgb.dimensions();
-            let image = Tensor::from_vec(
-                rgb.into_raw(),
-                (height as usize, width as usize, 3),
-                &Device::Cpu,
-            )?
-            .permute((2, 0, 1))?
-            .to_device(device)?
-            .to_dtype(DType::F32)?
-            .unsqueeze(0)?
-            .upsample_bilinear2d(image_size, image_size, false)?;
-            (image / 255.)?
+            let image = decode_image_rgb_chw_u8(image_path, device)?;
+            resize_image_exact_for_sam3(&image, image_size)?
         }
         PreprocessMode::CropFill => {
             let image = candle_examples::load_image_and_resize(image_path, image_size, image_size)?
@@ -443,10 +407,70 @@ fn preprocess_image_for_sam3(
             (image / 255.)?.unsqueeze(0)?
         }
     };
+    Ok(normalize_image_for_sam3(&image, config)?)
+}
+
+fn decode_image_rgb_chw_u8(image_path: &str, device: &Device) -> candle::Result<Tensor> {
+    let rgb = image::ImageReader::open(image_path)?
+        .decode()
+        .map_err(candle::Error::wrap)?
+        .to_rgb8();
+    let (width, height) = rgb.dimensions();
+    Tensor::from_vec(
+        rgb.into_raw(),
+        (height as usize, width as usize, 3),
+        &Device::Cpu,
+    )?
+    .permute((2, 0, 1))?
+    .to_device(device)
+}
+
+fn resize_image_exact_for_sam3(image_chw: &Tensor, image_size: usize) -> candle::Result<Tensor> {
+    let image = match image_chw.rank() {
+        3 => image_chw.unsqueeze(0)?,
+        4 => image_chw.clone(),
+        rank => candle::bail!("sam3 exact resize expects CHW or BCHW image, got rank {rank}"),
+    };
+    let image = image
+        .to_dtype(DType::F32)?
+        .upsample_bilinear2d(image_size, image_size, false)?;
+    image / 255.
+}
+
+#[cfg(test)]
+fn resize_image_exact_u8_for_sam3(image_chw: &Tensor, image_size: usize) -> candle::Result<Tensor> {
+    let image = match image_chw.rank() {
+        3 => image_chw.unsqueeze(0)?,
+        4 => image_chw.clone(),
+        rank => candle::bail!("sam3 exact resize expects CHW or BCHW image, got rank {rank}"),
+    };
+    let image = image.upsample_bilinear2d(image_size, image_size, false)?;
+    image.to_dtype(DType::F32)? / 255.
+}
+
+#[cfg(test)]
+fn resize_image_exact_quantized_for_sam3(
+    image_chw: &Tensor,
+    image_size: usize,
+) -> candle::Result<Tensor> {
+    let image = match image_chw.rank() {
+        3 => image_chw.unsqueeze(0)?,
+        4 => image_chw.clone(),
+        rank => candle::bail!("sam3 exact resize expects CHW or BCHW image, got rank {rank}"),
+    };
+    let image = image
+        .to_dtype(DType::F32)?
+        .upsample_bilinear2d(image_size, image_size, false)?
+        .clamp(0f32, 255f32)?
+        .round()?;
+    image / 255.
+}
+
+fn normalize_image_for_sam3(image: &Tensor, config: &sam3::Config) -> candle::Result<Tensor> {
+    let device = image.device();
     let mean = Tensor::from_vec(config.image.image_mean.to_vec(), (1, 3, 1, 1), device)?;
     let std = Tensor::from_vec(config.image.image_std.to_vec(), (1, 3, 1, 1), device)?;
-    let image = image.broadcast_sub(&mean)?.broadcast_div(&std)?;
-    Ok(image)
+    image.broadcast_sub(&mean)?.broadcast_div(&std)
 }
 
 fn load_render_image(image_path: &str) -> Result<RgbaImage> {
@@ -1972,6 +1996,7 @@ fn run_reference_comparison(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn geometry_prompt_defaults_positive_labels_for_points() -> Result<()> {
@@ -1980,7 +2005,10 @@ mod tests {
         let inputs = build_geometry_prompt_from_parts(&points, &[], &[], &[], &device)?
             .expect("expected geometry inputs");
         assert_eq!(inputs.point_labels, vec![1, 1]);
-        assert_eq!(inputs.prompt.point_labels.unwrap().to_vec1::<u32>()?, vec![1, 1]);
+        assert_eq!(
+            inputs.prompt.point_labels.unwrap().to_vec1::<u32>()?,
+            vec![1, 1]
+        );
         Ok(())
     }
 
@@ -1993,6 +2021,278 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("--point-label"));
         assert!(message.contains("must match"));
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn exact_preprocess_matches_interactive_visual_fixture() -> Result<()> {
+        let fixture_dir = interactive_visual_fixture_dir();
+        let fixture =
+            candle::safetensors::load(fixture_dir.join("fixture.safetensors"), &Device::Cpu)?;
+        let metadata: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fixture_dir.join("metadata.json"))?)?;
+        let image_path = metadata["image_path"]
+            .as_str()
+            .expect("interactive visual fixture image_path should be a string");
+        let image_size = metadata["image_size"]
+            .as_u64()
+            .expect("interactive visual fixture image_size should be an integer")
+            as usize;
+        let config = sam3::Config::default();
+        let actual = preprocess_image_for_sam3(
+            image_path,
+            image_size,
+            &config,
+            PreprocessMode::Exact,
+            &Device::Cpu,
+        )?;
+        let expected = fixture
+            .get("inputs.image_preprocessed")
+            .expect("interactive visual fixture should include inputs.image_preprocessed");
+        assert_tensor_close(&actual, expected, 1e-5, "inputs.image_preprocessed")
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn exact_decode_matches_interactive_visual_fixture() -> Result<()> {
+        let fixture_dir = interactive_visual_fixture_dir();
+        let fixture =
+            candle::safetensors::load(fixture_dir.join("fixture.safetensors"), &Device::Cpu)?;
+        let metadata: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fixture_dir.join("metadata.json"))?)?;
+        let image_path = metadata["image_path"]
+            .as_str()
+            .expect("interactive visual fixture image_path should be a string");
+        let actual = decode_image_rgb_chw_u8(image_path, &Device::Cpu)?;
+        let expected = fixture
+            .get("inputs.image_decoded_u8")
+            .expect("interactive visual fixture should include inputs.image_decoded_u8");
+        assert_tensor_close(&actual, expected, 0.0, "inputs.image_decoded_u8")
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn exact_resize_from_upstream_decode_matches_interactive_visual_fixture() -> Result<()> {
+        let fixture_dir = interactive_visual_fixture_dir();
+        let fixture =
+            candle::safetensors::load(fixture_dir.join("fixture.safetensors"), &Device::Cpu)?;
+        let metadata: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fixture_dir.join("metadata.json"))?)?;
+        let image_size = metadata["image_size"]
+            .as_u64()
+            .expect("interactive visual fixture image_size should be an integer")
+            as usize;
+        let actual = resize_image_exact_for_sam3(
+            fixture
+                .get("inputs.image_decoded_u8")
+                .expect("interactive visual fixture should include inputs.image_decoded_u8"),
+            image_size,
+        )?;
+        let expected = fixture
+            .get("inputs.image_resized_f32")
+            .expect("interactive visual fixture should include inputs.image_resized_f32");
+        assert_tensor_close(&actual, expected, 1e-5, "inputs.image_resized_f32")
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn exact_resize_matches_interactive_visual_floatpath_fixture() -> Result<()> {
+        let fixture_dir = interactive_visual_fixture_dir();
+        let fixture =
+            candle::safetensors::load(fixture_dir.join("fixture.safetensors"), &Device::Cpu)?;
+        let metadata: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fixture_dir.join("metadata.json"))?)?;
+        let image_size = metadata["image_size"]
+            .as_u64()
+            .expect("interactive visual fixture image_size should be an integer")
+            as usize;
+        let actual = resize_image_exact_for_sam3(
+            fixture
+                .get("inputs.image_decoded_u8")
+                .expect("interactive visual fixture should include inputs.image_decoded_u8"),
+            image_size,
+        )?;
+        let expected = fixture
+            .get("inputs.image_resized_floatpath_f32")
+            .expect("interactive visual fixture should include inputs.image_resized_floatpath_f32");
+        assert_tensor_close(
+            &actual,
+            expected,
+            1e-5,
+            "inputs.image_resized_floatpath_f32",
+        )
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn exact_resize_from_local_decode_matches_interactive_visual_fixture() -> Result<()> {
+        let fixture_dir = interactive_visual_fixture_dir();
+        let fixture =
+            candle::safetensors::load(fixture_dir.join("fixture.safetensors"), &Device::Cpu)?;
+        let metadata: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fixture_dir.join("metadata.json"))?)?;
+        let image_path = metadata["image_path"]
+            .as_str()
+            .expect("interactive visual fixture image_path should be a string");
+        let image_size = metadata["image_size"]
+            .as_u64()
+            .expect("interactive visual fixture image_size should be an integer")
+            as usize;
+        let decoded = decode_image_rgb_chw_u8(image_path, &Device::Cpu)?;
+        let actual = resize_image_exact_for_sam3(&decoded, image_size)?;
+        let expected = fixture
+            .get("inputs.image_resized_f32")
+            .expect("interactive visual fixture should include inputs.image_resized_f32");
+        assert_tensor_close(&actual, expected, 1e-5, "inputs.image_resized_f32")
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn exact_resize_with_imageops_from_upstream_decode_matches_interactive_visual_fixture(
+    ) -> Result<()> {
+        let fixture_dir = interactive_visual_fixture_dir();
+        let fixture =
+            candle::safetensors::load(fixture_dir.join("fixture.safetensors"), &Device::Cpu)?;
+        let metadata: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fixture_dir.join("metadata.json"))?)?;
+        let image_size = metadata["image_size"]
+            .as_u64()
+            .expect("interactive visual fixture image_size should be an integer")
+            as usize;
+        let actual = resize_image_exact_with_imageops(
+            fixture
+                .get("inputs.image_decoded_u8")
+                .expect("interactive visual fixture should include inputs.image_decoded_u8"),
+            image_size,
+        )?;
+        let expected = fixture
+            .get("inputs.image_resized_f32")
+            .expect("interactive visual fixture should include inputs.image_resized_f32");
+        assert_tensor_close(&actual, expected, 1e-5, "inputs.image_resized_f32")
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn exact_resize_u8_tensor_from_upstream_decode_matches_interactive_visual_fixture() -> Result<()>
+    {
+        let fixture_dir = interactive_visual_fixture_dir();
+        let fixture =
+            candle::safetensors::load(fixture_dir.join("fixture.safetensors"), &Device::Cpu)?;
+        let metadata: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fixture_dir.join("metadata.json"))?)?;
+        let image_size = metadata["image_size"]
+            .as_u64()
+            .expect("interactive visual fixture image_size should be an integer")
+            as usize;
+        let actual = resize_image_exact_u8_for_sam3(
+            fixture
+                .get("inputs.image_decoded_u8")
+                .expect("interactive visual fixture should include inputs.image_decoded_u8"),
+            image_size,
+        )?;
+        let expected = fixture
+            .get("inputs.image_resized_f32")
+            .expect("interactive visual fixture should include inputs.image_resized_f32");
+        assert_tensor_close(&actual, expected, 1e-5, "inputs.image_resized_f32")
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn exact_resize_quantized_from_upstream_decode_matches_interactive_visual_fixture() -> Result<()>
+    {
+        let fixture_dir = interactive_visual_fixture_dir();
+        let fixture =
+            candle::safetensors::load(fixture_dir.join("fixture.safetensors"), &Device::Cpu)?;
+        let metadata: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fixture_dir.join("metadata.json"))?)?;
+        let image_size = metadata["image_size"]
+            .as_u64()
+            .expect("interactive visual fixture image_size should be an integer")
+            as usize;
+        let actual = resize_image_exact_quantized_for_sam3(
+            fixture
+                .get("inputs.image_decoded_u8")
+                .expect("interactive visual fixture should include inputs.image_decoded_u8"),
+            image_size,
+        )?;
+        let expected = fixture
+            .get("inputs.image_resized_f32")
+            .expect("interactive visual fixture should include inputs.image_resized_f32");
+        assert_tensor_close(&actual, expected, 1e-5, "inputs.image_resized_f32")
+    }
+
+    fn interactive_visual_fixture_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../candle-transformers/tests/data/sam3_interactive_visual_seed")
+    }
+
+    fn assert_tensor_close(
+        actual: &Tensor,
+        expected: &Tensor,
+        atol: f32,
+        name: &str,
+    ) -> Result<()> {
+        if actual.dims() != expected.dims() {
+            anyhow::bail!(
+                "{name}: shape mismatch actual={:?} expected={:?}",
+                actual.dims(),
+                expected.dims()
+            );
+        }
+        let actual = actual
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let expected = expected
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let mut max_abs_diff = 0f32;
+        for (lhs, rhs) in actual.iter().zip(expected.iter()) {
+            max_abs_diff = max_abs_diff.max((lhs - rhs).abs());
+        }
+        if max_abs_diff > atol {
+            anyhow::bail!("{name}: max_abs_diff={max_abs_diff:.8} exceeded atol={atol:.8}");
+        }
+        Ok(())
+    }
+
+    fn resize_image_exact_with_imageops(image_chw: &Tensor, image_size: usize) -> Result<Tensor> {
+        let channels = image_chw.to_vec3::<u8>()?;
+        let height = channels
+            .first()
+            .map(Vec::len)
+            .expect("decoded image should have channel data");
+        let width = channels
+            .first()
+            .and_then(|channel| channel.first())
+            .map(Vec::len)
+            .expect("decoded image should have non-empty rows");
+        let mut raw = Vec::with_capacity(height * width * 3);
+        for y in 0..height {
+            for x in 0..width {
+                raw.push(channels[0][y][x]);
+                raw.push(channels[1][y][x]);
+                raw.push(channels[2][y][x]);
+            }
+        }
+        let rgb = image::RgbImage::from_raw(width as u32, height as u32, raw)
+            .expect("decoded image tensor should convert to an RGB image");
+        let resized = image::imageops::resize(
+            &rgb,
+            image_size as u32,
+            image_size as u32,
+            image::imageops::FilterType::Triangle,
+        );
+        let image = Tensor::from_vec(
+            resized.into_raw(),
+            (image_size, image_size, 3),
+            &Device::Cpu,
+        )?
+        .permute((2, 0, 1))?
+        .to_dtype(DType::F32)?
+        .unsqueeze(0)?;
+        Ok((image / 255.)?)
     }
 }
 
@@ -2245,9 +2545,9 @@ pub fn main() -> anyhow::Result<()> {
 
     if let Some(bundle_path) = args.compare_interactive_reference.as_deref() {
         interactive_compare::run_interactive_reference_comparison(
-            model
-                .as_ref()
-                .context("SAM3 interactive reference comparison mode requires `--checkpoint <sam3.pt>`")?,
+            model.as_ref().context(
+                "SAM3 interactive reference comparison mode requires `--checkpoint <sam3.pt>`",
+            )?,
             bundle_path,
             Path::new(&args.output_dir),
             &device,
@@ -2294,7 +2594,13 @@ pub fn main() -> anyhow::Result<()> {
             .unwrap_or_default();
         let boxes = geometry_inputs
             .as_ref()
-            .map(|inputs| inputs.boxes.iter().map(|b| (b.cx, b.cy, b.w, b.h)).collect())
+            .map(|inputs| {
+                inputs
+                    .boxes
+                    .iter()
+                    .map(|b| (b.cx, b.cy, b.w, b.h))
+                    .collect()
+            })
             .unwrap_or_default();
         let box_labels = geometry_inputs
             .as_ref()
@@ -2353,10 +2659,7 @@ pub fn main() -> anyhow::Result<()> {
                     .map(|inputs| inputs.box_labels.clone())
                     .unwrap_or_default(),
             )
-            .with_replay_steps(
-                replay_steps,
-                args.interactive_script.clone(),
-            );
+            .with_replay_steps(replay_steps, args.interactive_script.clone());
         interactive::run_interactive_refinement(
             model
                 .as_ref()

@@ -154,9 +154,9 @@ impl InteractiveReferenceBundle {
     }
 
     pub fn tensor(&self, key: &str) -> Result<&Tensor> {
-        self.tensors
-            .get(key)
-            .ok_or_else(|| anyhow::anyhow!("interactive reference bundle is missing tensor `{key}`"))
+        self.tensors.get(key).ok_or_else(|| {
+            anyhow::anyhow!("interactive reference bundle is missing tensor `{key}`")
+        })
     }
 
     pub fn tensor_opt(&self, key: &str) -> Option<&Tensor> {
@@ -235,8 +235,14 @@ fn compare_tensor(
         });
     }
 
-    let expected = expected.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let actual = actual.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let expected = expected
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let actual = actual
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
     if expected.is_empty() {
         return Ok(InteractiveComparisonStageReport {
             stage: stage.to_string(),
@@ -334,7 +340,10 @@ pub fn run_interactive_reference_comparison(
         )
     }
 
-    println!("preprocessing reference image {}", bundle.metadata.image_path);
+    println!(
+        "preprocessing reference image {}",
+        bundle.metadata.image_path
+    );
     let image = crate::preprocess_image_path_exact(&bundle.metadata.image_path, model, device)?;
     let replay_steps = interactive_replay_steps_from_metadata(&bundle.metadata.steps)?;
     println!(
@@ -476,7 +485,11 @@ pub fn run_interactive_reference_comparison(
             stages,
             all_stages_passed,
         };
-        let status = if entry.all_stages_passed { "PASS" } else { "FAIL" };
+        let status = if entry.all_stages_passed {
+            "PASS"
+        } else {
+            "FAIL"
+        };
         println!(
             "  step {} ({}): {} score_diff={:.6} box_iou={:.6} mask_mae={:.6} mask_iou@0.5={:.6}",
             entry.iteration_index,
@@ -541,7 +554,11 @@ pub fn run_interactive_reference_comparison(
     println!("  preprocess mode: {}", report.preprocess_mode);
     println!("  absolute tolerance: {}", report.atol);
     for entry in &report.steps {
-        let status = if entry.all_stages_passed { "PASS" } else { "FAIL" };
+        let status = if entry.all_stages_passed {
+            "PASS"
+        } else {
+            "FAIL"
+        };
         println!(
             "  step {} ({}): {} score_diff={:.6} box_iou={:.6} mask_mae={:.6} mask_iou@0.5={:.6}",
             entry.iteration_index,
