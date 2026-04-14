@@ -6,6 +6,7 @@ extern crate accelerate_src;
 
 mod parity;
 mod interactive;
+mod interactive_compare;
 mod video;
 
 use anyhow::{bail, Context, Error as E, Result};
@@ -50,6 +51,10 @@ struct Args {
     /// Optional upstream exact reference bundle used for output-level comparison against Candle preprocessing.
     #[arg(long)]
     compare_reference_bundle: Option<String>,
+
+    /// Optional upstream interactive replay reference bundle used for step-by-step click replay comparison.
+    #[arg(long)]
+    compare_interactive_reference: Option<String>,
 
     /// Absolute tolerance used for stage-by-stage parity comparisons.
     #[arg(long, default_value_t = 1e-4f32)]
@@ -2136,6 +2141,13 @@ pub fn main() -> anyhow::Result<()> {
     if args.parity_bundle.is_some() && args.compare_reference_bundle.is_some() {
         bail!("use either `--parity-bundle` or `--compare-reference-bundle`, not both")
     }
+    if args.compare_interactive_reference.is_some()
+        && (args.parity_bundle.is_some() || args.compare_reference_bundle.is_some())
+    {
+        bail!(
+            "use `--compare-interactive-reference` by itself; do not combine it with `--parity-bundle` or `--compare-reference-bundle`"
+        )
+    }
     if args.compare_reference_bundle.is_some()
         && (args.image.is_some()
             || args.prompt.is_some()
@@ -2147,6 +2159,22 @@ pub fn main() -> anyhow::Result<()> {
     {
         bail!(
             "`--compare-reference-bundle` derives image/prompt inputs from the exported bundle; omit `--image`, `--prompt`, `--tokenizer`, `--point`, `--box`, `--batch-manifest`, and `--image-predictor-example`"
+        )
+    }
+    if args.compare_interactive_reference.is_some()
+        && (args.image.is_some()
+            || args.prompt.is_some()
+            || args.tokenizer.is_some()
+            || !args.points.is_empty()
+            || !args.boxes.is_empty()
+            || args.batch_manifest.is_some()
+            || args.image_predictor_example
+            || args.interactive.is_some()
+            || args.interactive_script.is_some()
+            || args.video.is_some())
+    {
+        bail!(
+            "`--compare-interactive-reference` derives image and replay inputs from the exported bundle; omit `--image`, `--prompt`, `--tokenizer`, `--point`, `--box`, `--batch-manifest`, `--image-predictor-example`, `--interactive`, `--interactive-script`, and `--video`"
         )
     }
     if args.parity_bundle.is_some()
@@ -2211,6 +2239,19 @@ pub fn main() -> anyhow::Result<()> {
             bundle_path,
             Path::new(&args.output_dir),
             &device,
+        )?;
+        return Ok(());
+    }
+
+    if let Some(bundle_path) = args.compare_interactive_reference.as_deref() {
+        interactive_compare::run_interactive_reference_comparison(
+            model
+                .as_ref()
+                .context("SAM3 interactive reference comparison mode requires `--checkpoint <sam3.pt>`")?,
+            bundle_path,
+            Path::new(&args.output_dir),
+            &device,
+            args.parity_atol,
         )?;
         return Ok(());
     }

@@ -538,7 +538,9 @@ pub fn run_interactive_refinement(
         .unwrap_or_default();
 
     if let Some(initial_inputs) = initial_geometry_inputs {
+        println!("interactive replay: initializing from initial prompt");
         let initial_output = session.initialize(initial_inputs.prompt)?;
+        println!("interactive replay: initial prompt complete");
         summaries.push(render_iteration(
             &interactive_mode.image_path,
             output_dir,
@@ -560,6 +562,16 @@ pub fn run_interactive_refinement(
     for (script_step_index, step) in interactive_mode.replay_steps.iter().enumerate() {
         let step_points = step.points.clone();
         let step_point_labels = step.point_labels.clone();
+        let step_name = step
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("refinement_{script_step_index:02}"));
+        println!(
+            "interactive replay: step {} ({}) with {} point(s)",
+            script_step_index,
+            step_name,
+            step_points.len()
+        );
         let grounding = if session.history().is_empty() {
             let step_inputs =
                 interactive_geometry_inputs(&step_points, &step_point_labels, &[], &[], device)?
@@ -577,10 +589,7 @@ pub fn run_interactive_refinement(
             session.refine(step_points.clone(), step_point_labels.clone())?
         };
 
-        let step_name = step
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("refinement_{script_step_index:02}"));
+        println!("interactive replay: step {} complete", script_step_index);
         summaries.push(render_iteration(
             &interactive_mode.image_path,
             output_dir,

@@ -175,7 +175,6 @@ impl GeometryEncoderLayer {
     ) -> Result<Tensor> {
         let residual = prompt_feats;
         let hidden_states = self.norm1.forward(prompt_feats)?;
-        eprintln!("[PHASE4] After norm1");
 
         let hidden_states = self.self_attn.forward(
             &hidden_states,
@@ -183,14 +182,11 @@ impl GeometryEncoderLayer {
             Some(prompt_padding_mask),
             None,
         )?;
-        eprintln!("[PHASE4] After self_attn");
 
         let hidden_states = (hidden_states + residual)?;
-        eprintln!("[PHASE4] After self_attn residual");
 
         let residual = &hidden_states;
         let hidden_states = self.norm2.forward(&hidden_states)?;
-        eprintln!("[PHASE4] After norm2");
 
         let hidden_states = self.cross_attn_image.forward(
             &hidden_states,
@@ -198,23 +194,17 @@ impl GeometryEncoderLayer {
             None,
             Some(vision_pos_encoding),
         )?;
-        eprintln!("[PHASE4] After cross_attn");
 
         let hidden_states = (hidden_states + residual)?;
-        eprintln!("[PHASE4] After cross_attn residual");
 
         let residual = &hidden_states;
         let hidden_states = self.norm3.forward(&hidden_states)?;
-        eprintln!("[PHASE4] After norm3");
 
         let hidden_states = self.linear1.forward(&hidden_states)?.relu()?;
-        eprintln!("[PHASE4] After linear1+relu");
 
         let hidden_states = self.linear2.forward(&hidden_states)?;
-        eprintln!("[PHASE4] After linear2");
 
         let result = (hidden_states + residual)?;
-        eprintln!("[PHASE4] After FFN residual");
         Ok(result)
     }
 }
@@ -422,21 +412,11 @@ impl SequenceGeometryEncoder {
             features = final_proj.forward(&features)?;
         }
         features = self.norm.forward(&features)?;
-        eprintln!(
-            "[PHASE3] After initial norm, features shape: {:?}",
-            features.dims()
-        );
         debug::capture_tensor("geometry/features_initial_norm", &features)?;
 
         for (layer_idx, layer) in self.encode.iter().enumerate() {
-            eprintln!("[PHASE3] Before layer {}", layer_idx);
             features =
                 layer.forward(&features, &vision_feats, &vision_pos_embeds, &padding_mask)?;
-            eprintln!(
-                "[PHASE3] After layer {}, features shape: {:?}",
-                layer_idx,
-                features.dims()
-            );
             debug::capture_tensor(
                 &format!("geometry/features_after_layer_{}", layer_idx),
                 &features,
@@ -445,7 +425,6 @@ impl SequenceGeometryEncoder {
 
         if let Some(encode_norm) = &self.encode_norm {
             features = encode_norm.forward(&features)?;
-            eprintln!("[PHASE3] After encode_norm");
         }
         debug::capture_tensor("geometry/features_final", &features)?;
         Ok(EncodedPrompt {
@@ -515,22 +494,29 @@ impl SequenceGeometryEncoder {
             points_xy.device(),
         )?;
         let label_embed = self.label_embed.forward(&point_labels)?;
-        let mut point_features = label_embed;
+        debug::capture_tensor("geometry/point_label_embed", &label_embed)?;
+        let mut point_features = label_embed.clone();
 
         if let Some(points_direct_project) = &self.points_direct_project {
-            point_features =
-                point_features.broadcast_add(&points_direct_project.forward(&points_xy)?)?;
+            let direct_proj = points_direct_project.forward(&points_xy)?;
+            debug::capture_tensor("geometry/point_direct_proj", &direct_proj)?;
+            point_features = point_features.broadcast_add(&direct_proj)?;
         }
         if let Some(points_pool_project) = &self.points_pool_project {
             let pooled_points = sample_points_nearest(vision_feats, &points_xy)?;
-            point_features =
-                point_features.broadcast_add(&points_pool_project.forward(&pooled_points)?)?;
+            debug::capture_tensor("geometry/point_sampled_raw", &pooled_points)?;
+            let pool_proj = points_pool_project.forward(&pooled_points)?;
+            debug::capture_tensor("geometry/point_pool_proj", &pool_proj)?;
+            point_features = point_features.broadcast_add(&pool_proj)?;
         }
         if let Some(points_pos_enc_project) = &self.points_pos_enc_project {
             let pos_enc = encode_points_position(&points_xy, self.config.d_model)?;
-            point_features =
-                point_features.broadcast_add(&points_pos_enc_project.forward(&pos_enc)?)?;
+            debug::capture_tensor("geometry/point_pos_enc", &pos_enc)?;
+            let pos_enc_proj = points_pos_enc_project.forward(&pos_enc)?;
+            debug::capture_tensor("geometry/point_pos_enc_proj", &pos_enc_proj)?;
+            point_features = point_features.broadcast_add(&pos_enc_proj)?;
         }
+        debug::capture_tensor("geometry/point_features", &point_features)?;
         Ok((
             point_features,
             Tensor::zeros((batch_size, seq_len), DType::U8, points_xy.device())?,
@@ -763,7 +749,7 @@ fn encode_points_position(points_xy: &Tensor, d_model: usize) -> Result<Tensor> 
         (coords.len(), coords[0].len(), num_pos_feats),
         device,
     )?;
-    Tensor::cat(&[&pos_y, &pos_x], 2)?
+    Tensor::cat(&[&pos_x, &pos_y], 2)?
         .transpose(0, 1)?
         .contiguous()?
         .to_dtype(points_xy.dtype())
@@ -1494,6 +1480,71 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn interactive_geometry_fixture_point_helpers_match_upstream() -> Result<()> {
+        let fixture = load_interactive_geometry_fixture_tensors("fixture.safetensors")?;
+        let points_xy = fixture_tensor(&fixture, "inputs/points_xy")?;
+        let pool_image_features = fixture_tensor(&fixture, "inputs/pool_image_features")?;
+        assert_tensor_close(
+            &encode_points_position(points_xy, interactive_fixture_metadata()?.d_model)?,
+            fixture_tensor(&fixture, "helper/points_position")?,
+            1e-5,
+            "helper/points_position",
+        )?;
+        assert_tensor_close(
+            &sample_points_nearest(pool_image_features, points_xy)?,
+            fixture_tensor(&fixture, "helper/points_sampled")?,
+            1e-5,
+            "helper/points_sampled",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn interactive_geometry_fixture_point_feature_composition_matches_upstream() -> Result<()> {
+        let (_encoded, debug_tensors) = run_interactive_fixture_geometry_encode()?;
+        let expected = load_interactive_geometry_fixture_tensors("fixture.safetensors")?;
+        let keys = [
+            "geometry/point_label_embed",
+            "geometry/point_direct_proj",
+            "geometry/point_sampled_raw",
+            "geometry/point_pool_proj",
+            "geometry/point_pos_enc",
+            "geometry/point_pos_enc_proj",
+            "geometry/point_features",
+        ];
+        assert_debug_keys_close(&debug_tensors, &expected, &keys, 1e-5)
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn interactive_geometry_fixture_encoder_matches_upstream() -> Result<()> {
+        let (encoded, debug_tensors) = run_interactive_fixture_geometry_encode()?;
+        let expected = load_interactive_geometry_fixture_tensors("fixture.safetensors")?;
+        let keys = [
+            "geometry/features_initial_norm",
+            "geometry/features_after_layer_0",
+            "geometry/features_after_layer_1",
+            "geometry/features_after_layer_2",
+        ];
+        assert_debug_keys_close(&debug_tensors, &expected, &keys, 1e-5)?;
+        assert_tensor_close(
+            &encoded.features,
+            fixture_tensor(&expected, "geometry/returned_features")?,
+            1e-5,
+            "geometry/returned_features",
+        )?;
+        assert_tensor_close(
+            &encoded.padding_mask.to_dtype(DType::U8)?,
+            fixture_tensor(&expected, "geometry/padding_mask")?,
+            0.0,
+            "geometry/padding_mask",
+        )?;
+        Ok(())
+    }
+
     fn test_config() -> GeometryConfig {
         GeometryConfig {
             d_model: 8,
@@ -1539,6 +1590,10 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/sam3_geometry_unit")
     }
 
+    fn interactive_geometry_fixture_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/sam3_interactive_geometry_seed")
+    }
+
     fn load_geometry_fixture_tensors(file_name: &str) -> Result<HashMap<String, Tensor>> {
         let path = geometry_fixture_dir().join(file_name);
         candle::safetensors::load(&path, &Device::Cpu).map_err(|err| {
@@ -1546,6 +1601,45 @@ mod tests {
                 "failed to load geometry fixture {}: {err}",
                 path.display()
             ))
+        })
+    }
+
+    fn load_interactive_geometry_fixture_tensors(file_name: &str) -> Result<HashMap<String, Tensor>> {
+        let path = interactive_geometry_fixture_dir().join(file_name);
+        candle::safetensors::load(&path, &Device::Cpu).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to load interactive geometry fixture {}: {err}",
+                path.display()
+            ))
+        })
+    }
+
+    fn interactive_fixture_metadata() -> Result<GeometryFixtureMetadata> {
+        let path = interactive_geometry_fixture_dir().join("metadata.json");
+        let contents = fs::read_to_string(&path).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to read interactive geometry fixture metadata {}: {err}",
+                path.display()
+            ))
+        })?;
+        serde_json::from_str(&contents).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to parse interactive geometry fixture metadata {}: {err}",
+                path.display()
+            ))
+        })
+    }
+
+    fn interactive_fixture_config() -> Result<GeometryConfig> {
+        let metadata = interactive_fixture_metadata()?;
+        Ok(GeometryConfig {
+            d_model: metadata.d_model,
+            num_layers: metadata.num_layers,
+            num_heads: metadata.num_heads,
+            dim_feedforward: metadata.dim_feedforward,
+            roi_size: metadata.roi_size,
+            add_cls: true,
+            add_post_encode_proj: true,
         })
     }
 
@@ -1597,6 +1691,39 @@ mod tests {
                 .map_err(|err| {
                     candle::Error::Msg(format!(
                         "failed to load geometry debug tensors from {}: {err}",
+                        debug_dir.display()
+                    ))
+                })?;
+        let _ = fs::remove_dir_all(&debug_dir);
+        Ok((encoded, debug_tensors))
+    }
+
+    fn run_interactive_fixture_geometry_encode() -> Result<(super::EncodedPrompt, HashMap<String, Tensor>)> {
+        let device = Device::Cpu;
+        let config = interactive_fixture_config()?;
+        let weights = load_interactive_geometry_fixture_tensors("weights.safetensors")?;
+        let fixture = load_interactive_geometry_fixture_tensors("fixture.safetensors")?;
+        let vb = VarBuilder::from_tensors(weights, DType::F32, &device);
+        let encoder = SequenceGeometryEncoder::new(&config, vb)?;
+        let prompt = GeometryPrompt {
+            points_xy: Some(fixture_tensor(&fixture, "inputs/points_xy")?.clone()),
+            point_labels: Some(
+                fixture_tensor(&fixture, "inputs/point_labels")?.to_dtype(DType::U32)?
+            ),
+            ..Default::default()
+        };
+        let image_features = vec![fixture_tensor(&fixture, "inputs/image_features")?.clone()];
+        let image_pos = vec![fixture_tensor(&fixture, "inputs/image_pos_embeds")?.clone()];
+
+        let debug_dir = unique_temp_dir("interactive_encode")?;
+        debug::set_exporter(Some(DebugExporter::new(&debug_dir)?));
+        let encoded = encoder.encode(&prompt, &image_features, &image_pos)?;
+        debug::finish()?;
+        let debug_tensors =
+            candle::safetensors::load(debug_dir.join("debug_tensors.safetensors"), &device)
+                .map_err(|err| {
+                    candle::Error::Msg(format!(
+                        "failed to load interactive geometry debug tensors from {}: {err}",
                         debug_dir.display()
                     ))
                 })?;
