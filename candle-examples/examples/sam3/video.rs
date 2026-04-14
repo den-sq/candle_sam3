@@ -132,7 +132,10 @@ fn load_image_sequence(
         anyhow::bail!("Failed to load any frames from directory: {}", dir_path);
     }
 
-    println!("Successfully loaded {} frames from image sequence", frames.len());
+    println!(
+        "Successfully loaded {} frames from image sequence",
+        frames.len()
+    );
     Ok(frames)
 }
 
@@ -240,7 +243,10 @@ pub fn run_video_prediction(
 
     let mut results = Vec::new();
     for (frame_idx, grounding) in selected_outputs {
-        if let (Ok(scores), Ok(boxes)) = (grounding.scores.to_vec1::<f32>(), grounding.boxes_xyxy.to_vec2::<f32>()) {
+        if let (Ok(scores), Ok(boxes)) = (
+            grounding.scores.to_vec1::<f32>(),
+            grounding.boxes_xyxy.to_vec2::<f32>(),
+        ) {
             results.push(serde_json::json!({
                 "frame_idx": frame_idx,
                 "scores": scores,
@@ -248,12 +254,19 @@ pub fn run_video_prediction(
                 "mask_shape": grounding.masks.dims()
             }));
         } else {
-            println!("Warning: Failed to serialize results for frame {}", frame_idx);
+            println!(
+                "Warning: Failed to serialize results for frame {}",
+                frame_idx
+            );
         }
     }
 
     std::fs::write(&results_path, serde_json::to_string_pretty(&results)?)?;
-    println!("Saved {} frame results to: {}", results.len(), results_path.display());
+    println!(
+        "Saved {} frame results to: {}",
+        results.len(),
+        results_path.display()
+    );
 
     predictor.close_session(&session_id)?;
     println!("Video prediction completed successfully!");

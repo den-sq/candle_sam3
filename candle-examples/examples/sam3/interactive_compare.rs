@@ -7,6 +7,7 @@ use candle::{DType, Device, Tensor};
 use candle_transformers::models::sam3;
 use serde::{Deserialize, Serialize};
 
+use crate::comparison;
 use crate::interactive::InteractiveReplayStep;
 
 const REFERENCE_TENSORS_FILE: &str = "reference.safetensors";
@@ -243,67 +244,16 @@ fn compare_tensor(
     actual: &Tensor,
     atol: f32,
 ) -> Result<InteractiveComparisonStageReport> {
-    let expected_shape = expected.dims().to_vec();
-    let actual_shape = actual.dims().to_vec();
-    if expected_shape != actual_shape {
-        return Ok(InteractiveComparisonStageReport {
-            stage: stage.to_string(),
-            expected_shape,
-            actual_shape,
-            max_abs_diff: None,
-            mean_abs_diff: None,
-            rmse: None,
-            pass: false,
-            note: Some("shape mismatch".to_string()),
-        });
-    }
-
-    let expected = expected
-        .to_dtype(DType::F32)?
-        .flatten_all()?
-        .to_vec1::<f32>()?;
-    let actual = actual
-        .to_dtype(DType::F32)?
-        .flatten_all()?
-        .to_vec1::<f32>()?;
-    if expected.is_empty() {
-        return Ok(InteractiveComparisonStageReport {
-            stage: stage.to_string(),
-            expected_shape,
-            actual_shape,
-            max_abs_diff: Some(0.0),
-            mean_abs_diff: Some(0.0),
-            rmse: Some(0.0),
-            pass: true,
-            note: None,
-        });
-    }
-
-    let mut max_abs_diff = 0.0f32;
-    let mut sum_abs = 0.0f64;
-    let mut sum_sq = 0.0f64;
-    for (lhs, rhs) in expected.iter().zip(actual.iter()) {
-        let diff = if lhs.is_nan() || rhs.is_nan() {
-            f32::INFINITY
-        } else {
-            (lhs - rhs).abs()
-        };
-        max_abs_diff = max_abs_diff.max(diff);
-        sum_abs += diff as f64;
-        sum_sq += (diff as f64) * (diff as f64);
-    }
-    let len = expected.len() as f64;
-    let mean_abs_diff = (sum_abs / len) as f32;
-    let rmse = (sum_sq / len).sqrt() as f32;
+    let diff = comparison::compare_tensors(expected, Some(actual), atol, "stage missing")?;
     Ok(InteractiveComparisonStageReport {
         stage: stage.to_string(),
-        expected_shape,
-        actual_shape,
-        max_abs_diff: Some(max_abs_diff),
-        mean_abs_diff: Some(mean_abs_diff),
-        rmse: Some(rmse),
-        pass: max_abs_diff <= atol,
-        note: None,
+        expected_shape: diff.expected_shape,
+        actual_shape: diff.actual_shape,
+        max_abs_diff: diff.max_abs_diff,
+        mean_abs_diff: diff.mean_abs_diff,
+        rmse: diff.rmse,
+        pass: diff.pass,
+        note: diff.note,
     })
 }
 

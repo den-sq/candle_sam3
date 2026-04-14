@@ -7,6 +7,8 @@ use candle::{DType, Device, Tensor};
 use candle_transformers::models::sam3;
 use serde::{Deserialize, Serialize};
 
+use crate::comparison;
+
 const REFERENCE_TENSORS_FILE: &str = "reference.safetensors";
 const REFERENCE_METADATA_FILE: &str = "reference.json";
 const INPUT_IMAGE_KEY: &str = "inputs.image";
@@ -400,96 +402,25 @@ fn compare_stage(
     atol: f32,
 ) -> Result<StageDiffReport> {
     let expected = bundle.tensor(stage)?;
-    let expected_shape = expected.dims().to_vec();
-    let Some(actual) = actual.get(stage) else {
-        return Ok(StageDiffReport {
-            stage: stage.to_owned(),
-            expected_shape,
-            actual_shape: Vec::new(),
-            max_abs_diff: None,
-            max_abs_diff_flat_index: None,
-            expected_at_max_abs_diff: None,
-            actual_at_max_abs_diff: None,
-            mean_abs_diff: None,
-            rmse: None,
-            pass: false,
-            note: Some("stage missing from Candle output".to_owned()),
-        });
-    };
-    let actual_shape = actual.dims().to_vec();
-    if expected_shape != actual_shape {
-        return Ok(StageDiffReport {
-            stage: stage.to_owned(),
-            expected_shape,
-            actual_shape,
-            max_abs_diff: None,
-            max_abs_diff_flat_index: None,
-            expected_at_max_abs_diff: None,
-            actual_at_max_abs_diff: None,
-            mean_abs_diff: None,
-            rmse: None,
-            pass: false,
-            note: Some("shape mismatch".to_owned()),
-        });
-    }
-
-    let expected = expected.to_dtype(DType::F32)?.flatten_all()?;
-    let actual = actual.to_dtype(DType::F32)?.flatten_all()?;
-    let expected = expected.to_vec1::<f32>()?;
-    let actual = actual.to_vec1::<f32>()?;
-    let len = expected.len();
-    if len == 0 {
-        return Ok(StageDiffReport {
-            stage: stage.to_owned(),
-            expected_shape,
-            actual_shape,
-            max_abs_diff: Some(0.0),
-            max_abs_diff_flat_index: Some(0),
-            expected_at_max_abs_diff: Some(0.0),
-            actual_at_max_abs_diff: Some(0.0),
-            mean_abs_diff: Some(0.0),
-            rmse: Some(0.0),
-            pass: true,
-            note: None,
-        });
-    }
-
-    let mut max_abs_diff = 0f32;
-    let mut max_abs_diff_flat_index = 0usize;
-    let mut expected_at_max_abs_diff = 0f32;
-    let mut actual_at_max_abs_diff = 0f32;
-    let mut sum_abs_diff = 0f64;
-    let mut sum_sq_diff = 0f64;
-    for (index, (expected, actual)) in expected.iter().zip(actual.iter()).enumerate() {
-        let abs_diff = if expected.is_nan() || actual.is_nan() {
-            f32::INFINITY
-        } else {
-            (actual - expected).abs()
-        };
-        if abs_diff > max_abs_diff {
-            max_abs_diff = abs_diff;
-            max_abs_diff_flat_index = index;
-            expected_at_max_abs_diff = *expected;
-            actual_at_max_abs_diff = *actual;
-        }
-        sum_abs_diff += abs_diff as f64;
-        sum_sq_diff += (abs_diff as f64) * (abs_diff as f64);
-    }
-    let mean_abs_diff = (sum_abs_diff / len as f64) as f32;
-    let rmse = (sum_sq_diff / len as f64).sqrt() as f32;
+    let diff = comparison::compare_tensors(
+        expected,
+        actual.get(stage),
+        atol,
+        "stage missing from Candle output",
+    )?;
 
     Ok(StageDiffReport {
         stage: stage.to_owned(),
-        expected_shape,
-        actual_shape,
-        max_abs_diff: Some(max_abs_diff),
-        max_abs_diff_flat_index: Some(max_abs_diff_flat_index),
-        expected_at_max_abs_diff: Some(expected_at_max_abs_diff),
-        actual_at_max_abs_diff: Some(actual_at_max_abs_diff),
-        mean_abs_diff: Some(mean_abs_diff),
-        rmse: Some(rmse),
-        pass: max_abs_diff <= atol,
-        note: None,
+        expected_shape: diff.expected_shape,
+        actual_shape: diff.actual_shape,
+        max_abs_diff: diff.max_abs_diff,
+        max_abs_diff_flat_index: diff.max_abs_diff_flat_index,
+        expected_at_max_abs_diff: diff.expected_at_max_abs_diff,
+        actual_at_max_abs_diff: diff.actual_at_max_abs_diff,
+        mean_abs_diff: diff.mean_abs_diff,
+        rmse: diff.rmse,
+        pass: diff.pass,
+        note: diff.note,
     })
 }
 

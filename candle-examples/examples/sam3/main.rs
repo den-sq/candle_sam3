@@ -4,6 +4,7 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
+mod comparison;
 mod interactive;
 mod interactive_compare;
 mod parity;
