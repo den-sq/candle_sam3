@@ -326,9 +326,24 @@ mod tests {
     use super::{Sam3DualViTDetNeck, VisualBackboneOutput};
     use crate::models::sam3::{NeckConfig, ViTDetTrunkOutput};
 
+    fn test_device() -> Result<Device> {
+        #[cfg(feature = "cuda")]
+        {
+            Device::new_cuda(0)
+        }
+        #[cfg(all(not(feature = "cuda"), feature = "metal"))]
+        {
+            Device::new_metal(0)
+        }
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        {
+            Ok(Device::Cpu)
+        }
+    }
+
     #[test]
     fn neck_projects_single_trunk_feature_map_to_three_levels() -> Result<()> {
-        let device = Device::Cpu;
+        let device = test_device()?;
         let config = NeckConfig {
             d_model: 4,
             scale_factors: [4.0, 2.0, 1.0, 0.5],
@@ -353,7 +368,7 @@ mod tests {
 
     #[test]
     fn neck_can_load_optional_sam2_branch() -> Result<()> {
-        let device = Device::Cpu;
+        let device = test_device()?;
         let config = NeckConfig {
             d_model: 4,
             scale_factors: [4.0, 2.0, 1.0, 0.5],
@@ -379,8 +394,9 @@ mod tests {
     #[test]
     #[ignore = "fixture-driven parity investigation"]
     fn interactive_visual_fixture_neck_last_level_matches_upstream() -> Result<()> {
-        let output = run_interactive_visual_fixture_neck()?;
-        let expected = load_interactive_visual_fixture_tensors("fixture.safetensors")?;
+        let device = test_device()?;
+        let output = run_interactive_visual_fixture_neck(&device)?;
+        let expected = load_interactive_visual_fixture_tensors("fixture.safetensors", &device)?;
         assert_tensor_close(
             output
                 .backbone_fpn
@@ -395,8 +411,9 @@ mod tests {
     #[test]
     #[ignore = "fixture-driven parity investigation"]
     fn interactive_visual_fixture_position_encoding_matches_upstream() -> Result<()> {
-        let output = run_interactive_visual_fixture_neck()?;
-        let expected = load_interactive_visual_fixture_tensors("fixture.safetensors")?;
+        let device = test_device()?;
+        let output = run_interactive_visual_fixture_neck(&device)?;
+        let expected = load_interactive_visual_fixture_tensors("fixture.safetensors", &device)?;
         assert_tensor_close(
             output
                 .vision_pos_enc
@@ -423,11 +440,10 @@ mod tests {
         Ok(())
     }
 
-    fn run_interactive_visual_fixture_neck() -> Result<VisualBackboneOutput> {
-        let device = Device::Cpu;
+    fn run_interactive_visual_fixture_neck(device: &Device) -> Result<VisualBackboneOutput> {
         let weights =
-            load_interactive_visual_fixture_tensors("vision_backbone_weights.safetensors")?;
-        let fixture = load_interactive_visual_fixture_tensors("fixture.safetensors")?;
+            load_interactive_visual_fixture_tensors("vision_backbone_weights.safetensors", device)?;
+        let fixture = load_interactive_visual_fixture_tensors("fixture.safetensors", device)?;
         let vb = VarBuilder::from_tensors(weights, DType::F32, &device);
         let neck = Sam3DualViTDetNeck::new(&NeckConfig::default(), vb)?;
         let trunk_last = fixture_tensor(&fixture, "vision.trunk.last")?.permute((0, 2, 3, 1))?;
@@ -441,9 +457,12 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/sam3_interactive_visual_seed")
     }
 
-    fn load_interactive_visual_fixture_tensors(file_name: &str) -> Result<HashMap<String, Tensor>> {
+    fn load_interactive_visual_fixture_tensors(
+        file_name: &str,
+        device: &Device,
+    ) -> Result<HashMap<String, Tensor>> {
         let path = interactive_visual_fixture_dir().join(file_name);
-        candle::safetensors::load(&path, &Device::Cpu).map_err(|err| {
+        candle::safetensors::load(&path, device).map_err(|err| {
             candle::Error::Msg(format!(
                 "failed to load interactive visual fixture {}: {err}",
                 path.display()

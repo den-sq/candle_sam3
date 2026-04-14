@@ -458,8 +458,8 @@ mod tests {
 
     use crate::models::sam3::Sam3ImageModel;
     use crate::models::sam3::{
-        Config, DecoderConfig, EncoderConfig, GeometryConfig, ImageConfig, NeckConfig,
-        SegmentationConfig, TextConfig, VisionConfig,
+        Config, DecoderConfig, EncoderConfig, GeometryConfig, GeometryPrompt, ImageConfig,
+        NeckConfig, SegmentationConfig, TextConfig, VisionConfig,
     };
 
     #[test]
@@ -552,6 +552,94 @@ mod tests {
             (1, config.decoder.num_queries, 16, 16)
         );
         assert_eq!(segmentation.semantic_logits.dims4()?, (1, 1, 16, 16));
+        Ok(())
+    }
+
+    #[test]
+    fn image_model_geometry_grounding_regression_is_stable() -> Result<()> {
+        let dev = Device::Cpu;
+        let config = tiny_segmentation_config();
+        let model = Sam3ImageModel::new(&config, VarBuilder::zeros(candle::DType::F32, &dev))?;
+        let image = Tensor::zeros(
+            (1, 3, config.image.image_size, config.image.image_size),
+            candle::DType::F32,
+            &dev,
+        )?;
+        let prompt = GeometryPrompt {
+            points_xy: Some(Tensor::from_vec(vec![0.48f32, 0.50], (1, 2), &dev)?),
+            point_labels: Some(Tensor::new(vec![1u32], &dev)?),
+            ..Default::default()
+        };
+        let state = model.set_image(&image)?.with_geometry_prompt(prompt);
+        let output = model.ground_geometry(&state)?;
+
+        assert_eq!(output.mask_logits.dims3()?, (1, 16, 16));
+        assert_eq!(output.masks.dims3()?, (1, 16, 16));
+        assert_eq!(output.boxes_xyxy.dims2()?, (1, 4));
+        assert_eq!(output.scores.dims2()?, (1, 1));
+        assert_all_close_to_scalar(&output.mask_logits, 0.0, 0.0, "ground_geometry.mask_logits")?;
+        assert_all_close_to_scalar(&output.masks, 0.5, 1e-6, "ground_geometry.masks")?;
+        assert_all_close_to_scalar(&output.scores, 0.25, 1e-6, "ground_geometry.scores")?;
+        assert_tensor_close(
+            &output.boxes_xyxy,
+            &Tensor::from_vec(vec![0.25f32, 0.25, 0.75, 0.75], (1, 4), &dev)?,
+            1e-6,
+            "ground_geometry.boxes_xyxy",
+        )?;
+        Ok(())
+    }
+
+    fn assert_all_close_to_scalar(
+        tensor: &Tensor,
+        expected: f32,
+        atol: f32,
+        name: &str,
+    ) -> Result<()> {
+        let values = tensor
+            .to_dtype(candle::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let max_abs_diff = values
+            .iter()
+            .map(|value| (value - expected).abs())
+            .fold(0f32, f32::max);
+        if max_abs_diff > atol {
+            candle::bail!(
+                "{name}: max_abs_diff={max_abs_diff} exceeded atol={atol} for scalar {expected}"
+            );
+        }
+        Ok(())
+    }
+
+    fn assert_tensor_close(
+        actual: &Tensor,
+        expected: &Tensor,
+        atol: f32,
+        name: &str,
+    ) -> Result<()> {
+        if actual.dims() != expected.dims() {
+            candle::bail!(
+                "{name}: shape mismatch actual={:?} expected={:?}",
+                actual.dims(),
+                expected.dims()
+            );
+        }
+        let actual = actual
+            .to_dtype(candle::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let expected = expected
+            .to_dtype(candle::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let max_abs_diff = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0f32, f32::max);
+        if max_abs_diff > atol {
+            candle::bail!("{name}: max_abs_diff={max_abs_diff} exceeded atol={atol}");
+        }
         Ok(())
     }
 

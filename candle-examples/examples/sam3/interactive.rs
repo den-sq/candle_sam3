@@ -627,13 +627,15 @@ pub fn run_interactive_refinement(
 
 #[cfg(test)]
 mod tests {
-    use super::{load_replay_steps, run_interactive_refinement, InteractiveMode};
+    use super::{
+        load_replay_steps, run_interactive_refinement, InteractiveMode, Sam3InteractiveSession,
+    };
     use anyhow::Result;
-    use candle::{DType, Device};
+    use candle::{DType, Device, Tensor};
     use candle_nn::VarBuilder;
     use candle_transformers::models::sam3::{
-        Config, DecoderConfig, EncoderConfig, GeometryConfig, ImageConfig, NeckConfig,
-        Sam3ImageModel, SegmentationConfig, TextConfig, VisionConfig,
+        Config, DecoderConfig, EncoderConfig, GeometryConfig, GeometryPrompt, GroundingOutput,
+        ImageConfig, NeckConfig, Sam3ImageModel, SegmentationConfig, TextConfig, VisionConfig,
     };
 
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
@@ -831,6 +833,160 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_replay_matches_direct_grounding_each_step() -> Result<()> {
+        let device = Device::Cpu;
+        let model = Sam3ImageModel::new(
+            &tiny_segmentation_config(),
+            VarBuilder::zeros(DType::F32, &device),
+        )?;
+        let image = Tensor::zeros((1, 3, 56, 56), DType::F32, &device)?;
+        let mut session = Sam3InteractiveSession::new(&model, device.clone(), image.clone())?;
+        let replay_steps = load_replay_steps(
+            checked_in_manifest_path()
+                .to_str()
+                .expect("utf8 manifest path"),
+        )?;
+
+        let mut accumulated_points = Vec::new();
+        let mut accumulated_labels = Vec::new();
+
+        for (step_idx, step) in replay_steps.iter().enumerate() {
+            accumulated_points.extend(step.points.iter().copied());
+            accumulated_labels.extend(step.point_labels.iter().copied());
+
+            let interactive = if step_idx == 0 {
+                session
+                    .initialize(prompt_from_points(
+                        &step.points,
+                        &step.point_labels,
+                        &device,
+                    )?)?
+                    .clone()
+            } else {
+                session
+                    .refine(step.points.clone(), step.point_labels.clone())?
+                    .clone()
+            };
+
+            let direct_state = model
+                .set_image(&image)?
+                .with_geometry_prompt(prompt_from_points(
+                    &accumulated_points,
+                    &accumulated_labels,
+                    &device,
+                )?);
+            let direct = model.ground_geometry(&direct_state)?;
+            assert_grounding_close(
+                &interactive,
+                &direct,
+                &format!("interactive replay step {step_idx}"),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn prompt_from_points(
+        points: &[(f32, f32)],
+        point_labels: &[u32],
+        device: &Device,
+    ) -> candle::Result<GeometryPrompt> {
+        let points_xy = if points.is_empty() {
+            None
+        } else {
+            Some(Tensor::from_vec(
+                points
+                    .iter()
+                    .flat_map(|(x, y)| [*x, *y])
+                    .collect::<Vec<_>>(),
+                (points.len(), 2),
+                device,
+            )?)
+        };
+        let point_labels = if point_labels.is_empty() {
+            None
+        } else {
+            Some(Tensor::new(point_labels.to_vec(), device)?)
+        };
+        Ok(GeometryPrompt {
+            points_xy,
+            point_labels,
+            ..Default::default()
+        })
+    }
+
+    fn assert_grounding_close(
+        actual: &GroundingOutput,
+        expected: &GroundingOutput,
+        label: &str,
+    ) -> Result<()> {
+        assert_tensor_close(
+            &actual.mask_logits,
+            &expected.mask_logits,
+            1e-6,
+            &format!("{label} mask_logits"),
+        )?;
+        assert_tensor_close(
+            &actual.masks,
+            &expected.masks,
+            1e-6,
+            &format!("{label} masks"),
+        )?;
+        assert_tensor_close(
+            &actual.boxes_xyxy,
+            &expected.boxes_xyxy,
+            1e-6,
+            &format!("{label} boxes_xyxy"),
+        )?;
+        assert_tensor_close(
+            &actual.scores,
+            &expected.scores,
+            1e-6,
+            &format!("{label} scores"),
+        )?;
+        match (&actual.presence_scores, &expected.presence_scores) {
+            (Some(actual), Some(expected)) => {
+                assert_tensor_close(actual, expected, 1e-6, &format!("{label} presence_scores"))?
+            }
+            (None, None) => {}
+            _ => anyhow::bail!("{label} presence score availability mismatch"),
+        }
+        Ok(())
+    }
+
+    fn assert_tensor_close(
+        actual: &Tensor,
+        expected: &Tensor,
+        atol: f32,
+        label: &str,
+    ) -> Result<()> {
+        if actual.dims() != expected.dims() {
+            anyhow::bail!(
+                "{label}: shape mismatch actual={:?} expected={:?}",
+                actual.dims(),
+                expected.dims()
+            );
+        }
+        let actual = actual
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let expected = expected
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let max_abs_diff = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0f32, f32::max);
+        if max_abs_diff > atol {
+            anyhow::bail!("{label}: max_abs_diff={max_abs_diff} exceeded atol={atol}");
+        }
         Ok(())
     }
 }

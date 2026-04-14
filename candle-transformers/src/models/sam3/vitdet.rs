@@ -637,9 +637,24 @@ mod tests {
         }
     }
 
+    fn test_device() -> Result<Device> {
+        #[cfg(feature = "cuda")]
+        {
+            Device::new_cuda(0)
+        }
+        #[cfg(all(not(feature = "cuda"), feature = "metal"))]
+        {
+            Device::new_metal(0)
+        }
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        {
+            Ok(Device::Cpu)
+        }
+    }
+
     #[test]
     fn vitdet_trunk_tiles_position_embeddings_and_strips_cls_token() -> Result<()> {
-        let device = Device::Cpu;
+        let device = test_device()?;
         let config = small_config();
         let mut tensors = HashMap::new();
         tensors.insert(
@@ -675,10 +690,12 @@ mod tests {
     #[test]
     #[ignore = "fixture-driven parity investigation"]
     fn interactive_visual_fixture_trunk_matches_upstream() -> Result<()> {
-        let device = Device::Cpu;
-        let weights =
-            load_interactive_visual_fixture_tensors("vision_backbone_weights.safetensors")?;
-        let fixture = load_interactive_visual_fixture_tensors("fixture.safetensors")?;
+        let device = test_device()?;
+        let weights = load_interactive_visual_fixture_tensors(
+            "vision_backbone_weights.safetensors",
+            &device,
+        )?;
+        let fixture = load_interactive_visual_fixture_tensors("fixture.safetensors", &device)?;
         let vb = VarBuilder::from_tensors(weights, DType::F32, &device);
         let trunk = Sam3ViTDetTrunk::new(&VisionConfig::default(), vb.pp("trunk"))?;
         let image = fixture_tensor(&fixture, "inputs.image_preprocessed")?.clone();
@@ -700,9 +717,12 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/sam3_interactive_visual_seed")
     }
 
-    fn load_interactive_visual_fixture_tensors(file_name: &str) -> Result<HashMap<String, Tensor>> {
+    fn load_interactive_visual_fixture_tensors(
+        file_name: &str,
+        device: &Device,
+    ) -> Result<HashMap<String, Tensor>> {
         let path = interactive_visual_fixture_dir().join(file_name);
-        candle::safetensors::load(&path, &Device::Cpu).map_err(|err| {
+        candle::safetensors::load(&path, device).map_err(|err| {
             candle::Error::Msg(format!(
                 "failed to load interactive visual fixture {}: {err}",
                 path.display()

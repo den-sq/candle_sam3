@@ -386,9 +386,24 @@ mod tests {
     use crate::models::sam3::config::EncoderConfig;
     use crate::models::sam3::geometry::EncodedPrompt;
 
+    fn test_device() -> Result<Device> {
+        #[cfg(feature = "cuda")]
+        {
+            Device::new_cuda(0)
+        }
+        #[cfg(all(not(feature = "cuda"), feature = "metal"))]
+        {
+            Device::new_metal(0)
+        }
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        {
+            Ok(Device::Cpu)
+        }
+    }
+
     #[test]
     fn fusion_encoder_flattens_last_feature_level() -> Result<()> {
-        let device = Device::Cpu;
+        let device = test_device()?;
         let config = test_config();
         let vb = VarBuilder::from_tensors(encoder_weights(&config, &device)?, DType::F32, &device);
         let encoder = Sam3FusionEncoder::new(&config, vb)?;
@@ -411,7 +426,7 @@ mod tests {
 
     #[test]
     fn fusion_encoder_can_pool_prompt_into_image_features() -> Result<()> {
-        let device = Device::Cpu;
+        let device = test_device()?;
         let mut config = test_config();
         config.add_pooled_text_to_image = true;
         let vb = VarBuilder::from_tensors(encoder_weights(&config, &device)?, DType::F32, &device);
@@ -436,7 +451,7 @@ mod tests {
 
     #[test]
     fn fusion_encoder_smoke_fixture_matches_expected_values() -> Result<()> {
-        let device = Device::Cpu;
+        let device = test_device()?;
         let config = test_config();
         let vb = VarBuilder::from_tensors(encoder_weights(&config, &device)?, DType::F32, &device);
         let encoder = Sam3FusionEncoder::new(&config, vb)?;
@@ -493,8 +508,9 @@ mod tests {
     #[test]
     #[ignore = "fixture-driven parity investigation"]
     fn fusion_fixture_memory_matches_upstream() -> Result<()> {
-        let output = run_fixture_fusion()?;
-        let expected = load_fusion_fixture_tensors("fixture.safetensors")?;
+        let device = test_device()?;
+        let output = run_fixture_fusion(&device)?;
+        let expected = load_fusion_fixture_tensors("fixture.safetensors", &device)?;
         assert_tensor_close(
             &output.memory,
             fixture_tensor(&expected, "fusion.memory")?,
@@ -519,8 +535,9 @@ mod tests {
     #[test]
     #[ignore = "fixture-driven parity investigation"]
     fn fusion_fixture_metadata_matches_upstream() -> Result<()> {
-        let output = run_fixture_fusion()?;
-        let expected = load_fusion_fixture_tensors("fixture.safetensors")?;
+        let device = test_device()?;
+        let output = run_fixture_fusion(&device)?;
+        let expected = load_fusion_fixture_tensors("fixture.safetensors", &device)?;
         if let Some(expected_padding_mask) = expected.get("fusion.padding_mask") {
             assert_tensor_close(
                 &output.padding_mask.to_dtype(DType::U8)?,
@@ -646,11 +663,10 @@ mod tests {
         Ok(tensors)
     }
 
-    fn run_fixture_fusion() -> Result<FusionEncoderOutput> {
-        let device = Device::Cpu;
+    fn run_fixture_fusion(device: &Device) -> Result<FusionEncoderOutput> {
         let config = fusion_fixture_config()?;
-        let weights = load_fusion_fixture_tensors("encoder_weights.safetensors")?;
-        let fixture = load_fusion_fixture_tensors("fixture.safetensors")?;
+        let weights = load_fusion_fixture_tensors("encoder_weights.safetensors", device)?;
+        let fixture = load_fusion_fixture_tensors("fixture.safetensors", device)?;
         let vb = VarBuilder::from_tensors(weights, DType::F32, &device);
         let encoder = Sam3FusionEncoder::new(&config, vb)?;
         let visual_features = fixture_feature_levels(&fixture, "inputs.backbone_fpn");
@@ -706,9 +722,12 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/sam3_fusion_unit")
     }
 
-    fn load_fusion_fixture_tensors(file_name: &str) -> Result<HashMap<String, Tensor>> {
+    fn load_fusion_fixture_tensors(
+        file_name: &str,
+        device: &Device,
+    ) -> Result<HashMap<String, Tensor>> {
         let path = fusion_fixture_dir().join(file_name);
-        candle::safetensors::load(&path, &Device::Cpu).map_err(|err| {
+        candle::safetensors::load(&path, device).map_err(|err| {
             candle::Error::Msg(format!(
                 "failed to load fusion fixture {}: {err}",
                 path.display()
