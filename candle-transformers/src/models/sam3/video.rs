@@ -1,9 +1,9 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
 
-use std::collections::HashMap;
 use candle::{Device, Result, Tensor};
+use std::collections::HashMap;
 
-use super::{geometry::GeometryPrompt, Sam3ImageModel, GroundingOutput};
+use super::{geometry::GeometryPrompt, GroundingOutput, Sam3ImageModel};
 
 /// Represents a tracked object across video frames
 #[derive(Debug, Clone)]
@@ -75,13 +75,13 @@ impl Sam3VideoSession {
         }
     }
 
-    pub fn add_prompt(
-        &mut self,
-        frame_idx: usize,
-        prompt: SessionPrompt,
-    ) -> Result<()> {
+    pub fn add_prompt(&mut self, frame_idx: usize, prompt: SessionPrompt) -> Result<()> {
         if frame_idx >= self.video_frames.len() {
-            candle::bail!("frame_idx {} exceeds video length {}", frame_idx, self.video_frames.len());
+            candle::bail!(
+                "frame_idx {} exceeds video length {}",
+                frame_idx,
+                self.video_frames.len()
+            );
         }
         self.prompts_by_frame.insert(frame_idx, prompt);
         Ok(())
@@ -158,10 +158,10 @@ impl<'a> Sam3VideoPredictor<'a> {
     pub fn start_session(&mut self, video_frames: Vec<Tensor>) -> Result<String> {
         let session_id = format!("session_{}", self.next_session_id);
         self.next_session_id += 1;
-        
+
         let session = Sam3VideoSession::new(session_id.clone(), video_frames);
         self.sessions.insert(session_id.clone(), session);
-        
+
         Ok(session_id)
     }
 
@@ -172,10 +172,11 @@ impl<'a> Sam3VideoPredictor<'a> {
         frame_idx: usize,
         prompt: SessionPrompt,
     ) -> Result<()> {
-        let session = self.sessions
+        let session = self
+            .sessions
             .get_mut(session_id)
             .ok_or_else(|| candle::Error::Msg(format!("unknown session {}", session_id)))?;
-        
+
         session.add_prompt(frame_idx, prompt)?;
         Ok(())
     }
@@ -186,7 +187,8 @@ impl<'a> Sam3VideoPredictor<'a> {
         session_id: &str,
         frame_idx: usize,
     ) -> Result<Option<GroundingOutput>> {
-        let session = self.sessions
+        let session = self
+            .sessions
             .get(session_id)
             .ok_or_else(|| candle::Error::Msg(format!("unknown session {}", session_id)))?;
 
@@ -210,7 +212,10 @@ impl<'a> Sam3VideoPredictor<'a> {
         Ok(Some(grounding))
     }
 
-    fn session_prompt_to_geometry(prompt: &SessionPrompt, device: &Device) -> Result<GeometryPrompt> {
+    fn session_prompt_to_geometry(
+        prompt: &SessionPrompt,
+        device: &Device,
+    ) -> Result<GeometryPrompt> {
         let mut geometry_prompt = GeometryPrompt::default();
 
         if let Some(points) = prompt.points.as_ref() {
@@ -224,7 +229,8 @@ impl<'a> Sam3VideoPredictor<'a> {
 
         if let Some(point_labels) = prompt.point_labels.as_ref() {
             let labels = point_labels.iter().map(|v| *v as u32).collect::<Vec<_>>();
-            geometry_prompt.point_labels = Some(Tensor::from_vec(labels, (point_labels.len(),), device)?);
+            geometry_prompt.point_labels =
+                Some(Tensor::from_vec(labels, (point_labels.len(),), device)?);
         }
 
         if let Some(boxes) = prompt.boxes.as_ref() {
@@ -239,7 +245,11 @@ impl<'a> Sam3VideoPredictor<'a> {
         }
 
         if let Some(box_labels) = prompt.box_labels.as_ref() {
-            geometry_prompt.box_labels = Some(Tensor::from_vec(box_labels.clone(), (box_labels.len(),), device)?);
+            geometry_prompt.box_labels = Some(Tensor::from_vec(
+                box_labels.clone(),
+                (box_labels.len(),),
+                device,
+            )?);
         }
 
         Ok(geometry_prompt)
@@ -251,7 +261,8 @@ impl<'a> Sam3VideoPredictor<'a> {
         session_id: &str,
         direction: PropagationDirection,
     ) -> Result<VideoOutput> {
-        let session = self.sessions
+        let session = self
+            .sessions
             .get(session_id)
             .ok_or_else(|| candle::Error::Msg(format!("unknown session {}", session_id)))?;
 
@@ -271,7 +282,10 @@ impl<'a> Sam3VideoPredictor<'a> {
         }
 
         // Forward propagation (from last seed frame to end)
-        if matches!(direction, PropagationDirection::Forward | PropagationDirection::Both) {
+        if matches!(
+            direction,
+            PropagationDirection::Forward | PropagationDirection::Both
+        ) {
             if let Some(&last_seed) = seed_frames.iter().max() {
                 for frame_idx in (last_seed + 1)..session.num_frames() {
                     // Propagate using optical flow / feature matching
@@ -284,7 +298,10 @@ impl<'a> Sam3VideoPredictor<'a> {
         }
 
         // Backward propagation (from first seed frame to start)
-        if matches!(direction, PropagationDirection::Backward | PropagationDirection::Both) {
+        if matches!(
+            direction,
+            PropagationDirection::Backward | PropagationDirection::Both
+        ) {
             if let Some(&first_seed) = seed_frames.iter().min() {
                 for frame_idx in (0..first_seed).rev() {
                     if let Some(next_output) = outputs_per_frame.get(&(frame_idx + 1)) {
@@ -294,9 +311,7 @@ impl<'a> Sam3VideoPredictor<'a> {
             }
         }
 
-        Ok(VideoOutput {
-            outputs_per_frame,
-        })
+        Ok(VideoOutput { outputs_per_frame })
     }
 
     pub fn close_session(&mut self, session_id: &str) -> Result<()> {
@@ -314,7 +329,8 @@ impl<'a> Sam3VideoPredictor<'a> {
 
     /// Get the number of frames in a session
     pub fn session_frame_count(&self, session_id: &str) -> Result<usize> {
-        let session = self.sessions
+        let session = self
+            .sessions
             .get(session_id)
             .ok_or_else(|| candle::Error::Msg(format!("unknown session {}", session_id)))?;
         Ok(session.num_frames())
@@ -322,7 +338,8 @@ impl<'a> Sam3VideoPredictor<'a> {
 
     /// Get a frame from a session
     pub fn get_session_frame(&self, session_id: &str, frame_idx: usize) -> Result<Tensor> {
-        let session = self.sessions
+        let session = self
+            .sessions
             .get(session_id)
             .ok_or_else(|| candle::Error::Msg(format!("unknown session {}", session_id)))?;
         let frame = session.get_frame(frame_idx)?;

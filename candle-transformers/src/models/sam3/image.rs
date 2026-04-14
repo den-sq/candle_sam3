@@ -56,12 +56,18 @@ impl Sam3PromptState {
 #[derive(Debug, Clone)]
 pub struct Sam3ImageState {
     pub original_size: ImageSize,
-    pub model_input_size: ImageSize,    pub image_tensor: Tensor,    pub prompts: Sam3PromptState,
+    pub model_input_size: ImageSize,
+    pub image_tensor: Tensor,
+    pub prompts: Sam3PromptState,
     pub last_output: Option<GroundingOutput>,
 }
 
 impl Sam3ImageState {
-    pub fn new(original_size: ImageSize, model_input_size: ImageSize, image_tensor: Tensor) -> Self {
+    pub fn new(
+        original_size: ImageSize,
+        model_input_size: ImageSize,
+        image_tensor: Tensor,
+    ) -> Self {
         Self {
             original_size,
             model_input_size,
@@ -196,7 +202,11 @@ impl Sam3ImageModel {
             }
             rank => candle::bail!("expected CHW or BCHW image tensor, got rank {rank}"),
         };
-        Ok(Sam3ImageState::new(original_size, self.input_size(), image.clone()))
+        Ok(Sam3ImageState::new(
+            original_size,
+            self.input_size(),
+            image.clone(),
+        ))
     }
 
     pub fn encode_text_tokens(
@@ -352,12 +362,16 @@ impl Sam3ImageModel {
 
     pub fn ground_text(&self, state: &Sam3ImageState) -> Result<GroundingOutput> {
         let _text_prompt = state.text_prompt().ok_or_else(|| {
-            candle::Error::Msg("sam3 image state has no text prompt; call `with_text_prompt` first".to_string())
+            candle::Error::Msg(
+                "sam3 image state has no text prompt; call `with_text_prompt` first".to_string(),
+            )
         })?;
 
         // For now, this is a scaffold - we need tokenizer integration
         // TODO: Implement text tokenization and encoding
-        Err(candle::Error::Msg("sam3 text grounding not yet implemented: requires tokenizer integration".to_string()))
+        Err(candle::Error::Msg(
+            "sam3 text grounding not yet implemented: requires tokenizer integration".to_string(),
+        ))
     }
 
     pub fn ground_geometry(&self, state: &Sam3ImageState) -> Result<GroundingOutput> {
@@ -371,7 +385,8 @@ impl Sam3ImageModel {
         let visual_features = self.encode_image_features(&state.image_tensor)?;
 
         // Encode geometry prompt
-        let geometry_encoded = self.encode_geometry_prompt(state.geometry_prompt(), &visual_features)?;
+        let geometry_encoded =
+            self.encode_geometry_prompt(state.geometry_prompt(), &visual_features)?;
 
         // Fuse prompts
         let fused = self.encode_fused_prompt(&visual_features, &geometry_encoded)?;
@@ -380,7 +395,8 @@ impl Sam3ImageModel {
         let decoder_out = self.decode_grounding(&fused, &geometry_encoded)?;
 
         // Segment
-        let segmentation = self.segment_grounding(&visual_features, &decoder_out, &fused, &geometry_encoded)?;
+        let segmentation =
+            self.segment_grounding(&visual_features, &decoder_out, &fused, &geometry_encoded)?;
 
         // Extract grounding output
         let scores = self.text_detection_scores(&decoder_out)?;
@@ -410,7 +426,10 @@ impl Sam3ImageModel {
             masks: mask.unsqueeze(0)?,
             boxes_xyxy: best_box.unsqueeze(0)?,
             scores: best_score.unsqueeze(0)?,
-            presence_scores: segmentation.presence_logits.as_ref().and_then(|p| p.i((0, best_idx)).ok()),
+            presence_scores: segmentation
+                .presence_logits
+                .as_ref()
+                .and_then(|p| p.i((0, best_idx)).ok()),
         })
     }
 
@@ -447,9 +466,13 @@ mod tests {
     fn image_state_tracks_prompt_state() {
         let dev = Device::Cpu;
         let dummy_image = Tensor::zeros((3, 400, 600), candle::DType::F32, &dev).unwrap();
-        let state = Sam3ImageState::new(ImageSize::new(400, 600), ImageSize::square(1008), dummy_image)
-            .with_text_prompt("player in white")
-            .clear_prompts();
+        let state = Sam3ImageState::new(
+            ImageSize::new(400, 600),
+            ImageSize::square(1008),
+            dummy_image,
+        )
+        .with_text_prompt("player in white")
+        .clear_prompts();
         assert_eq!(state.original_size, ImageSize::new(400, 600));
         assert_eq!(state.model_input_size, ImageSize::square(1008));
         assert_eq!(state.text_prompt(), None);
@@ -467,8 +490,9 @@ mod tests {
             scores: Tensor::zeros((1,), candle::DType::F32, &dev)?,
             presence_scores: None,
         };
-        let state = Sam3ImageState::new(ImageSize::new(10, 12), ImageSize::square(1008), dummy_image)
-            .with_last_output(output);
+        let state =
+            Sam3ImageState::new(ImageSize::new(10, 12), ImageSize::square(1008), dummy_image)
+                .with_last_output(output);
         assert!(state.last_output.is_some());
         Ok(())
     }

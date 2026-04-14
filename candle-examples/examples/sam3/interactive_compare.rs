@@ -24,6 +24,10 @@ pub struct InteractiveReferenceMetadata {
     #[serde(default)]
     pub replay_script_path: Option<String>,
     #[serde(default)]
+    pub checkpoint_path: Option<String>,
+    #[serde(default)]
+    pub bpe_path: Option<String>,
+    #[serde(default)]
     pub steps: Vec<InteractiveReferenceStepMetadata>,
 }
 
@@ -181,6 +185,25 @@ fn point_args_from_pairs(points: &[(f32, f32)]) -> Vec<crate::PointArg> {
     points
         .iter()
         .map(|(x, y)| crate::PointArg { x: *x, y: *y })
+        .collect()
+}
+
+fn accumulated_points_from_step(
+    step: &InteractiveReferenceStepMetadata,
+    step_idx: usize,
+) -> Result<Vec<(f32, f32)>> {
+    step.accumulated_points_xy_normalized
+        .iter()
+        .map(|point| -> Result<(f32, f32)> {
+            if point.len() != 2 {
+                bail!(
+                    "interactive reference step {} accumulated point expected [x, y], got {} values",
+                    step_idx,
+                    point.len()
+                )
+            }
+            Ok((point[0], point[1]))
+        })
         .collect()
 }
 
@@ -354,20 +377,7 @@ pub fn run_interactive_reference_comparison(
     let mut entries = Vec::with_capacity(bundle.metadata.steps.len());
     for (step_idx, step) in bundle.metadata.steps.iter().enumerate() {
         println!("comparing interactive step {step_idx}");
-        let accumulated_points = step
-            .accumulated_points_xy_normalized
-            .iter()
-            .map(|point| -> Result<(f32, f32)> {
-                if point.len() != 2 {
-                    bail!(
-                        "interactive reference step {} accumulated point expected [x, y], got {} values",
-                        step_idx,
-                        point.len()
-                    )
-                }
-                Ok((point[0], point[1]))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let accumulated_points = accumulated_points_from_step(step, step_idx)?;
         let candle = run_candle_interactive_step(
             model,
             &image,
@@ -579,4 +589,109 @@ pub fn run_interactive_reference_comparison(
         )
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use anyhow::{Context, Result};
+    use candle::{DType, Device};
+    use candle_transformers::models::sam3::{self, Sam3CheckpointSource};
+
+    use super::{
+        accumulated_points_from_step, compare_tensor, run_candle_interactive_step,
+        InteractiveReferenceBundle,
+    };
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn interactive_reference_fusion_memory_matches_upstream() -> Result<()> {
+        let (bundle, model, image, device) = load_test_context()?;
+        let step_idx = 0usize;
+        let step = &bundle.metadata.steps[step_idx];
+        let points = accumulated_points_from_step(step, step_idx)?;
+        let output = run_candle_interactive_step(
+            &model,
+            &image,
+            &points,
+            &step.accumulated_point_labels,
+            &device,
+        )?;
+        let report = compare_tensor(
+            "fusion.memory",
+            bundle.tensor(&format!("step.{step_idx}.fusion.memory"))?,
+            &output.fusion_memory,
+            1e-5,
+        )?;
+        assert!(
+            report.pass,
+            "interactive reference step {} fusion.memory mismatch: max_abs_diff={:?} mean_abs_diff={:?}",
+            step_idx,
+            report.max_abs_diff,
+            report.mean_abs_diff
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn interactive_reference_segmentation_mask_logits_match_upstream() -> Result<()> {
+        let (bundle, model, image, device) = load_test_context()?;
+        let step_idx = 0usize;
+        let step = &bundle.metadata.steps[step_idx];
+        let points = accumulated_points_from_step(step, step_idx)?;
+        let output = run_candle_interactive_step(
+            &model,
+            &image,
+            &points,
+            &step.accumulated_point_labels,
+            &device,
+        )?;
+        let report = compare_tensor(
+            "segmentation.mask_logits",
+            bundle.tensor(&format!("step.{step_idx}.segmentation.mask_logits"))?,
+            &output.segmentation_mask_logits,
+            1e-5,
+        )?;
+        assert!(
+            report.pass,
+            "interactive reference step {} segmentation.mask_logits mismatch: max_abs_diff={:?} mean_abs_diff={:?}",
+            step_idx,
+            report.max_abs_diff,
+            report.mean_abs_diff
+        );
+        Ok(())
+    }
+
+    fn load_test_context() -> Result<(
+        InteractiveReferenceBundle,
+        sam3::Sam3ImageModel,
+        candle::Tensor,
+        Device,
+    )> {
+        let device = Device::Cpu;
+        let bundle = InteractiveReferenceBundle::load(&reference_bundle_dir())?;
+        let checkpoint_path = bundle
+            .metadata
+            .checkpoint_path
+            .as_deref()
+            .context("interactive reference metadata is missing checkpoint_path")?;
+        let config = sam3::Config::default();
+        let checkpoint = Sam3CheckpointSource::upstream_pth(checkpoint_path);
+        let model = sam3::Sam3ImageModel::from_checkpoint_source(
+            &config,
+            &checkpoint,
+            DType::F32,
+            &device,
+        )?;
+        let image =
+            crate::preprocess_image_path_exact(&bundle.metadata.image_path, &model, &device)?;
+        Ok((bundle, model, image, device))
+    }
+
+    fn reference_bundle_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../candle-examples/examples/sam3/reference_interactive_replay")
+    }
 }

@@ -376,6 +376,8 @@ fn pool_prompt_feat(prompt: &Tensor, prompt_mask: &Tensor, pool_with_mask: bool)
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::PathBuf;
 
     use candle::{DType, Device, Result, Tensor};
     use candle_nn::VarBuilder;
@@ -430,6 +432,63 @@ mod tests {
         };
         let output = encoder.forward(&visual_features, &visual_pos, &prompt)?;
         assert_fusion_output(output, 4, 1, &config)
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn fusion_fixture_memory_matches_upstream() -> Result<()> {
+        let output = run_fixture_fusion()?;
+        let expected = load_fusion_fixture_tensors("fixture.safetensors")?;
+        assert_tensor_close(
+            &output.memory,
+            fixture_tensor(&expected, "fusion.memory")?,
+            1e-5,
+            "fusion.memory",
+        )?;
+        assert_tensor_close(
+            &output.pos_embed,
+            fixture_tensor(&expected, "fusion.pos_embed")?,
+            1e-5,
+            "fusion.pos_embed",
+        )?;
+        assert_tensor_close(
+            &output.valid_ratios,
+            fixture_tensor(&expected, "fusion.valid_ratios")?,
+            1e-5,
+            "fusion.valid_ratios",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn fusion_fixture_metadata_matches_upstream() -> Result<()> {
+        let output = run_fixture_fusion()?;
+        let expected = load_fusion_fixture_tensors("fixture.safetensors")?;
+        if let Some(expected_padding_mask) = expected.get("fusion.padding_mask") {
+            assert_tensor_close(
+                &output.padding_mask.to_dtype(DType::U8)?,
+                expected_padding_mask,
+                0.0,
+                "fusion.padding_mask",
+            )?;
+        } else {
+            let zero_mask = Tensor::zeros_like(&output.padding_mask)?;
+            assert_tensor_close(&output.padding_mask, &zero_mask, 0.0, "fusion.padding_mask")?;
+        }
+        assert_tensor_close(
+            &output.spatial_shapes,
+            fixture_tensor(&expected, "fusion.spatial_shapes")?,
+            0.0,
+            "fusion.spatial_shapes",
+        )?;
+        assert_tensor_close(
+            &output.level_start_index,
+            fixture_tensor(&expected, "fusion.level_start_index")?,
+            0.0,
+            "fusion.level_start_index",
+        )?;
+        Ok(())
     }
 
     fn assert_fusion_output(
@@ -529,5 +588,124 @@ mod tests {
             );
         }
         Ok(tensors)
+    }
+
+    fn run_fixture_fusion() -> Result<FusionEncoderOutput> {
+        let device = Device::Cpu;
+        let config = fusion_fixture_config()?;
+        let weights = load_fusion_fixture_tensors("encoder_weights.safetensors")?;
+        let fixture = load_fusion_fixture_tensors("fixture.safetensors")?;
+        let vb = VarBuilder::from_tensors(weights, DType::F32, &device);
+        let encoder = Sam3FusionEncoder::new(&config, vb)?;
+        let visual_features = fixture_feature_levels(&fixture, "inputs.backbone_fpn");
+        let visual_pos = fixture_feature_levels(&fixture, "inputs.vision_pos_enc");
+        let prompt = EncodedPrompt {
+            features: fixture_tensor(&fixture, "inputs.prompt")?.clone(),
+            padding_mask: fixture_tensor(&fixture, "inputs.prompt_mask")?.to_dtype(DType::U8)?,
+        };
+        encoder.forward(&visual_features, &visual_pos, &prompt)
+    }
+
+    fn fusion_fixture_config() -> Result<EncoderConfig> {
+        let path = fusion_fixture_dir().join("metadata.json");
+        let contents = fs::read_to_string(&path).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to read fusion fixture metadata {}: {err}",
+                path.display()
+            ))
+        })?;
+        let metadata: serde_json::Value = serde_json::from_str(&contents).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to parse fusion fixture metadata {}: {err}",
+                path.display()
+            ))
+        })?;
+        Ok(EncoderConfig {
+            d_model: metadata["d_model"]
+                .as_u64()
+                .expect("fusion fixture d_model should be an integer")
+                as usize,
+            num_layers: metadata["num_layers"]
+                .as_u64()
+                .expect("fusion fixture num_layers should be an integer")
+                as usize,
+            num_feature_levels: metadata["num_feature_levels"]
+                .as_u64()
+                .expect("fusion fixture num_feature_levels should be an integer")
+                as usize,
+            num_heads: metadata["num_heads"]
+                .as_u64()
+                .expect("fusion fixture num_heads should be an integer")
+                as usize,
+            dim_feedforward: metadata["dim_feedforward"]
+                .as_u64()
+                .expect("fusion fixture dim_feedforward should be an integer")
+                as usize,
+            add_pooled_text_to_image: false,
+            pool_text_with_mask: true,
+        })
+    }
+
+    fn fusion_fixture_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/sam3_fusion_unit")
+    }
+
+    fn load_fusion_fixture_tensors(file_name: &str) -> Result<HashMap<String, Tensor>> {
+        let path = fusion_fixture_dir().join(file_name);
+        candle::safetensors::load(&path, &Device::Cpu).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to load fusion fixture {}: {err}",
+                path.display()
+            ))
+        })
+    }
+
+    fn fixture_feature_levels(fixture: &HashMap<String, Tensor>, prefix: &str) -> Vec<Tensor> {
+        let mut levels = Vec::new();
+        for idx in 0.. {
+            let key = format!("{prefix}.{idx}");
+            let Some(level) = fixture.get(&key) else {
+                break;
+            };
+            levels.push(level.clone());
+        }
+        levels
+    }
+
+    fn fixture_tensor<'a>(fixture: &'a HashMap<String, Tensor>, key: &str) -> Result<&'a Tensor> {
+        fixture
+            .get(key)
+            .ok_or_else(|| candle::Error::Msg(format!("fusion fixture is missing tensor `{key}`")))
+    }
+
+    fn assert_tensor_close(
+        actual: &Tensor,
+        expected: &Tensor,
+        atol: f32,
+        name: &str,
+    ) -> Result<()> {
+        if actual.dims() != expected.dims() {
+            candle::bail!(
+                "{name}: shape mismatch actual={:?} expected={:?}",
+                actual.dims(),
+                expected.dims()
+            );
+        }
+        let actual = actual
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let expected = expected
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let mut max_abs_diff = 0f32;
+        for (lhs, rhs) in actual.iter().zip(expected.iter()) {
+            max_abs_diff = max_abs_diff.max((lhs - rhs).abs());
+        }
+        if max_abs_diff > atol {
+            candle::bail!("{name}: max_abs_diff={max_abs_diff:.8} exceeded atol={atol:.8}");
+        }
+        Ok(())
     }
 }

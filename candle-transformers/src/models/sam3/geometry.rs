@@ -1604,7 +1604,9 @@ mod tests {
         })
     }
 
-    fn load_interactive_geometry_fixture_tensors(file_name: &str) -> Result<HashMap<String, Tensor>> {
+    fn load_interactive_geometry_fixture_tensors(
+        file_name: &str,
+    ) -> Result<HashMap<String, Tensor>> {
         let path = interactive_geometry_fixture_dir().join(file_name);
         candle::safetensors::load(&path, &Device::Cpu).map_err(|err| {
             candle::Error::Msg(format!(
@@ -1698,7 +1700,8 @@ mod tests {
         Ok((encoded, debug_tensors))
     }
 
-    fn run_interactive_fixture_geometry_encode() -> Result<(super::EncodedPrompt, HashMap<String, Tensor>)> {
+    fn run_interactive_fixture_geometry_encode(
+    ) -> Result<(super::EncodedPrompt, HashMap<String, Tensor>)> {
         let device = Device::Cpu;
         let config = interactive_fixture_config()?;
         let weights = load_interactive_geometry_fixture_tensors("weights.safetensors")?;
@@ -1708,7 +1711,7 @@ mod tests {
         let prompt = GeometryPrompt {
             points_xy: Some(fixture_tensor(&fixture, "inputs/points_xy")?.clone()),
             point_labels: Some(
-                fixture_tensor(&fixture, "inputs/point_labels")?.to_dtype(DType::U32)?
+                fixture_tensor(&fixture, "inputs/point_labels")?.to_dtype(DType::U32)?,
             ),
             ..Default::default()
         };

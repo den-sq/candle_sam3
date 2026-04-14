@@ -318,6 +318,7 @@ fn build_2d_sine_position_encoding(feature: &Tensor, d_model: usize) -> Result<T
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     use candle::{DType, Device, Result, Tensor};
     use candle_nn::VarBuilder;
@@ -375,6 +376,38 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn interactive_visual_fixture_neck_last_level_matches_upstream() -> Result<()> {
+        let output = run_interactive_visual_fixture_neck()?;
+        let expected = load_interactive_visual_fixture_tensors("fixture.safetensors")?;
+        assert_tensor_close(
+            output
+                .backbone_fpn
+                .last()
+                .expect("neck should emit at least one FPN level"),
+            fixture_tensor(&expected, "vision.backbone_fpn.last")?,
+            1e-5,
+            "vision.backbone_fpn.last",
+        )
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn interactive_visual_fixture_position_encoding_matches_upstream() -> Result<()> {
+        let output = run_interactive_visual_fixture_neck()?;
+        let expected = load_interactive_visual_fixture_tensors("fixture.safetensors")?;
+        assert_tensor_close(
+            output
+                .vision_pos_enc
+                .last()
+                .expect("neck should emit at least one position encoding"),
+            fixture_tensor(&expected, "vision.vision_pos_enc.last")?,
+            1e-5,
+            "vision.vision_pos_enc.last",
+        )
+    }
+
     fn assert_visual_shapes(
         out: &VisualBackboneOutput,
         expected: &[(usize, usize, usize, usize)],
@@ -386,6 +419,73 @@ mod tests {
         }
         for (pos, dims) in out.vision_pos_enc.iter().zip(expected.iter()) {
             assert_eq!(pos.dims4()?, *dims);
+        }
+        Ok(())
+    }
+
+    fn run_interactive_visual_fixture_neck() -> Result<VisualBackboneOutput> {
+        let device = Device::Cpu;
+        let weights =
+            load_interactive_visual_fixture_tensors("vision_backbone_weights.safetensors")?;
+        let fixture = load_interactive_visual_fixture_tensors("fixture.safetensors")?;
+        let vb = VarBuilder::from_tensors(weights, DType::F32, &device);
+        let neck = Sam3DualViTDetNeck::new(&NeckConfig::default(), vb)?;
+        let trunk_last = fixture_tensor(&fixture, "vision.trunk.last")?.permute((0, 2, 3, 1))?;
+        let trunk = ViTDetTrunkOutput {
+            stage_features: vec![trunk_last],
+        };
+        neck.forward(&trunk)
+    }
+
+    fn interactive_visual_fixture_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/sam3_interactive_visual_seed")
+    }
+
+    fn load_interactive_visual_fixture_tensors(file_name: &str) -> Result<HashMap<String, Tensor>> {
+        let path = interactive_visual_fixture_dir().join(file_name);
+        candle::safetensors::load(&path, &Device::Cpu).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to load interactive visual fixture {}: {err}",
+                path.display()
+            ))
+        })
+    }
+
+    fn fixture_tensor<'a>(fixture: &'a HashMap<String, Tensor>, key: &str) -> Result<&'a Tensor> {
+        fixture.get(key).ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "interactive visual fixture is missing tensor `{key}`"
+            ))
+        })
+    }
+
+    fn assert_tensor_close(
+        actual: &Tensor,
+        expected: &Tensor,
+        atol: f32,
+        name: &str,
+    ) -> Result<()> {
+        if actual.dims() != expected.dims() {
+            candle::bail!(
+                "{name}: shape mismatch actual={:?} expected={:?}",
+                actual.dims(),
+                expected.dims()
+            );
+        }
+        let actual = actual
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let expected = expected
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let mut max_abs_diff = 0f32;
+        for (lhs, rhs) in actual.iter().zip(expected.iter()) {
+            max_abs_diff = max_abs_diff.max((lhs - rhs).abs());
+        }
+        if max_abs_diff > atol {
+            candle::bail!("{name}: max_abs_diff={max_abs_diff:.8} exceeded atol={atol:.8}");
         }
         Ok(())
     }

@@ -47,7 +47,7 @@ pub use neck::VisualBackboneOutput;
 pub use segmentation::{SegmentationOutput, UniversalSegmentationHead};
 pub use text::{Sam3TextEncoder, TextEncoding};
 pub use video::{
-    Sam3VideoPredictor, Sam3VideoSession, SessionPrompt, TrackedObject, VideoConfig,
-    VideoOutput, PropagationDirection,
+    PropagationDirection, Sam3VideoPredictor, Sam3VideoSession, SessionPrompt, TrackedObject,
+    VideoConfig, VideoOutput,
 };
 pub use vitdet::{Sam3ViTDetTrunk, ViTDetTrunkOutput};
