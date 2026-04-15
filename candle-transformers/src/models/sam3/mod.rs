@@ -27,12 +27,14 @@ mod image;
 mod neck;
 mod segmentation;
 mod text;
+mod tracker;
 mod video;
 mod vitdet;
 
 pub use checkpoint::{
     load_upstream_detector_var_builder, map_image_tensor_to_upstream_checkpoint_name,
-    Sam3CheckpointSource, UPSTREAM_SAM3_DETECTOR_PREFIX, UPSTREAM_SAM3_STATE_KEY,
+    map_tracker_tensor_to_upstream_checkpoint_name, Sam3CheckpointSource,
+    UPSTREAM_SAM3_DETECTOR_PREFIX, UPSTREAM_SAM3_STATE_KEY, UPSTREAM_SAM3_TRACKER_PREFIX,
 };
 pub use config::{
     Config, DecoderConfig, EncoderConfig, GeometryConfig, ImageConfig, NeckConfig,
@@ -46,9 +48,11 @@ pub use image::{GroundingOutput, ImageSize, Sam3ImageModel, Sam3ImageState, Sam3
 pub use neck::VisualBackboneOutput;
 pub use segmentation::{SegmentationOutput, UniversalSegmentationHead};
 pub use text::{Sam3TextEncoder, TextEncoding};
+pub use tracker::{Sam3TrackerConfig, Sam3TrackerModel, TrackerFrameState, TrackerStepOutput};
 pub use video::{
-    FrameSource, ObjectFrameOutput, PropagationDirection, PropagationOptions, Sam3VideoPredictor,
-    Sam3VideoSession, SessionCacheStats, SessionPrompt, TrackedObject, VideoConfig,
-    VideoFrameOutput, VideoOutput, VideoSessionOptions, VideoSource,
+    FrameSource, ObjectFrameOutput, PropagationDirection, PropagationOptions,
+    Sam3MemoryAttentionVideoTrackerBackend, Sam3VideoPredictor, Sam3VideoSession,
+    SessionCacheStats, SessionPrompt, TrackedObject, VideoConfig, VideoFrameOutput, VideoOutput,
+    VideoSessionOptions, VideoSource,
 };
 pub use vitdet::{Sam3ViTDetTrunk, ViTDetTrunkOutput};

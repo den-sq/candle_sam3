@@ -2629,10 +2629,20 @@ pub fn main() -> anyhow::Result<()> {
             max_feature_cache_entries: args.video_max_feature_cache_entries,
             offload_state_to_cpu: args.video_offload_state_to_cpu || !args.cpu,
         };
+        let checkpoint = checkpoint_source
+            .as_ref()
+            .context("SAM3 video mode requires `--checkpoint <sam3.pt>`")?;
+        let tracker = sam3::Sam3TrackerModel::from_checkpoint_source(
+            &config,
+            checkpoint,
+            DType::F32,
+            &device,
+        )?;
         video::run_video_prediction(
             model
                 .as_ref()
                 .context("SAM3 video mode requires `--checkpoint <sam3.pt>`")?,
+            &tracker,
             &video_mode,
             Path::new(&args.output_dir),
             &device,

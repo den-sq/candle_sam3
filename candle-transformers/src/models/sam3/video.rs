@@ -15,7 +15,7 @@ use super::{
     image::{GroundingOutput, ImageSize},
     neck::VisualBackboneOutput,
     text::TextEncoding,
-    Config, Sam3ImageModel,
+    Config, Sam3ImageModel, Sam3TrackerModel, TrackerFrameState,
 };
 
 const CLIP_EOT_TOKEN: &str = "<|endoftext|>";
@@ -320,6 +320,7 @@ pub struct TrackedObject {
     pub last_updated_frame: usize,
     pub prompt_frames: BTreeMap<usize, SessionPrompt>,
     pub frame_outputs: BTreeMap<usize, ObjectFrameOutput>,
+    pub tracker_states: BTreeMap<usize, TrackerFrameState>,
 }
 
 impl TrackedObject {
@@ -330,6 +331,7 @@ impl TrackedObject {
             last_updated_frame: creation_frame,
             prompt_frames: BTreeMap::new(),
             frame_outputs: BTreeMap::new(),
+            tracker_states: BTreeMap::new(),
         }
     }
 
@@ -347,6 +349,7 @@ impl TrackedObject {
         }
         self.last_updated_frame = frame_idx;
         self.frame_outputs.clear();
+        self.tracker_states.clear();
     }
 
     fn nearest_prompt(
@@ -420,6 +423,25 @@ impl TrackedObject {
             PropagationDirection::Backward => {
                 self.prompt_frames.range(frame_idx..).next().is_some()
             }
+        }
+    }
+
+    fn tracker_history(
+        &self,
+        frame_idx: usize,
+        direction: PropagationDirection,
+    ) -> BTreeMap<usize, TrackerFrameState> {
+        match direction {
+            PropagationDirection::Forward | PropagationDirection::Both => self
+                .tracker_states
+                .range(..frame_idx)
+                .map(|(idx, state)| (*idx, state.clone()))
+                .collect(),
+            PropagationDirection::Backward => self
+                .tracker_states
+                .range((frame_idx + 1)..)
+                .map(|(idx, state)| (*idx, state.clone()))
+                .collect(),
         }
     }
 }
@@ -616,6 +638,7 @@ impl Sam3VideoSession {
     fn invalidate_object_outputs(&mut self, obj_id: u32) {
         if let Some(object) = self.tracked_objects.get_mut(&obj_id) {
             object.frame_outputs.clear();
+            object.tracker_states.clear();
         }
         let mut empty_frames = Vec::new();
         for (frame_idx, frame_outputs) in self.frame_outputs.iter_mut() {
@@ -978,6 +1001,304 @@ pub trait VideoTrackerBackend {
         direction: PropagationDirection,
         output_threshold: f32,
     ) -> Result<VideoFrameOutput>;
+}
+
+#[derive(Debug)]
+pub struct Sam3MemoryAttentionVideoTrackerBackend<'a> {
+    tracker: &'a Sam3TrackerModel,
+}
+
+impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
+    pub fn new(tracker: &'a Sam3TrackerModel) -> Self {
+        Self { tracker }
+    }
+
+    fn history_on_device(
+        &self,
+        object: &TrackedObject,
+        frame_idx: usize,
+        direction: PropagationDirection,
+        compute_device: &Device,
+    ) -> Result<BTreeMap<usize, TrackerFrameState>> {
+        object
+            .tracker_history(frame_idx, direction)
+            .into_iter()
+            .map(|(idx, state)| Ok((idx, state.to_storage_device(compute_device)?)))
+            .collect()
+    }
+
+    fn store_object_result(
+        &self,
+        session: &mut Sam3VideoSession,
+        frame_idx: usize,
+        output: ObjectFrameOutput,
+        state: TrackerFrameState,
+    ) -> Result<ObjectFrameOutput> {
+        let stored_output = output.to_storage_device(session.storage_device())?;
+        let stored_state = state.to_storage_device(session.storage_device())?;
+        let tracked = session
+            .tracked_objects
+            .get_mut(&stored_output.obj_id)
+            .ok_or_else(|| {
+                candle::Error::Msg(format!("unknown obj_id {}", stored_output.obj_id))
+            })?;
+        tracked
+            .frame_outputs
+            .insert(frame_idx, stored_output.clone());
+        tracked.tracker_states.insert(frame_idx, stored_state);
+        tracked.last_updated_frame = frame_idx;
+        session
+            .frame_outputs
+            .entry(frame_idx)
+            .or_default()
+            .insert(stored_output.obj_id, stored_output.clone());
+        Ok(stored_output)
+    }
+
+    fn seed_with_detector(
+        &self,
+        model: &Sam3ImageModel,
+        compute_device: &Device,
+        session: &mut Sam3VideoSession,
+        object: &TrackedObject,
+        frame_idx: usize,
+        direction: PropagationDirection,
+        prompt: &SessionPrompt,
+    ) -> Result<ObjectFrameOutput> {
+        let visual = session.get_visual_features(model, compute_device, frame_idx)?;
+        let text_encoding = match prompt.text.as_deref() {
+            Some(text_prompt) => {
+                Some(session.cached_text_encoding(model, text_prompt, compute_device)?)
+            }
+            None => None,
+        };
+        let geometry_encoding = if prompt.has_geometry() {
+            let geometry_prompt = session_prompt_to_geometry(prompt, compute_device)?;
+            Some(model.encode_geometry_prompt(&geometry_prompt, &visual)?)
+        } else {
+            None
+        };
+        let encoded_prompt =
+            combine_encoded_prompts(text_encoding.as_ref(), geometry_encoding.as_ref())?
+                .ok_or_else(|| {
+                    candle::Error::Msg(
+                        "detector seeding requires a text or geometry prompt".to_owned(),
+                    )
+                })?;
+        let grounding = ground_from_encoded_prompt(model, &visual, &encoded_prompt)?;
+        let mask_input = grounding.masks.gt(0.5)?.to_dtype(DType::F32)?;
+        let history = self.history_on_device(object, frame_idx, direction, compute_device)?;
+        let step = self.tracker.track_frame(
+            &visual,
+            frame_idx,
+            session.num_frames(),
+            None,
+            None,
+            None,
+            Some(&mask_input),
+            &history,
+            true,
+            matches!(direction, PropagationDirection::Backward),
+            false,
+        )?;
+        let output = ObjectFrameOutput::from_grounding(
+            object.obj_id,
+            grounding,
+            Some(frame_idx),
+            step.memory_frame_indices,
+            prompt.text.clone(),
+            prompt.has_geometry(),
+            false,
+        );
+        self.store_object_result(session, frame_idx, output, step.state)
+    }
+
+    fn seed_with_tracker_points(
+        &self,
+        model: &Sam3ImageModel,
+        compute_device: &Device,
+        session: &mut Sam3VideoSession,
+        object: &TrackedObject,
+        frame_idx: usize,
+        direction: PropagationDirection,
+        prompt: &SessionPrompt,
+    ) -> Result<ObjectFrameOutput> {
+        let visual = session.get_visual_features(model, compute_device, frame_idx)?;
+        let history = self.history_on_device(object, frame_idx, direction, compute_device)?;
+        let image_size = model.input_size();
+        let point_inputs = session_prompt_to_tracker_points(prompt, image_size, compute_device)?;
+        let boxes_xyxy = session_prompt_to_tracker_box(prompt, image_size, compute_device)?;
+        let (point_coords, point_labels) = match point_inputs {
+            Some((coords, labels)) => (Some(coords), Some(labels)),
+            None => (None, None),
+        };
+        let step = self.tracker.track_frame(
+            &visual,
+            frame_idx,
+            session.num_frames(),
+            point_coords.as_ref(),
+            point_labels.as_ref(),
+            boxes_xyxy.as_ref(),
+            None,
+            &history,
+            true,
+            matches!(direction, PropagationDirection::Backward),
+            false,
+        )?;
+        let output = tracker_state_to_object_output(
+            object.obj_id,
+            &step.state,
+            Some(frame_idx),
+            step.memory_frame_indices,
+            prompt.text.clone(),
+            prompt.has_geometry(),
+            false,
+        )?;
+        self.store_object_result(session, frame_idx, output, step.state)
+    }
+
+    fn propagate_with_tracker(
+        &self,
+        model: &Sam3ImageModel,
+        compute_device: &Device,
+        session: &mut Sam3VideoSession,
+        object: &TrackedObject,
+        frame_idx: usize,
+        direction: PropagationDirection,
+    ) -> Result<Option<ObjectFrameOutput>> {
+        let history = self.history_on_device(object, frame_idx, direction, compute_device)?;
+        if history.is_empty() {
+            return Ok(None);
+        }
+        let visual = session.get_visual_features(model, compute_device, frame_idx)?;
+        let step = self.tracker.track_frame(
+            &visual,
+            frame_idx,
+            session.num_frames(),
+            None,
+            None,
+            None,
+            None,
+            &history,
+            false,
+            matches!(direction, PropagationDirection::Backward),
+            true,
+        )?;
+        let prompt_frame_idx = match direction {
+            PropagationDirection::Forward | PropagationDirection::Both => {
+                step.prompt_frame_indices.last().copied()
+            }
+            PropagationDirection::Backward => step.prompt_frame_indices.first().copied(),
+        };
+        let text_prompt = object
+            .latest_text_prompt(frame_idx, direction)
+            .map(|(_, text)| text);
+        let output = tracker_state_to_object_output(
+            object.obj_id,
+            &step.state,
+            prompt_frame_idx,
+            step.memory_frame_indices,
+            text_prompt,
+            false,
+            false,
+        )?;
+        Ok(Some(self.store_object_result(
+            session, frame_idx, output, step.state,
+        )?))
+    }
+
+    fn infer_object_on_frame(
+        &self,
+        model: &Sam3ImageModel,
+        compute_device: &Device,
+        session: &mut Sam3VideoSession,
+        object: TrackedObject,
+        frame_idx: usize,
+        direction: PropagationDirection,
+    ) -> Result<Option<ObjectFrameOutput>> {
+        if let Some(cached) = object.frame_outputs.get(&frame_idx) {
+            return Ok(Some(cached.clone()));
+        }
+
+        if let Some(prompt) = object.prompt_frames.get(&frame_idx) {
+            if prompt.text.is_some() || prompt.boxes.is_some() {
+                return self
+                    .seed_with_detector(
+                        model,
+                        compute_device,
+                        session,
+                        &object,
+                        frame_idx,
+                        direction,
+                        prompt,
+                    )
+                    .map(Some);
+            }
+            if prompt.points.is_some() {
+                return self
+                    .seed_with_tracker_points(
+                        model,
+                        compute_device,
+                        session,
+                        &object,
+                        frame_idx,
+                        direction,
+                        prompt,
+                    )
+                    .map(Some);
+            }
+        }
+
+        self.propagate_with_tracker(
+            model,
+            compute_device,
+            session,
+            &object,
+            frame_idx,
+            direction,
+        )
+    }
+}
+
+impl VideoTrackerBackend for Sam3MemoryAttentionVideoTrackerBackend<'_> {
+    fn process_frame(
+        &self,
+        model: &Sam3ImageModel,
+        compute_device: &Device,
+        _config: &VideoConfig,
+        session: &mut Sam3VideoSession,
+        frame_idx: usize,
+        direction: PropagationDirection,
+        _output_threshold: f32,
+    ) -> Result<VideoFrameOutput> {
+        let object_ids = session
+            .tracked_objects
+            .values()
+            .filter(|object| object.is_active_for_frame(frame_idx, direction))
+            .map(|object| object.obj_id)
+            .collect::<Vec<_>>();
+
+        let mut objects = Vec::new();
+        for obj_id in object_ids {
+            let object = session
+                .tracked_objects
+                .get(&obj_id)
+                .cloned()
+                .ok_or_else(|| candle::Error::Msg(format!("unknown obj_id {}", obj_id)))?;
+            if let Some(output) = self.infer_object_on_frame(
+                model,
+                compute_device,
+                session,
+                object,
+                frame_idx,
+                direction,
+            )? {
+                objects.push(output);
+            }
+        }
+
+        Ok(VideoFrameOutput { frame_idx, objects })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1705,6 +2026,126 @@ fn session_prompt_to_geometry(prompt: &SessionPrompt, device: &Device) -> Result
     }
 
     Ok(geometry_prompt)
+}
+
+fn session_prompt_to_tracker_points(
+    prompt: &SessionPrompt,
+    image_size: ImageSize,
+    device: &Device,
+) -> Result<Option<(Tensor, Tensor)>> {
+    let Some(points) = prompt.points.as_ref() else {
+        return Ok(None);
+    };
+    let mut coords = Vec::with_capacity(points.len() * 2);
+    for (x, y) in points {
+        coords.push(x.clamp(0.0, 1.0) * image_size.width as f32);
+        coords.push(y.clamp(0.0, 1.0) * image_size.height as f32);
+    }
+    let labels = prompt
+        .point_labels
+        .as_ref()
+        .ok_or_else(|| candle::Error::Msg("tracker point prompts require point labels".to_owned()))?
+        .iter()
+        .map(|label| *label as f32)
+        .collect::<Vec<_>>();
+    Ok(Some((
+        Tensor::from_vec(coords, (1, points.len(), 2), device)?,
+        Tensor::from_vec(labels, (1, points.len()), device)?,
+    )))
+}
+
+fn session_prompt_to_tracker_box(
+    prompt: &SessionPrompt,
+    image_size: ImageSize,
+    device: &Device,
+) -> Result<Option<Tensor>> {
+    let Some(boxes) = prompt.boxes.as_ref() else {
+        return Ok(None);
+    };
+    if boxes.is_empty() {
+        return Ok(None);
+    }
+    let mut x0 = f32::INFINITY;
+    let mut y0 = f32::INFINITY;
+    let mut x1 = f32::NEG_INFINITY;
+    let mut y1 = f32::NEG_INFINITY;
+    for (cx, cy, width, height) in boxes {
+        let half_w = width * 0.5;
+        let half_h = height * 0.5;
+        x0 = x0.min((cx - half_w).clamp(0.0, 1.0) * image_size.width as f32);
+        y0 = y0.min((cy - half_h).clamp(0.0, 1.0) * image_size.height as f32);
+        x1 = x1.max((cx + half_w).clamp(0.0, 1.0) * image_size.width as f32);
+        y1 = y1.max((cy + half_h).clamp(0.0, 1.0) * image_size.height as f32);
+    }
+    Tensor::from_vec(vec![x0, y0, x1, y1], (1, 4), device).map(Some)
+}
+
+fn mask_to_normalized_xyxy(mask: &Tensor) -> Result<Tensor> {
+    let mask = match mask.rank() {
+        4 => mask.i((0, 0))?,
+        3 => mask.i(0)?,
+        2 => mask.clone(),
+        rank => candle::bail!("expected mask rank 2, 3, or 4, got {}", rank),
+    };
+    let values = mask.gt(0f32)?.to_vec2::<u8>()?;
+    if values.is_empty() || values[0].is_empty() {
+        return Tensor::zeros((1, 4), DType::F32, mask.device());
+    }
+    let height = values.len();
+    let width = values[0].len();
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    let mut any = false;
+    for (y, row) in values.iter().enumerate() {
+        for (x, value) in row.iter().enumerate() {
+            if *value != 0 {
+                any = true;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    if !any {
+        return Tensor::zeros((1, 4), DType::F32, mask.device());
+    }
+    Tensor::from_vec(
+        vec![
+            min_x as f32 / width.max(1) as f32,
+            min_y as f32 / height.max(1) as f32,
+            (max_x + 1) as f32 / width.max(1) as f32,
+            (max_y + 1) as f32 / height.max(1) as f32,
+        ],
+        (1, 4),
+        mask.device(),
+    )
+}
+
+fn tracker_state_to_object_output(
+    obj_id: u32,
+    state: &TrackerFrameState,
+    prompt_frame_idx: Option<usize>,
+    memory_frame_indices: Vec<usize>,
+    text_prompt: Option<String>,
+    used_explicit_geometry: bool,
+    reused_previous_output: bool,
+) -> Result<ObjectFrameOutput> {
+    Ok(ObjectFrameOutput {
+        obj_id,
+        mask_logits: state.high_res_masks.clone(),
+        masks: candle_nn::ops::sigmoid(&state.high_res_masks)?,
+        boxes_xyxy: mask_to_normalized_xyxy(&state.high_res_masks)?,
+        scores: state.iou_scores.clone(),
+        presence_scores: Some(candle_nn::ops::sigmoid(&state.object_score_logits)?),
+        prompt_frame_idx,
+        memory_frame_indices,
+        text_prompt,
+        used_explicit_geometry,
+        reused_previous_output,
+    })
 }
 
 fn build_processing_order(

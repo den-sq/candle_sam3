@@ -24,6 +24,7 @@ pub struct VideoMode {
 
 pub fn run_video_prediction(
     model: &sam3::Sam3ImageModel,
+    tracker: &sam3::Sam3TrackerModel,
     video_mode: &VideoMode,
     output_dir: &Path,
     device: &Device,
@@ -40,7 +41,9 @@ pub fn run_video_prediction(
         max_feature_cache_entries: video_mode.max_feature_cache_entries,
     };
 
-    let mut predictor = sam3::Sam3VideoPredictor::new(model, device);
+    let mut predictor = sam3::Sam3VideoPredictor::new(model, device).with_backend(Box::new(
+        sam3::Sam3MemoryAttentionVideoTrackerBackend::new(tracker),
+    ));
     let session_id = predictor.start_session(source, session_options)?;
     let num_frames = predictor.session_frame_count(&session_id)?;
     println!("Created video session {session_id} with {num_frames} frames");
