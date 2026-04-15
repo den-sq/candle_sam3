@@ -49,11 +49,12 @@ struct Args {
     #[arg(long)]
     parity_bundle: Option<String>,
 
-    /// Optional upstream exact reference bundle used for output-level comparison against Candle preprocessing.
+    /// Optional upstream exact or interactive reference bundle used for comparison against Candle outputs.
     #[arg(long)]
     compare_reference_bundle: Option<String>,
 
     /// Optional upstream interactive replay reference bundle used for step-by-step click replay comparison.
+    /// Legacy alias for `--compare-reference-bundle` with an interactive bundle.
     #[arg(long)]
     compare_interactive_reference: Option<String>,
 
@@ -894,10 +895,13 @@ fn save_render_outputs(
     render_style: RenderStyle,
 ) -> Result<SelectedPrediction> {
     std::fs::create_dir_all(output_dir)?;
+    let base = load_render_image(image_path)?;
     let mut overlay = load_render_image(image_path)?;
     let mut prediction_overlay = load_render_image(image_path)?;
     let render_width = overlay.width() as usize;
     let render_height = overlay.height() as usize;
+    let base_path = output_dir.join("base.png");
+    base.save(&base_path)?;
     draw_prompt_annotations(
         &mut overlay,
         input_points,
@@ -1121,6 +1125,225 @@ fn save_render_outputs(
         mask_one_minus_sigmoid_path.display()
     );
     println!("  summary: {}", summary_path.display());
+    Ok(SelectedPrediction {
+        best_idx,
+        best_score,
+        best_box_xyxy: best_box,
+        mask_probs: best_mask_probs,
+    })
+}
+
+fn save_render_outputs_from_xyxy_tensors(
+    image_path: &str,
+    image_size: usize,
+    output_dir: &Path,
+    prompt_label: &str,
+    pred_boxes_xyxy: &Tensor,
+    mask_logits: &Tensor,
+    scores: &Tensor,
+    input_points: &[PointArg],
+    input_point_labels: &[u32],
+    input_boxes: &[BoxArg],
+    input_box_labels: &[u32],
+    render_style: RenderStyle,
+) -> Result<SelectedPrediction> {
+    std::fs::create_dir_all(output_dir)?;
+    let base = load_render_image(image_path)?;
+    let mut overlay = load_render_image(image_path)?;
+    let mut prediction_overlay = load_render_image(image_path)?;
+    let render_width = overlay.width() as usize;
+    let render_height = overlay.height() as usize;
+    let base_path = output_dir.join("base.png");
+    base.save(&base_path)?;
+    draw_prompt_annotations(
+        &mut overlay,
+        input_points,
+        input_point_labels,
+        input_boxes,
+        input_box_labels,
+        render_style,
+    );
+    if matches!(render_style, RenderStyle::Combined) {
+        draw_prompt_annotations(
+            &mut prediction_overlay,
+            input_points,
+            input_point_labels,
+            input_boxes,
+            input_box_labels,
+            render_style,
+        );
+    }
+
+    let selected = select_prediction_from_xyxy_tensors(
+        image_path,
+        image_size,
+        pred_boxes_xyxy,
+        mask_logits,
+        scores,
+    )?;
+    let best_idx = selected.best_idx;
+    let best_score = selected.best_score;
+    let best_box = selected.best_box_xyxy.clone();
+    draw_hollow_rect_mut(
+        &mut prediction_overlay,
+        normalized_box_to_rect(
+            [best_box[0], best_box[1], best_box[2], best_box[3]],
+            render_width,
+            render_height,
+        ),
+        Rgba([56, 201, 84, 255]),
+    );
+
+    let best_mask_probs = selected.mask_probs;
+    let inverted_mask_probs = best_mask_probs
+        .iter()
+        .map(|row| row.iter().map(|prob| 1.0f32 - prob).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let mask = blend_mask(&mut prediction_overlay, &best_mask_probs, [56, 201, 84])?;
+
+    let mut prediction_overlay_all_kept = load_render_image(image_path)?;
+    let kept = kept_queries(scores, DEFAULT_CONFIDENCE_THRESHOLD)?;
+    let pred_boxes = pred_boxes_xyxy.to_vec3::<f32>()?;
+    let mut kept_queries_debug = Vec::with_capacity(kept.len());
+    for (rank, (query_idx, query_score)) in kept.iter().enumerate() {
+        let box_xyxy = pred_boxes[0][*query_idx].clone();
+        kept_queries_debug.push(json!({
+            "rank": rank,
+            "query_index": query_idx,
+            "score": query_score,
+            "box_xyxy_normalized": box_xyxy,
+        }));
+        let query_mask_probs = upsample_mask_probs_to_render(
+            &mask_logits.i((0, *query_idx))?,
+            image_size,
+            image_path,
+        )?;
+        let color = palette_color(rank);
+        blend_mask_with_threshold(
+            &mut prediction_overlay_all_kept,
+            &query_mask_probs,
+            color,
+            0.5,
+        );
+        draw_hollow_rect_mut(
+            &mut prediction_overlay_all_kept,
+            normalized_box_to_rect(
+                [box_xyxy[0], box_xyxy[1], box_xyxy[2], box_xyxy[3]],
+                render_width,
+                render_height,
+            ),
+            Rgba([color[0], color[1], color[2], 255]),
+        );
+    }
+
+    if matches!(render_style, RenderStyle::Combined) {
+        overlay = prediction_overlay.clone();
+    }
+
+    let overlay_path = output_dir.join("overlay.png");
+    let prediction_overlay_path = output_dir.join("prediction_overlay.png");
+    let prediction_overlay_all_kept_path = output_dir.join("prediction_overlay_all_kept.png");
+    let mask_path = output_dir.join("mask.png");
+    let mask_sigmoid_path = output_dir.join("mask_sigmoid.png");
+    let mask_one_minus_sigmoid_path = output_dir.join("mask_one_minus_sigmoid.png");
+    overlay.save(&overlay_path)?;
+    prediction_overlay.save(&prediction_overlay_path)?;
+    prediction_overlay_all_kept.save(&prediction_overlay_all_kept_path)?;
+    mask.save(&mask_path)?;
+    mask_probs_to_gray_image(&best_mask_probs).save(&mask_sigmoid_path)?;
+    mask_probs_to_gray_image(&inverted_mask_probs).save(&mask_one_minus_sigmoid_path)?;
+
+    let thresholds = [0.5f32];
+    let mut debug_masks = Vec::new();
+    for threshold in thresholds {
+        let suffix = format!("{:.1}", threshold).replace('.', "_");
+        let sigmoid_threshold_mask_path =
+            output_dir.join(format!("mask_sigmoid_threshold_{suffix}.png"));
+        let one_minus_sigmoid_threshold_mask_path =
+            output_dir.join(format!("mask_one_minus_sigmoid_threshold_{suffix}.png"));
+        let sigmoid_overlay_path =
+            output_dir.join(format!("prediction_overlay_sigmoid_threshold_{suffix}.png"));
+        let one_minus_sigmoid_overlay_path = output_dir.join(format!(
+            "prediction_overlay_one_minus_sigmoid_threshold_{suffix}.png"
+        ));
+
+        threshold_mask(&best_mask_probs, threshold).save(&sigmoid_threshold_mask_path)?;
+        threshold_mask(&inverted_mask_probs, threshold)
+            .save(&one_minus_sigmoid_threshold_mask_path)?;
+
+        let mut sigmoid_overlay = load_render_image(image_path)?;
+        draw_hollow_rect_mut(
+            &mut sigmoid_overlay,
+            normalized_box_to_rect(
+                [best_box[0], best_box[1], best_box[2], best_box[3]],
+                render_width,
+                render_height,
+            ),
+            Rgba([56, 201, 84, 255]),
+        );
+        blend_mask_with_threshold(
+            &mut sigmoid_overlay,
+            &best_mask_probs,
+            [56, 201, 84],
+            threshold,
+        );
+        sigmoid_overlay.save(&sigmoid_overlay_path)?;
+
+        let mut one_minus_sigmoid_overlay = load_render_image(image_path)?;
+        draw_hollow_rect_mut(
+            &mut one_minus_sigmoid_overlay,
+            normalized_box_to_rect(
+                [best_box[0], best_box[1], best_box[2], best_box[3]],
+                render_width,
+                render_height,
+            ),
+            Rgba([56, 201, 84, 255]),
+        );
+        blend_mask_with_threshold(
+            &mut one_minus_sigmoid_overlay,
+            &inverted_mask_probs,
+            [56, 201, 84],
+            threshold,
+        );
+        one_minus_sigmoid_overlay.save(&one_minus_sigmoid_overlay_path)?;
+
+        debug_masks.push(json!({
+            "threshold": threshold,
+            "mask_sigmoid_threshold_path": sigmoid_threshold_mask_path.display().to_string(),
+            "mask_one_minus_sigmoid_threshold_path": one_minus_sigmoid_threshold_mask_path.display().to_string(),
+            "prediction_overlay_sigmoid_threshold_path": sigmoid_overlay_path.display().to_string(),
+            "prediction_overlay_one_minus_sigmoid_threshold_path": one_minus_sigmoid_overlay_path.display().to_string(),
+        }));
+    }
+
+    let summary = json!({
+        "prompt_label": prompt_label,
+        "render_image_size": {
+            "width": render_width,
+            "height": render_height,
+        },
+        "preprocess_mode": "exact",
+        "model_input_size": image_size,
+        "best_query_index": best_idx,
+        "best_score": best_score,
+        "best_box_xyxy_normalized": best_box,
+        "kept_queries_debug": serde_json::Value::Array(kept_queries_debug),
+        "input_points_xy_normalized": input_points.iter().map(|point| vec![point.x, point.y]).collect::<Vec<_>>(),
+        "input_point_labels": input_point_labels,
+        "input_boxes_cxcywh_normalized": input_boxes.iter().map(|bbox| vec![bbox.cx, bbox.cy, bbox.w, bbox.h]).collect::<Vec<_>>(),
+        "input_box_labels": input_box_labels,
+        "base_path": base_path.display().to_string(),
+        "overlay_path": overlay_path.display().to_string(),
+        "prediction_overlay_path": prediction_overlay_path.display().to_string(),
+        "prediction_overlay_all_kept_path": prediction_overlay_all_kept_path.display().to_string(),
+        "mask_path": mask_path.display().to_string(),
+        "mask_sigmoid_path": mask_sigmoid_path.display().to_string(),
+        "mask_one_minus_sigmoid_path": mask_one_minus_sigmoid_path.display().to_string(),
+        "debug_masks": debug_masks,
+    });
+    let summary_path = output_dir.join("summary.json");
+    std::fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)?;
+
     Ok(SelectedPrediction {
         best_idx,
         best_score,
@@ -2210,10 +2433,13 @@ pub fn main() -> anyhow::Result<()> {
             || !args.points.is_empty()
             || !args.boxes.is_empty()
             || args.batch_manifest.is_some()
-            || args.image_predictor_example)
+            || args.image_predictor_example
+            || args.interactive.is_some()
+            || args.interactive_script.is_some()
+            || args.video.is_some())
     {
         bail!(
-            "`--compare-reference-bundle` derives image/prompt inputs from the exported bundle; omit `--image`, `--prompt`, `--tokenizer`, `--point`, `--box`, `--batch-manifest`, and `--image-predictor-example`"
+            "`--compare-reference-bundle` derives image, prompt, and replay inputs from the exported bundle; omit `--image`, `--prompt`, `--tokenizer`, `--point`, `--box`, `--batch-manifest`, `--image-predictor-example`, `--interactive`, `--interactive-script`, and `--video`"
         )
     }
     if args.compare_interactive_reference.is_some()
@@ -2287,14 +2513,26 @@ pub fn main() -> anyhow::Result<()> {
     }
 
     if let Some(bundle_path) = args.compare_reference_bundle.as_deref() {
-        run_reference_comparison(
-            model
-                .as_ref()
-                .context("SAM3 reference comparison mode requires `--checkpoint <sam3.pt>`")?,
-            bundle_path,
-            Path::new(&args.output_dir),
-            &device,
-        )?;
+        if interactive_compare::is_interactive_reference_bundle(Path::new(bundle_path))? {
+            interactive_compare::run_interactive_reference_comparison(
+                model.as_ref().context(
+                    "SAM3 interactive reference comparison mode requires `--checkpoint <sam3.pt>`",
+                )?,
+                bundle_path,
+                Path::new(&args.output_dir),
+                &device,
+                args.parity_atol,
+            )?;
+        } else {
+            run_reference_comparison(
+                model
+                    .as_ref()
+                    .context("SAM3 reference comparison mode requires `--checkpoint <sam3.pt>`")?,
+                bundle_path,
+                Path::new(&args.output_dir),
+                &device,
+            )?;
+        }
         return Ok(());
     }
 

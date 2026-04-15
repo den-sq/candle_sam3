@@ -10,11 +10,9 @@ This example now runs the implemented SAM3 image pipeline end to end:
 6. tokenize and encode the text prompt
 7. run the ViTDet trunk, FPN neck, fusion encoder, DETR decoder, and segmentation head
 8. render the best predicted box and mask to disk
-9. repeat the same sample with both `exact` and `crop_fill` preprocessing
 
 The rendered outputs are:
 
-- `exact/` and `crop_fill/`: one subdirectory per preprocessing mode for each sample
 - `overlay.png`: rendered on the original image aspect ratio; by default this is the prediction overlay, while `--image-predictor-example` box jobs use notebook-style prompt visualization here
 - `prediction_overlay.png`: prediction overlay with the selected mask and box on the original image
 - `prediction_overlay_all_kept.png`: notebook-style overlay of all kept predictions above the confidence threshold
@@ -66,12 +64,13 @@ What is implemented in this Candle example:
 - mixed text + geometry grounding
 - sequential batch-manifest execution that mirrors the batched notebook workflow at the CLI level
 - a canned `--image-predictor-example` mode that replays the inputs from `sam3_image_predictor_example.ipynb`
-- Phase 12 scaffolding for `--interactive` image refinement and `--video` session runs
+- Phase 12 MVP for deterministic `--interactive` image refinement replays
+- Phase 12 scaffolding for `--video` session runs
 
 What is not implemented here yet:
 
 - Jupyter widget interaction
-- production-ready interactive refinement UX
+- live GUI-driven interactive refinement UX
 - true multi-frame video tracking and object propagation
 - agent / LLM integration
 
@@ -99,15 +98,19 @@ And either:
 
 ## Default image pipeline
 
-Unless `--smoke-image-size` is set, each sample is run twice against the model default image size:
+Unless `--smoke-image-size` is set, each sample is run once against the model default image size:
 
 - preprocess into a `1008x1008` model input tensor with `exact`
-- preprocess into a `1008x1008` model input tensor with `crop_fill`
 - normalize RGB with mean `[0.5, 0.5, 0.5]`
 - normalize RGB with std `[0.5, 0.5, 0.5]`
 
 `--smoke-image-size` is still available for faster CPU runs while debugging, but the
-default path now compares both preprocessing modes side by side.
+default path now stays on the parity-validated exact preprocessing path.
+
+The example commands below use the fixed notebook assets from the downloaded
+upstream reference checkout under
+`/home/dnorthover/extcode/sam3_baseline/assets/images/`. Adjust those paths if
+your checkout lives elsewhere.
 
 ## CPU Example
 
@@ -115,8 +118,8 @@ default path now compares both preprocessing modes side by side.
 cargo run -p candle-examples --example sam3 -- \
   --checkpoint /path/to/hf_sam3 \
   --tokenizer /path/to/hf_sam3 \
-  --image candle-examples/examples/wuerstchen/assets/cat.jpg \
-  --prompt "a cat" \
+  --image /home/dnorthover/extcode/sam3_baseline/assets/images/test_image.jpg \
+  --prompt "shoe" \
   --output-dir candle-examples/examples/sam3/output
 ```
 
@@ -132,8 +135,8 @@ source /opt/intel/oneapi/mkl/2025.3/env/vars.sh
 cargo run -p candle-examples --example sam3 --features mkl -- \
   --checkpoint /path/to/hf_sam3 \
   --tokenizer /path/to/hf_sam3 \
-  --image candle-examples/examples/wuerstchen/assets/cat.jpg \
-  --prompt "a cat" \
+  --image /home/dnorthover/extcode/sam3_baseline/assets/images/test_image.jpg \
+  --prompt "shoe" \
   --output-dir candle-examples/examples/sam3/output
 ```
 
@@ -146,46 +149,43 @@ oneAPI environment rather than MKL alone.
 cargo run -p candle-examples --example sam3 -- \
   --checkpoint /path/to/hf_sam3 \
   --tokenizer /path/to/hf_sam3 \
-  --image candle-examples/examples/wuerstchen/assets/cat.jpg \
-  --prompt "a cat" \
-  --box 0.5,0.5,0.45,0.45 \
+  --image /home/dnorthover/extcode/sam3_baseline/assets/images/test_image.jpg \
+  --prompt "shoe" \
+  --box 0.41796875,0.6527777778,0.0859375,0.5 \
   --output-dir candle-examples/examples/sam3/output
 ```
 
 ## CPU Geometry-Only Example
 
-This is the closest CLI equivalent to the visual-prompt sections of
-`sam3_image_predictor_example.ipynb`.
+This is the closest CLI equivalent to the point-based image-prediction sections
+of `sam3_for_sam1_task_example.ipynb`.
 
 ```bash
 cargo run -p candle-examples --example sam3 -- \
   --checkpoint /path/to/hf_sam3 \
-  --image candle-examples/examples/wuerstchen/assets/cat.jpg \
-  --box 0.48,0.53,0.72,0.78 \
-  --box-label 1 \
-  --point 0.48,0.50 \
+  --image /home/dnorthover/extcode/sam3_baseline/assets/images/truck.jpg \
+  --point 0.2888888889,0.3125 \
   --point-label 1 \
   --output-dir candle-examples/examples/sam3/output
 ```
 
 ## CPU Mixed Text + Geometry Example
 
-This matches the notebook workflow where a text prompt is refined by positive or
-negative geometric prompts.
+This uses the same `truck.jpg` point and box locations shown in
+`sam3_for_sam1_task_example.ipynb`, with an added text prompt so the CLI still
+exercises the mixed text-plus-geometry path.
 
 ```bash
 cargo run -p candle-examples --example sam3 -- \
   --checkpoint /path/to/hf_sam3 \
   --tokenizer /path/to/hf_sam3 \
-  --image candle-examples/examples/wuerstchen/assets/cat.jpg \
-  --prompt "cat" \
-  --box 0.48,0.53,0.72,0.78 \
+  --image /home/dnorthover/extcode/sam3_baseline/assets/images/truck.jpg \
+  --prompt "truck" \
+  --box 0.3125,0.6145833333,0.1527777778,0.2291666667 \
   --box-label 1 \
-  --box 0.16,0.20,0.20,0.20 \
-  --box-label 0 \
-  --point 0.48,0.50 \
+  --point 0.2888888889,0.3125 \
   --point-label 1 \
-  --point 0.12,0.15 \
+  --point 0.625,0.5208333333 \
   --point-label 0 \
   --output-dir candle-examples/examples/sam3/output
 ```
@@ -209,8 +209,7 @@ cargo run -p candle-examples --example sam3 -- \
 ```
 
 Each notebook scenario writes into its own subdirectory under the requested
-output directory, and each scenario then writes `exact/` and `crop_fill/`
-subdirectories underneath that. For the two box scenarios:
+output directory. For the two box scenarios:
 
 - `overlay.png` matches the notebook prompt-box visualization
 - `prediction_overlay.png` contains the model prediction overlay on the original image
@@ -233,7 +232,42 @@ cargo run -p candle-examples --example sam3 -- \
 ```
 
 Each manifest job writes into its own subdirectory under the requested output
-directory.
+directory. The bundled manifest assumes your upstream checkout is available at
+`../../extcode/sam3_baseline` relative to this repo root.
+
+## Interactive Replay Example
+
+This is the current CLI-first replacement for the point-refinement flow from
+`sam3_for_sam1_task_example.ipynb`. Instead of a widget loop, the Candle example
+replays a deterministic JSON script of positive and negative clicks against the
+same `truck.jpg` image used in that notebook.
+
+Use the included replay manifest:
+
+```bash
+cargo run -p candle-examples --example sam3 -- \
+  --checkpoint /path/to/hf_sam3 \
+  --interactive /home/dnorthover/extcode/sam3_baseline/assets/images/truck.jpg \
+  --interactive-script candle-examples/examples/sam3/interactive_replay.example.json \
+  --output-dir candle-examples/examples/sam3/output/interactive_replay
+```
+
+The included replay manifest uses the notebook click locations `(520,375)`,
+`(500,375)`, and `(1125,625)` converted to normalized coordinates. Because the
+CLI replay is incremental, later steps append those notebook clicks rather than
+resetting the session between calls.
+
+Each iteration writes its own subdirectory under the requested output directory:
+
+- `step_000_*/base.png`: the original image for that refinement step
+- `step_000_*/overlay.png`: prompt clicks plus the selected predicted box and mask
+- `step_000_*/mask.png`: grayscale mask for the selected prediction
+- `step_000_*/summary.json`: click history, labels, score, normalized box, and artifact paths
+- `interactive_session.json`: session-level summary for the whole replay
+
+If you also provide `--point` or `--box` with `--interactive`, those prompts are
+run first as an `initial_prompt` iteration and later replay steps append more
+clicks on top.
 
 ## CUDA Example
 
@@ -244,8 +278,8 @@ LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64:$LD_LIBRARY_PATH \
 cargo run -p candle-examples --example sam3 --features cuda -- \
   --checkpoint /path/to/hf_sam3 \
   --tokenizer /path/to/hf_sam3 \
-  --image candle-examples/examples/wuerstchen/assets/cat.jpg \
-  --prompt "a cat" \
+  --image /home/dnorthover/extcode/sam3_baseline/assets/images/test_image.jpg \
+  --prompt "shoe" \
   --output-dir candle-examples/examples/sam3/output
 ```
 
@@ -260,15 +294,13 @@ LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64:$LD_LIBRARY_PATH \
 cargo run -p candle-examples --example sam3 --features cuda -- \
   --checkpoint /path/to/hf_sam3 \
   --tokenizer /path/to/hf_sam3 \
-  --image candle-examples/examples/wuerstchen/assets/cat.jpg \
-  --prompt "cat" \
-  --box 0.48,0.53,0.72,0.78 \
+  --image /home/dnorthover/extcode/sam3_baseline/assets/images/truck.jpg \
+  --prompt "truck" \
+  --box 0.3125,0.6145833333,0.1527777778,0.2291666667 \
   --box-label 1 \
-  --box 0.16,0.20,0.20,0.20 \
-  --box-label 0 \
-  --point 0.48,0.50 \
+  --point 0.2888888889,0.3125 \
   --point-label 1 \
-  --point 0.12,0.15 \
+  --point 0.625,0.5208333333 \
   --point-label 0 \
   --output-dir candle-examples/examples/sam3/output
 ```
@@ -284,8 +316,8 @@ LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64:$LD_LIBRARY_PATH \
 cargo run -p candle-examples --example sam3 --features cuda,mkl -- \
   --checkpoint /path/to/hf_sam3 \
   --tokenizer /path/to/hf_sam3 \
-  --image candle-examples/examples/wuerstchen/assets/cat.jpg \
-  --prompt "a cat" \
+  --image /home/dnorthover/extcode/sam3_baseline/assets/images/test_image.jpg \
+  --prompt "shoe" \
   --output-dir candle-examples/examples/sam3/output
 ```
 
@@ -354,6 +386,40 @@ This writes:
 That is the true upstream parity mode. It uses the same exact square resize as
 the Python SAM3 image processor.
 
+### Export Interactive Replay Reference Bundle
+
+`export_reference.py` also supports deterministic interactive replay export via
+`--interactive-script`:
+
+```bash
+python candle-examples/examples/sam3/export_reference.py \
+  --sam3-repo /home/dnorthover/extcode/sam3_baseline \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --image /home/dnorthover/extcode/sam3_baseline/assets/images/truck.jpg \
+  --interactive-script candle-examples/examples/sam3/interactive_replay.example.json \
+  --output-dir candle-examples/examples/sam3/reference_interactive
+```
+
+This writes the same `reference.safetensors` / `reference.json` pair, but the
+metadata contains replay `steps` and the tensor bundle contains per-step:
+
+- `step.N.geometry.features`
+- `step.N.geometry.padding_mask`
+- `step.N.fusion.memory`
+- `step.N.decoder.pred_logits`
+- `step.N.decoder.pred_boxes_xyxy`
+- `step.N.segmentation.mask_logits`
+- optional `step.N.decoder.presence_logits`
+
+It also writes rendered artifacts for each replay step under:
+
+- `step_000_<name>/base.png`
+- `step_000_<name>/overlay.png`
+- `step_000_<name>/prediction_overlay.png`
+- `step_000_<name>/prediction_overlay_all_kept.png`
+- `step_000_<name>/mask.png`
+- `step_000_<name>/summary.json`
+
 ### Export `shoe` Text Reference Bundle
 
 This matches the text-prompt part of `sam3_image_predictor_example.ipynb`.
@@ -366,36 +432,6 @@ python candle-examples/examples/sam3/export_reference.py \
   --prompt "shoe" \
   --output-dir candle-examples/examples/sam3/reference_shoe
 ```
-
-### Export Diagnostic Crop-Fill Same-Input Bundle
-
-If you want to compare Candle's non-upstream `crop_fill` example mode against a
-matching Python-side bundle, export it explicitly:
-
-```bash
-python candle-examples/examples/sam3/export_reference.py \
-  --sam3-repo /home/dnorthover/extcode/sam3_baseline \
-  --checkpoint /home/dnorthover/extcode/hf_sam3 \
-  --image /home/dnorthover/extcode/sam3_baseline/assets/images/test_image.jpg \
-  --box 0.41796875,0.6527777778,0.0859375,0.5 \
-  --box-label 1 \
-  --preprocess-mode crop_fill \
-  --output-dir candle-examples/examples/sam3/reference_crop_fill
-```
-
-In this mode, the exporter:
-
-- preprocesses the image with `crop_fill`
-- remaps box prompts into crop-space before encoding
-- writes those remapped model-space boxes into the bundle
-
-This is a local diagnostic mode for the Candle example, not the upstream SAM3
-preprocessing contract. It is useful for same-input tensor checks, but not for
-comparing Candle `crop_fill` preprocessing against upstream exact preprocessing.
-The exporter also writes `overlay.png`, `prediction_overlay.png`, and `mask.png`
-for the selected upstream prediction in that output directory, plus
-`prediction_overlay_all_kept.png` which follows the upstream notebook style more
-closely by rendering all kept masks and boxes above the confidence threshold.
 
 ### Export Exact Positive/Negative Box Parity Bundles
 
@@ -427,37 +463,6 @@ python candle-examples/examples/sam3/export_reference.py \
   --output-dir candle-examples/examples/sam3/reference_box_negative
 ```
 
-### Export Crop-Fill Positive/Negative Box Parity Bundles
-
-These use the same box-conditioned checks, but preprocess the image with the
-example's non-upstream `crop_fill` mode before exporting the bundle.
-
-Positive box:
-
-```bash
-python candle-examples/examples/sam3/export_reference.py \
-  --sam3-repo /home/dnorthover/extcode/sam3_baseline \
-  --checkpoint /home/dnorthover/extcode/hf_sam3 \
-  --image /home/dnorthover/extcode/sam3_baseline/assets/images/test_image.jpg \
-  --box 0.41796875,0.6527777778,0.0859375,0.5 \
-  --box-label 1 \
-  --preprocess-mode crop_fill \
-  --output-dir candle-examples/examples/sam3/reference_crop_fill_box_positive
-```
-
-Negative box:
-
-```bash
-python candle-examples/examples/sam3/export_reference.py \
-  --sam3-repo /home/dnorthover/extcode/sam3_baseline \
-  --checkpoint /home/dnorthover/extcode/hf_sam3 \
-  --image /home/dnorthover/extcode/sam3_baseline/assets/images/test_image.jpg \
-  --box 0.41796875,0.6527777778,0.0859375,0.5 \
-  --box-label 0 \
-  --preprocess-mode crop_fill \
-  --output-dir candle-examples/examples/sam3/reference_crop_fill_box_negative
-```
-
 ### Run Rust Parity Check
 
 ```bash
@@ -467,27 +472,13 @@ cargo run -p candle-examples --example sam3 -- \
   --output-dir candle-examples/examples/sam3/output
 ```
 
-The same command works with a diagnostic crop-fill same-input bundle too:
-
-```bash
-cargo run -p candle-examples --example sam3 -- \
-  --checkpoint /home/dnorthover/extcode/hf_sam3 \
-  --parity-bundle candle-examples/examples/sam3/reference_crop_fill \
-  --output-dir candle-examples/examples/sam3/output_crop_fill
-```
-
 ## Reference Comparison Mode
 
-If your goal is to compare Candle's own preprocessing path against the upstream
-exact baseline, do not use `--parity-bundle` with a crop-fill reference bundle.
-That only compares both models on the same preprocessed tensor.
-
-Instead:
+Reference bundle export and comparison are exact-only:
 
 1. export the normal upstream exact bundle
 2. run `--compare-reference-bundle` against that exact bundle
-3. let Candle run both `exact` and `crop_fill` itself
-4. compare final boxes, scores, and masks in the generated report
+3. compare final boxes, scores, and masks in the generated report
 
 Using the single-positive-box notebook case as the reference:
 
@@ -500,8 +491,7 @@ cargo run -p candle-examples --example sam3 --release -- \
 
 This writes:
 
-- `candle-examples/examples/sam3/output/reference_compare/exact/`
-- `candle-examples/examples/sam3/output/reference_compare/crop_fill/`
+- `candle-examples/examples/sam3/output/reference_compare/`
 - `candle-examples/examples/sam3/output/reference_compare/reference_comparison_report.json`
 
 The comparison report is output-level, not hidden-state parity. It includes:
@@ -515,13 +505,8 @@ The comparison report is output-level, not hidden-state parity. It includes:
 - Candle `prediction_overlay.png` vs reference `prediction_overlay_all_kept.png` mean absolute difference
 - Candle `prediction_overlay.png` vs reference `prediction_overlay_all_kept.png` RMSE
 
-For `crop_fill`, these evaluation metrics ignore anything outside the visible
-crop window in the original image. Box metrics are computed on boxes clipped to
-that crop region, and mask/image metrics ignore pixels outside it.
-
 You can run the same comparison mode against the explicit positive/negative box
-reference bundles too. This is the correct way to compare Candle's own
-`crop_fill` preprocessing against the upstream exact baseline for those cases.
+reference bundles too.
 
 Positive box reference comparison:
 
@@ -541,11 +526,7 @@ cargo run -p candle-examples --example sam3 --release -- \
   --output-dir candle-examples/examples/sam3/output/reference_compare_box_negative
 ```
 
-Each run writes both:
-
-- `exact/`
-- `crop_fill/`
-
+Each run writes render outputs directly into the requested output directory,
 plus a top-level `reference_comparison_report.json` for that case.
 
 You can do the same for the `shoe` text example:
@@ -556,6 +537,29 @@ cargo run -p candle-examples --example sam3 --release -- \
   --compare-reference-bundle candle-examples/examples/sam3/reference_shoe \
   --output-dir candle-examples/examples/sam3/output/reference_compare_shoe
 ```
+
+Interactive replay bundles exported by `export_reference.py --interactive-script`
+can be compared through the same flag. The CLI auto-detects the replay bundle
+and runs the step-by-step interactive comparison across the full replay script
+before returning failure:
+
+```bash
+cargo run -p candle-examples --example sam3 --release -- \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --compare-reference-bundle candle-examples/examples/sam3/reference_interactive \
+  --output-dir candle-examples/examples/sam3/output/reference_compare_interactive
+```
+
+That writes:
+
+- `candle-examples/examples/sam3/output/reference_compare_interactive/interactive_comparison_report.json`
+- `candle-examples/examples/sam3/output/reference_compare_interactive/step_000_<name>/...`
+- `candle-examples/examples/sam3/output/reference_compare_interactive/step_001_<name>/...`
+- `candle-examples/examples/sam3/output/reference_compare_interactive/step_002_<name>/...`
+
+The interactive report includes per-step stage diffs plus final score / box /
+mask comparison metrics for each replay step, and Candle also saves rendered
+per-step masks and masked-image overlays in the output directory.
 
 For the box-conditioned geometry checks above, run parity like this.
 
@@ -576,26 +580,6 @@ cargo run -p candle-examples --example sam3 --release -- \
   --checkpoint /home/dnorthover/extcode/hf_sam3 \
   --parity-bundle candle-examples/examples/sam3/reference_box_negative \
   --output-dir candle-examples/examples/sam3/output/parity_box_negative \
-  --cpu
-```
-
-Crop-fill positive:
-
-```bash
-cargo run -p candle-examples --example sam3 --release -- \
-  --checkpoint /home/dnorthover/extcode/hf_sam3 \
-  --parity-bundle candle-examples/examples/sam3/reference_crop_fill_box_positive \
-  --output-dir candle-examples/examples/sam3/output/parity_crop_fill_box_positive \
-  --cpu
-```
-
-Crop-fill negative:
-
-```bash
-cargo run -p candle-examples --example sam3 --release -- \
-  --checkpoint /home/dnorthover/extcode/hf_sam3 \
-  --parity-bundle candle-examples/examples/sam3/reference_crop_fill_box_negative \
-  --output-dir candle-examples/examples/sam3/output/parity_crop_fill_box_negative \
   --cpu
 ```
 

@@ -43,6 +43,11 @@ def parse_args():
     parser.add_argument("--image", required=True, help="Input image path.")
     parser.add_argument("--prompt", default=None, help="Optional text prompt to encode.")
     parser.add_argument(
+        "--interactive-script",
+        default=None,
+        help="Optional JSON replay manifest with interactive point clicks to export step-by-step interactive reference outputs.",
+    )
+    parser.add_argument(
         "--box",
         action="append",
         default=[],
@@ -128,6 +133,45 @@ def build_preprocessed_image(v2, image_tensor, image_size: int):
     return image.unsqueeze(0)
 
 
+def default_positive_label():
+    return 1
+
+
+def load_interactive_script(path: Path):
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(raw, list):
+        steps = raw
+    else:
+        steps = raw.get("steps", [])
+    if not steps:
+        raise ValueError(f"interactive replay script {path} does not contain any steps")
+
+    parsed_steps = []
+    accumulated_points = []
+    accumulated_labels = []
+    for idx, step in enumerate(steps):
+        points = step.get("points", [])
+        if not points:
+            raise ValueError(f"interactive replay step {idx} does not contain any points")
+        step_points = []
+        step_labels = []
+        for point in points:
+            step_points.append([float(point["x"]), float(point["y"])])
+            step_labels.append(int(point.get("label", default_positive_label())))
+        accumulated_points.extend(step_points)
+        accumulated_labels.extend(step_labels)
+        parsed_steps.append(
+            {
+                "name": step.get("name"),
+                "step_points_xy_normalized": step_points,
+                "step_point_labels": step_labels,
+                "accumulated_points_xy_normalized": [list(point) for point in accumulated_points],
+                "accumulated_point_labels": list(accumulated_labels),
+            }
+        )
+    return parsed_steps
+
+
 def normalized_box_to_pixels(box_xyxy, width, height):
     x0 = round(max(0.0, min(1.0, box_xyxy[0])) * max(width - 1, 0))
     y0 = round(max(0.0, min(1.0, box_xyxy[1])) * max(height - 1, 0))
@@ -136,19 +180,43 @@ def normalized_box_to_pixels(box_xyxy, width, height):
     return [x0, y0, x1, y1]
 
 
-def draw_prompt_annotations(image, boxes, box_labels):
+def prompt_color(label):
+    return (59, 130, 246, 255) if label else (239, 68, 68, 255)
+
+
+def draw_prompt_annotations(
+    image,
+    boxes=None,
+    box_labels=None,
+    points=None,
+    point_labels=None,
+):
     from PIL import ImageDraw
 
     draw = ImageDraw.Draw(image)
     width, height = image.size
+    boxes = boxes or []
+    box_labels = box_labels or []
+    points = points or []
+    point_labels = point_labels or []
     for box, label in zip(boxes, box_labels):
         x0, y0, x1, y1 = normalized_box_to_pixels(
             [box[0] - box[2] * 0.5, box[1] - box[3] * 0.5, box[0] + box[2] * 0.5, box[1] + box[3] * 0.5],
             width,
             height,
         )
-        color = (59, 130, 246, 255) if label else (239, 68, 68, 255)
+        color = prompt_color(label)
         draw.rectangle([x0, y0, x1, y1], outline=color, width=3)
+    radius = 5
+    for point, label in zip(points, point_labels):
+        px = round(max(0.0, min(1.0, point[0])) * max(width - 1, 0))
+        py = round(max(0.0, min(1.0, point[1])) * max(height - 1, 0))
+        color = prompt_color(label)
+        draw.ellipse(
+            [px - radius, py - radius, px + radius, py + radius],
+            fill=color,
+            outline=color,
+        )
 
 
 def palette_color(index):
@@ -232,16 +300,139 @@ def draw_prediction_box(image, box_xyxy, color, score=None, index=None):
         draw.text((x0, max(0, y0 - 12)), ", ".join(label_parts), fill=tuple(color) + (255,))
 
 
+def sanitize_step_name(step_name):
+    sanitized = "".join(
+        ch.lower() if ch.isalnum() else "_" for ch in step_name
+    ).strip("_")
+    return sanitized or "step"
+
+
+def interactive_step_dir(output_dir, step_idx, step_name):
+    return output_dir / f"step_{step_idx:03d}_{sanitize_step_name(step_name)}"
+
+
+def render_interactive_reference_step(
+    image,
+    output_dir,
+    step_idx,
+    step_name,
+    script_step_index,
+    image_size,
+    pred_logits,
+    pred_boxes_xyxy,
+    pred_masks,
+    accumulated_points,
+    accumulated_point_labels,
+):
+    step_dir = interactive_step_dir(output_dir, step_idx, step_name)
+    step_dir.mkdir(parents=True, exist_ok=True)
+
+    base = image.convert("RGBA")
+    base_path = step_dir / "base.png"
+    base.save(base_path)
+
+    score_tensor = torch.sigmoid(pred_logits)
+    best_idx, best_score = best_kept_query(score_tensor, threshold=0.5)
+    kept_scores = score_tensor[0, :, 0].detach().cpu()
+    kept_indices = (kept_scores > 0.5).nonzero(as_tuple=False).flatten().tolist()
+    best_box = pred_boxes_xyxy[0, best_idx].detach().cpu().tolist()
+
+    restored_mask, raw_mask_probs = upsample_mask_to_original(
+        pred_masks[0, best_idx], image_size, (image.height, image.width)
+    )
+    prediction_overlay = blend_mask_on_image(base.copy(), restored_mask)
+    draw_prediction_box(
+        prediction_overlay,
+        best_box,
+        (56, 201, 84),
+        score=float(best_score),
+        index=int(best_idx),
+    )
+
+    overlay = prediction_overlay.copy()
+    draw_prompt_annotations(
+        overlay,
+        points=accumulated_points,
+        point_labels=accumulated_point_labels,
+    )
+
+    all_kept_overlay = base.copy()
+    kept_queries_debug = []
+    for rank, kept_idx in enumerate(kept_indices):
+        kept_box = pred_boxes_xyxy[0, kept_idx].detach().cpu().tolist()
+        kept_mask, _ = upsample_mask_to_original(
+            pred_masks[0, kept_idx], image_size, (image.height, image.width)
+        )
+        color = palette_color(rank)
+        all_kept_overlay = blend_mask_on_image(all_kept_overlay, kept_mask, color=color)
+        draw_prediction_box(
+            all_kept_overlay,
+            kept_box,
+            color,
+            score=float(kept_scores[kept_idx].item()),
+            index=rank,
+        )
+        kept_queries_debug.append(
+            {
+                "rank": rank,
+                "query_index": int(kept_idx),
+                "score": float(kept_scores[kept_idx].item()),
+                "box_xyxy_normalized": kept_box,
+            }
+        )
+
+    mask_path = step_dir / "mask.png"
+    overlay_path = step_dir / "overlay.png"
+    prediction_overlay_path = step_dir / "prediction_overlay.png"
+    prediction_overlay_all_kept_path = step_dir / "prediction_overlay_all_kept.png"
+    restored_mask.save(mask_path)
+    overlay.save(overlay_path)
+    prediction_overlay.save(prediction_overlay_path)
+    all_kept_overlay.save(prediction_overlay_all_kept_path)
+
+    summary = {
+        "iteration_index": step_idx,
+        "step_name": step_name,
+        "script_step_index": script_step_index,
+        "best_query_index": int(best_idx),
+        "best_score": float(best_score),
+        "best_box_xyxy_normalized": best_box,
+        "accumulated_points_xy_normalized": accumulated_points,
+        "accumulated_point_labels": accumulated_point_labels,
+        "render_image_size": {"width": image.width, "height": image.height},
+        "base_path": str(base_path),
+        "overlay_path": str(overlay_path),
+        "prediction_overlay_path": str(prediction_overlay_path),
+        "prediction_overlay_all_kept_path": str(prediction_overlay_all_kept_path),
+        "mask_path": str(mask_path),
+        "kept_queries_debug": kept_queries_debug,
+        "mask_mean_probability": float(raw_mask_probs.mean()),
+    }
+    (step_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return summary
+
+
 def main():
     args = parse_args()
     if args.box_label and len(args.box_label) != len(args.box):
         raise ValueError(
             f"--box-label count ({len(args.box_label)}) must match --box count ({len(args.box)})"
         )
-    if args.prompt is None and not args.box:
-        raise ValueError("provide --prompt, --box, or both")
-    effective_prompt = args.prompt
-    if effective_prompt is None and args.box:
+    if args.interactive_script is None:
+        if args.prompt is None and not args.box:
+            raise ValueError("provide --prompt, --box, or both")
+        effective_prompt = args.prompt
+        if effective_prompt is None and args.box:
+            effective_prompt = "visual"
+    else:
+        if args.prompt is not None or args.box or args.box_label:
+            raise ValueError(
+                "`--interactive-script` currently derives the prompt flow internally; do not combine it with `--prompt`, `--box`, or `--box-label`"
+            )
+        if args.vision_only:
+            raise ValueError("`--interactive-script` cannot be combined with `--vision-only`")
+        if args.debug_block:
+            raise ValueError("`--interactive-script` cannot be combined with `--debug-block`")
         effective_prompt = "visual"
 
     sam3_package_dir = resolve_sam3_package_dir(Path(args.sam3_repo))
@@ -265,6 +456,11 @@ def main():
         Path(args.bpe_path).expanduser().resolve()
         if args.bpe_path is not None
         else sam3_package_dir / "assets" / "bpe_simple_vocab_16e6.txt.gz"
+    )
+    script_path = (
+        Path(args.interactive_script).expanduser().resolve()
+        if args.interactive_script is not None
+        else None
     )
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -441,6 +637,130 @@ def main():
         device=str(device),
         confidence_threshold=0.5,
     )
+
+    if script_path is not None:
+        replay_steps = load_interactive_script(script_path)
+        rendered_steps = []
+        with torch.inference_mode():
+            image_tensor = v2.functional.to_image(image).to(device)
+            preprocessed_image = build_preprocessed_image(v2, image_tensor, args.image_size)
+            backbone_out = model.backbone.forward_image(preprocessed_image)
+            text_outputs = model.backbone.forward_text([effective_prompt], device=device)
+            backbone_out.update(text_outputs)
+            base_backbone_out = backbone_out
+            find_input = processor.find_stage
+            geometric_prompt = model._get_dummy_prompt()
+
+            tensors = {"inputs.image": to_cpu_contiguous(preprocessed_image)}
+            for step_idx, step in enumerate(replay_steps):
+                print(
+                    f"[interactive-export] step {step_idx + 1}/{len(replay_steps)} "
+                    f"({step.get('name') or f'step_{step_idx:02}'})",
+                    flush=True,
+                )
+                for point, label in zip(
+                    step["step_points_xy_normalized"], step["step_point_labels"]
+                ):
+                    points = torch.tensor(point, device=device, dtype=torch.float32).view(1, 1, 2)
+                    labels = torch.tensor([label], device=device, dtype=torch.long).view(1, 1)
+                    geometric_prompt.append_points(points, labels)
+
+                step_backbone_out = dict(base_backbone_out)
+                prompt, prompt_mask, step_backbone_out = model._encode_prompt(
+                    backbone_out=step_backbone_out,
+                    find_input=find_input,
+                    geometric_prompt=geometric_prompt.clone(),
+                    encode_text=False,
+                )
+                step_backbone_out, encoder_out, _ = model._run_encoder(
+                    backbone_out=step_backbone_out,
+                    find_input=find_input,
+                    prompt=prompt,
+                    prompt_mask=prompt_mask,
+                )
+                out = {"encoder_hidden_states": encoder_out["encoder_hidden_states"]}
+                out, hs = model._run_decoder(
+                    pos_embed=encoder_out["pos_embed"],
+                    memory=out["encoder_hidden_states"],
+                    src_mask=encoder_out["padding_mask"],
+                    out=out,
+                    prompt=prompt,
+                    prompt_mask=prompt_mask,
+                    encoder_out=encoder_out,
+                )
+                model._run_segmentation_heads(
+                    out=out,
+                    backbone_out=step_backbone_out,
+                    img_ids=find_input.img_ids,
+                    vis_feat_sizes=encoder_out["vis_feat_sizes"],
+                    encoder_hidden_states=out["encoder_hidden_states"],
+                    prompt=prompt,
+                    prompt_mask=prompt_mask,
+                    hs=hs,
+                )
+
+                tensors[f"step.{step_idx}.geometry.features"] = to_cpu_contiguous(prompt)
+                tensors[f"step.{step_idx}.geometry.padding_mask"] = to_cpu_contiguous(
+                    prompt_mask.to(torch.uint8)
+                )
+                tensors[f"step.{step_idx}.fusion.memory"] = to_cpu_contiguous(
+                    encoder_out["encoder_hidden_states"]
+                )
+                tensors[f"step.{step_idx}.decoder.pred_logits"] = to_cpu_contiguous(
+                    out["pred_logits"]
+                )
+                tensors[f"step.{step_idx}.decoder.pred_boxes_xyxy"] = to_cpu_contiguous(
+                    out["pred_boxes_xyxy"]
+                )
+                tensors[f"step.{step_idx}.segmentation.mask_logits"] = to_cpu_contiguous(
+                    out["pred_masks"]
+                )
+                if "presence_logit_dec" in out:
+                    tensors[f"step.{step_idx}.decoder.presence_logits"] = to_cpu_contiguous(
+                        out["presence_logit_dec"]
+                    )
+                rendered_steps.append(
+                    render_interactive_reference_step(
+                        image,
+                        output_dir,
+                        step_idx,
+                        step.get("name") or f"step_{step_idx:02}",
+                        step_idx,
+                        args.image_size,
+                        out["pred_logits"],
+                        out["pred_boxes_xyxy"],
+                        out["pred_masks"],
+                        step["accumulated_points_xy_normalized"],
+                        step["accumulated_point_labels"],
+                    )
+                )
+
+        save_file(
+            tensors,
+            str(output_dir / "reference.safetensors"),
+            metadata={"bundle_version": "1"},
+        )
+        metadata = {
+            "bundle_version": 1,
+            "mode": "interactive_reference",
+            "image_path": str(Path(args.image).expanduser().resolve()),
+            "image_size": args.image_size,
+            "preprocess_mode": "exact",
+            "replay_script_path": str(script_path),
+            "effective_prompt": effective_prompt,
+            "steps": replay_steps,
+            "rendered_steps": rendered_steps,
+            "checkpoint_path": str(checkpoint_path),
+            "bpe_path": str(bpe_path),
+        }
+        with open(output_dir / "reference.json", "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
+
+        print(f"saved interactive reference bundle to {output_dir}")
+        print(f"  tensors: {output_dir / 'reference.safetensors'}")
+        print(f"  metadata: {output_dir / 'reference.json'}")
+        print(f"  rendered steps: {len(rendered_steps)}")
+        return
 
     with torch.inference_mode():
         image_tensor = v2.functional.to_image(image).to(device)

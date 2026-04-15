@@ -713,6 +713,73 @@ mod tests {
         )
     }
 
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn interactive_visual_fixture_trunk_block_outputs_cover_fixture() -> Result<()> {
+        let device = test_device()?;
+        let weights = load_interactive_visual_fixture_tensors(
+            "vision_backbone_weights.safetensors",
+            &device,
+        )?;
+        let fixture = load_interactive_visual_fixture_tensors("fixture.safetensors", &device)?;
+        let vb = VarBuilder::from_tensors(weights, DType::F32, &device);
+        let trunk = Sam3ViTDetTrunk::new(&VisionConfig::default(), vb.pp("trunk"))?;
+        let image = fixture_tensor(&fixture, "inputs.image_preprocessed")?.clone();
+        let (_, block_outputs) = trunk.forward_with_block_outputs(&image)?;
+        let expected_block_count = fixture
+            .keys()
+            .filter(|key| key.starts_with("vision.block."))
+            .count();
+        if block_outputs.len() != expected_block_count {
+            candle::bail!(
+                "expected {expected_block_count} trunk block outputs, got {}",
+                block_outputs.len()
+            );
+        }
+
+        for (block_idx, block_output) in block_outputs.iter().enumerate() {
+            let actual = block_output.permute((0, 3, 1, 2))?;
+            let name = format!("vision.block.{block_idx}");
+            if actual.dims() != fixture_tensor(&fixture, &name)?.dims() {
+                candle::bail!(
+                    "{name}: shape mismatch actual={:?} expected={:?}",
+                    actual.dims(),
+                    fixture_tensor(&fixture, &name)?.dims()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn interactive_visual_fixture_trunk_first_diverging_block_is_0() -> Result<()> {
+        let device = test_device()?;
+        let weights = load_interactive_visual_fixture_tensors(
+            "vision_backbone_weights.safetensors",
+            &device,
+        )?;
+        let fixture = load_interactive_visual_fixture_tensors("fixture.safetensors", &device)?;
+        let vb = VarBuilder::from_tensors(weights, DType::F32, &device);
+        let trunk = Sam3ViTDetTrunk::new(&VisionConfig::default(), vb.pp("trunk"))?;
+        let image = fixture_tensor(&fixture, "inputs.image_preprocessed")?.clone();
+        let (_, block_outputs) = trunk.forward_with_block_outputs(&image)?;
+
+        let (first_block, max_abs_diff) = first_diverging_block(&block_outputs, &fixture, 1e-5)?
+            .ok_or_else(|| {
+                candle::Error::Msg(
+                    "expected at least one diverging trunk block in the interactive visual fixture"
+                        .to_owned(),
+                )
+            })?;
+        if first_block != 0 {
+            candle::bail!(
+                "expected first diverging trunk block to be 0, got {first_block} (max_abs_diff={max_abs_diff:.8})"
+            );
+        }
+        Ok(())
+    }
+
     fn interactive_visual_fixture_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/sam3_interactive_visual_seed")
     }
@@ -738,15 +805,39 @@ mod tests {
         })
     }
 
+    fn first_diverging_block(
+        block_outputs: &[Tensor],
+        fixture: &HashMap<String, Tensor>,
+        atol: f32,
+    ) -> Result<Option<(usize, f32)>> {
+        for (block_idx, block_output) in block_outputs.iter().enumerate() {
+            let name = format!("vision.block.{block_idx}");
+            let actual = block_output.permute((0, 3, 1, 2))?;
+            let max_abs_diff = tensor_max_abs_diff(&actual, fixture_tensor(fixture, &name)?)?;
+            if max_abs_diff > atol {
+                return Ok(Some((block_idx, max_abs_diff)));
+            }
+        }
+        Ok(None)
+    }
+
     fn assert_tensor_close(
         actual: &Tensor,
         expected: &Tensor,
         atol: f32,
         name: &str,
     ) -> Result<()> {
+        let max_abs_diff = tensor_max_abs_diff(actual, expected)?;
+        if max_abs_diff > atol {
+            candle::bail!("{name}: max_abs_diff={max_abs_diff:.8} exceeded atol={atol:.8}");
+        }
+        Ok(())
+    }
+
+    fn tensor_max_abs_diff(actual: &Tensor, expected: &Tensor) -> Result<f32> {
         if actual.dims() != expected.dims() {
             candle::bail!(
-                "{name}: shape mismatch actual={:?} expected={:?}",
+                "shape mismatch actual={:?} expected={:?}",
                 actual.dims(),
                 expected.dims()
             );
@@ -763,9 +854,6 @@ mod tests {
         for (lhs, rhs) in actual.iter().zip(expected.iter()) {
             max_abs_diff = max_abs_diff.max((lhs - rhs).abs());
         }
-        if max_abs_diff > atol {
-            candle::bail!("{name}: max_abs_diff={max_abs_diff:.8} exceeded atol={atol:.8}");
-        }
-        Ok(())
+        Ok(max_abs_diff)
     }
 }

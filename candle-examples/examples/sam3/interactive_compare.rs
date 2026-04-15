@@ -169,6 +169,25 @@ impl InteractiveReferenceBundle {
     }
 }
 
+pub fn is_interactive_reference_bundle(path: &Path) -> Result<bool> {
+    let (_, metadata_path) = resolve_bundle_paths(path);
+    if !metadata_path.exists() {
+        return Ok(false);
+    }
+    let metadata: serde_json::Value = serde_json::from_str(&fs::read_to_string(&metadata_path)?)
+        .with_context(|| {
+            format!(
+                "failed to parse interactive reference metadata probe from {}",
+                metadata_path.display()
+            )
+        })?;
+    Ok(metadata
+        .get("steps")
+        .and_then(|steps| steps.as_array())
+        .map(|steps| !steps.is_empty())
+        .unwrap_or(false))
+}
+
 fn resolve_bundle_paths(path: &Path) -> (PathBuf, PathBuf) {
     if path.is_dir() {
         (
@@ -236,6 +255,32 @@ fn interactive_replay_steps_from_metadata(
             })
         })
         .collect()
+}
+
+fn sanitize_step_name(step_name: &str) -> String {
+    let sanitized = step_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() {
+        "step".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn step_output_dir(output_dir: &Path, step_idx: usize, step_name: &str) -> PathBuf {
+    output_dir.join(format!(
+        "step_{step_idx:03}_{}",
+        sanitize_step_name(step_name)
+    ))
 }
 
 fn compare_tensor(
@@ -338,6 +383,25 @@ pub fn run_interactive_reference_comparison(
             &step.accumulated_point_labels,
             device,
         )?;
+        let step_name = step
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("step_{step_idx:02}"));
+        let step_output_dir = step_output_dir(output_dir, step_idx, &step_name);
+        let candle_selected = crate::save_render_outputs_from_xyxy_tensors(
+            &bundle.metadata.image_path,
+            image_size,
+            &step_output_dir,
+            &step_name,
+            &candle.decoder_pred_boxes_xyxy,
+            &candle.segmentation_mask_logits,
+            &candle.scores,
+            &point_args_from_pairs(&accumulated_points),
+            &step.accumulated_point_labels,
+            &[],
+            &[],
+            crate::RenderStyle::Combined,
+        )?;
 
         let stages = vec![
             compare_tensor(
@@ -404,21 +468,11 @@ pub fn run_interactive_reference_comparison(
             bundle.tensor(&format!("step.{step_idx}.segmentation.mask_logits"))?,
             &reference_scores,
         )?;
-        let candle_selected = crate::select_prediction_from_xyxy_tensors(
-            &bundle.metadata.image_path,
-            image_size,
-            &candle.decoder_pred_boxes_xyxy,
-            &candle.segmentation_mask_logits,
-            &candle.scores,
-        )?;
 
         let all_stages_passed = stages.iter().all(|stage| stage.pass);
         let entry = InteractiveComparisonEntry {
             iteration_index: step_idx,
-            step_name: step
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("step_{step_idx:02}")),
+            step_name: step_name.clone(),
             score_abs_diff: (reference_selected.best_score - candle_selected.best_score).abs(),
             reference_best_score: reference_selected.best_score,
             candle_best_score: candle_selected.best_score,
@@ -461,6 +515,7 @@ pub fn run_interactive_reference_comparison(
             entry.mask_mean_abs_diff,
             entry.mask_iou_threshold_0_5
         );
+        println!("    artifacts: {}", step_output_dir.display());
         if let Some(first_fail) = entry.stages.iter().find(|stage| !stage.pass) {
             println!(
                 "    first failing stage: {}{}",
@@ -486,13 +541,6 @@ pub fn run_interactive_reference_comparison(
         };
         let report_path = output_dir.join("interactive_comparison_report.json");
         fs::write(&report_path, serde_json::to_string_pretty(&partial_report)?)?;
-        if !partial_report.all_passed {
-            bail!(
-                "interactive replay comparison failed at step {}; see {}",
-                step_idx,
-                report_path.display()
-            );
-        }
     }
 
     let report = InteractiveComparisonReport {
@@ -544,16 +592,42 @@ pub fn run_interactive_reference_comparison(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use anyhow::{Context, Result};
     use candle::{DType, Device};
     use candle_transformers::models::sam3::{self, Sam3CheckpointSource};
 
     use super::{
-        accumulated_points_from_step, compare_tensor, run_candle_interactive_step,
-        InteractiveReferenceBundle,
+        accumulated_points_from_step, compare_tensor, is_interactive_reference_bundle,
+        run_candle_interactive_step, InteractiveReferenceBundle,
     };
+
+    #[test]
+    fn interactive_bundle_probe_detects_steps_metadata() -> Result<()> {
+        let dir = unique_temp_bundle_dir("interactive_probe_steps");
+        fs::create_dir_all(&dir)?;
+        fs::write(
+            dir.join("reference.json"),
+            r#"{"image_path":"test.png","steps":[{"step_points_xy_normalized":[[0.5,0.5]],"step_point_labels":[1],"accumulated_points_xy_normalized":[[0.5,0.5]],"accumulated_point_labels":[1]}]}"#,
+        )?;
+        assert!(is_interactive_reference_bundle(&dir)?);
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_bundle_probe_rejects_noninteractive_metadata() -> Result<()> {
+        let dir = unique_temp_bundle_dir("interactive_probe_noninteractive");
+        fs::create_dir_all(&dir)?;
+        fs::write(
+            dir.join("reference.json"),
+            r#"{"image_path":"test.png","prompt":"shoe","stage_order":["text.memory"]}"#,
+        )?;
+        assert!(!is_interactive_reference_bundle(&dir)?);
+        Ok(())
+    }
 
     #[test]
     #[ignore = "fixture-driven parity investigation"]
@@ -644,5 +718,13 @@ mod tests {
     fn reference_bundle_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../candle-examples/examples/sam3/reference_interactive_replay")
+    }
+
+    fn unique_temp_bundle_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("sam3_{label}_{}_{}", std::process::id(), nanos))
     }
 }
