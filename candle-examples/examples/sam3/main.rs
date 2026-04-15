@@ -275,6 +275,21 @@ fn resolve_repo_file(path: &str, expected_file: &str) -> std::path::PathBuf {
     }
 }
 
+fn infer_video_tokenizer_path(tokenizer: Option<&str>, checkpoint: Option<&str>) -> Option<String> {
+    if let Some(tokenizer) = tokenizer {
+        return Some(tokenizer.to_owned());
+    }
+    let checkpoint_path = checkpoint.map(PathBuf::from)?;
+    let candidate = if checkpoint_path.is_dir() {
+        checkpoint_path.join("tokenizer.json")
+    } else {
+        checkpoint_path.parent()?.join("tokenizer.json")
+    };
+    candidate
+        .exists()
+        .then(|| candidate.to_string_lossy().into_owned())
+}
+
 fn get_tokenizer(tokenizer: &str, context_length: usize) -> Result<Tokenizer> {
     let tokenizer_path = resolve_repo_file(tokenizer, "tokenizer.json");
     let mut tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|err| {
@@ -2539,6 +2554,25 @@ pub fn main() -> anyhow::Result<()> {
                 &device,
                 args.parity_atol,
             )?;
+        } else if video::is_video_reference_bundle(Path::new(bundle_path))? {
+            let checkpoint = checkpoint_source.as_ref().context(
+                "SAM3 video reference comparison mode requires `--checkpoint <sam3.pt>`",
+            )?;
+            let tracker = sam3::Sam3TrackerModel::from_checkpoint_source(
+                &config,
+                checkpoint,
+                DType::F32,
+                &device,
+            )?;
+            video::run_video_reference_comparison(
+                model.as_ref().context(
+                    "SAM3 video reference comparison mode requires `--checkpoint <sam3.pt>`",
+                )?,
+                &tracker,
+                bundle_path,
+                Path::new(&args.output_dir),
+                &device,
+            )?;
         } else {
             run_reference_comparison(
                 model
@@ -2615,9 +2649,11 @@ pub fn main() -> anyhow::Result<()> {
             .as_ref()
             .map(|inputs| inputs.box_labels.clone())
             .unwrap_or_default();
+        let video_tokenizer_path =
+            infer_video_tokenizer_path(args.tokenizer.as_deref(), args.checkpoint.as_deref());
         let video_mode = video::VideoMode {
             video_path: video_path.to_string(),
-            tokenizer_path: args.tokenizer.clone(),
+            tokenizer_path: video_tokenizer_path,
             prompt_text: args.video_prompt.clone(),
             points,
             point_labels,

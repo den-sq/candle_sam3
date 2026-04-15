@@ -2,6 +2,8 @@
 
 import argparse
 import json
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -28,7 +30,7 @@ def parse_args():
         )
 
     parser = argparse.ArgumentParser(
-        description="Export a SAM3 stage-by-stage parity bundle from upstream PyTorch."
+        description="Export SAM3 image parity bundles or video reference bundles from upstream PyTorch."
     )
     parser.add_argument(
         "--sam3-repo",
@@ -40,7 +42,12 @@ def parse_args():
         required=True,
         help="Path to sam3.pt or a directory containing sam3.pt.",
     )
-    parser.add_argument("--image", required=True, help="Input image path.")
+    parser.add_argument("--image", default=None, help="Input image path.")
+    parser.add_argument(
+        "--video",
+        default=None,
+        help="Optional input video path or extracted-frame directory for video reference export.",
+    )
     parser.add_argument("--prompt", default=None, help="Optional text prompt to encode.")
     parser.add_argument(
         "--interactive-script",
@@ -64,7 +71,7 @@ def parse_args():
     parser.add_argument(
         "--output-dir",
         required=True,
-        help="Directory where reference.safetensors and reference.json will be written.",
+        help="Directory where the exported bundle artifacts will be written.",
     )
     parser.add_argument(
         "--bpe-path",
@@ -76,6 +83,17 @@ def parse_args():
         type=int,
         default=1008,
         help="Square image size used by the upstream processor.",
+    )
+    parser.add_argument(
+        "--video-frame-count",
+        type=int,
+        default=30,
+        help="Maximum number of video frames to export for video reference bundles.",
+    )
+    parser.add_argument(
+        "--video-apply-temporal-disambiguation",
+        action="store_true",
+        help="Enable upstream temporal disambiguation for video export. Disabled by default so example bundles keep raw propagated masks instead of suppressing unconfirmed tracklets.",
     )
     parser.add_argument(
         "--device",
@@ -412,13 +430,192 @@ def render_interactive_reference_step(
     return summary
 
 
+def compare_frame_names(path: Path):
+    stem = path.stem
+    return (0, int(stem), path.name.lower()) if stem.isdigit() else (1, stem.lower(), path.name.lower())
+
+
+def sorted_frame_paths(dir_path: Path):
+    frame_paths = [
+        path
+        for path in dir_path.iterdir()
+        if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+    ]
+    frame_paths.sort(key=compare_frame_names)
+    if not frame_paths:
+        raise ValueError(f"no image frames found in {dir_path}")
+    return frame_paths
+
+
+def resolve_tokenizer_path(checkpoint_path: Path):
+    if checkpoint_path.is_dir():
+        candidate = checkpoint_path / "tokenizer.json"
+        if candidate.exists():
+            return candidate.resolve()
+    else:
+        candidate = checkpoint_path.parent / "tokenizer.json"
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def prepare_video_frames(video_path: Path, frames_dir: Path, max_frames: int):
+    from PIL import Image
+
+    if frames_dir.exists():
+        shutil.rmtree(frames_dir)
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    if video_path.is_dir():
+        source_paths = sorted_frame_paths(video_path)[:max_frames]
+        for frame_idx, source_path in enumerate(source_paths):
+            frame = Image.open(source_path).convert("RGB")
+            frame.save(frames_dir / f"{frame_idx:06d}.png")
+        return sorted_frame_paths(frames_dir)
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-v",
+        "error",
+        "-i",
+        str(video_path),
+        "-frames:v",
+        str(max_frames),
+        "-start_number",
+        "0",
+        str(frames_dir / "%06d.png"),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg failed while extracting frames from {video_path}: {result.stderr.strip()}"
+        )
+    frame_paths = sorted_frame_paths(frames_dir)
+    if len(frame_paths) > max_frames:
+        frame_paths = frame_paths[:max_frames]
+    if not frame_paths:
+        raise RuntimeError(f"ffmpeg produced no frames for {video_path}")
+    return frame_paths
+
+
+def box_cxcywh_to_xyxy(box):
+    cx, cy, w, h = box
+    return [cx - w * 0.5, cy - h * 0.5, cx + w * 0.5, cy + h * 0.5]
+
+
+def box_cxcywh_to_xywh(box):
+    x0, y0, x1, y1 = box_cxcywh_to_xyxy(box)
+    return [x0, y0, x1 - x0, y1 - y0]
+
+
+def write_binary_mask(mask, path):
+    from PIL import Image
+    import numpy as np
+
+    mask = np.asarray(mask)
+    if mask.ndim == 3:
+        mask = mask[0]
+    mask_uint8 = (mask.astype("uint8") * 255)
+    Image.fromarray(mask_uint8, mode="L").save(path)
+
+
+def output_object_count(outputs):
+    obj_ids = outputs.get("out_obj_ids", [])
+    return len(obj_ids) if obj_ids is not None else 0
+
+
+def merge_frame_outputs(frame_outputs, frame_idx, outputs):
+    existing = frame_outputs.get(frame_idx)
+    if existing is None or output_object_count(outputs) >= output_object_count(existing):
+        frame_outputs[frame_idx] = outputs
+
+
+def render_video_reference_frame(
+    frame_image,
+    frame_idx,
+    frame_path,
+    outputs,
+    masks_dir,
+    masked_frames_dir,
+    bundle_root,
+    prompt_text,
+    used_explicit_geometry,
+):
+    from PIL import Image
+    import numpy as np
+
+    obj_ids = outputs.get("out_obj_ids", [])
+    probs = outputs.get("out_probs", [])
+    boxes_xywh = outputs.get("out_boxes_xywh", [])
+    binary_masks = outputs.get("out_binary_masks")
+    if binary_masks is None:
+        binary_masks = []
+
+    objects = []
+    for obj_id, score, box_xywh, mask in zip(obj_ids, probs, boxes_xywh, binary_masks):
+        mask_array = np.asarray(mask)
+        if not mask_array.any():
+            continue
+        obj_id = int(obj_id)
+        score = float(score)
+        box_xywh = [float(value) for value in box_xywh]
+        box_xyxy = [
+            box_xywh[0],
+            box_xywh[1],
+            box_xywh[0] + box_xywh[2],
+            box_xywh[1] + box_xywh[3],
+        ]
+        color = palette_color(obj_id)
+        mask_path = masks_dir / f"frame_{frame_idx:06d}_obj_{obj_id:06d}.png"
+        masked_frame_path = masked_frames_dir / f"frame_{frame_idx:06d}_obj_{obj_id:06d}.png"
+        write_binary_mask(mask_array, mask_path)
+        mask_image = Image.fromarray((mask_array.astype("uint8") * 255), mode="L")
+        masked_frame = blend_mask_on_image(frame_image.convert("RGBA"), mask_image)
+        draw_prediction_box(masked_frame, box_xyxy, color=color, score=score, index=obj_id)
+        masked_frame.save(masked_frame_path)
+        objects.append(
+            {
+                "obj_id": obj_id,
+                "scores": [score],
+                "presence_scores": None,
+                "boxes_xyxy": [box_xyxy],
+                "mask_path": str(mask_path.relative_to(bundle_root)),
+                "masked_frame_path": str(masked_frame_path.relative_to(bundle_root)),
+                "prompt_frame_idx": 0,
+                "memory_frame_indices": [],
+                "text_prompt": prompt_text,
+                "used_explicit_geometry": used_explicit_geometry,
+                "reused_previous_output": frame_idx != 0,
+            }
+        )
+
+    return {
+        "frame_idx": frame_idx,
+        "frame_path": str(frame_path.relative_to(bundle_root)),
+        "objects": objects,
+    }
+
+
 def main():
     args = parse_args()
+    if (args.image is None) == (args.video is None):
+        raise ValueError("provide exactly one of --image or --video")
     if args.box_label and len(args.box_label) != len(args.box):
         raise ValueError(
             f"--box-label count ({len(args.box_label)}) must match --box count ({len(args.box)})"
         )
-    if args.interactive_script is None:
+    if args.video is not None and args.interactive_script is not None:
+        raise ValueError("`--video` cannot be combined with `--interactive-script`")
+    if args.video is not None and args.vision_only:
+        raise ValueError("`--video` cannot be combined with `--vision-only`")
+    if args.video is not None and args.debug_block:
+        raise ValueError("`--video` cannot be combined with `--debug-block`")
+    if args.video is not None:
+        if args.prompt is None and not args.box:
+            raise ValueError("video export requires --prompt, --box, or both")
+        effective_prompt = args.prompt
+    elif args.interactive_script is None:
         if args.prompt is None and not args.box:
             raise ValueError("provide --prompt, --box, or both")
         effective_prompt = args.prompt
@@ -537,6 +734,136 @@ def main():
             return type_embed + boxes_embed, boxes_mask
 
         SequenceGeometryEncoder._encode_boxes = encode_boxes_cpu_safe
+
+    if args.video is not None:
+        if device.type != "cuda":
+            raise ValueError("upstream SAM3 video reference export currently requires CUDA")
+
+        from PIL import Image
+
+        from sam3.model_builder import build_sam3_predictor
+
+        source_video_path = Path(args.video).expanduser().resolve()
+        frames_dir = output_dir / "frames"
+        masks_dir = output_dir / "masks"
+        masked_frames_dir = output_dir / "masked_frames"
+        masks_dir.mkdir(parents=True, exist_ok=True)
+        masked_frames_dir.mkdir(parents=True, exist_ok=True)
+        frame_paths = prepare_video_frames(
+            source_video_path, frames_dir, max_frames=args.video_frame_count
+        )
+
+        predictor = build_sam3_predictor(
+            version="sam3",
+            checkpoint_path=str(checkpoint_path),
+            bpe_path=str(bpe_path),
+            compile=False,
+            async_loading_frames=False,
+            apply_temporal_disambiguation=args.video_apply_temporal_disambiguation,
+        )
+        response = predictor.handle_request(
+            {"type": "start_session", "resource_path": str(frames_dir)}
+        )
+        session_id = response["session_id"]
+        frame_outputs = {}
+
+        request = {
+            "type": "add_prompt",
+            "session_id": session_id,
+            "frame_index": 0,
+        }
+        if args.prompt is not None:
+            request["text"] = args.prompt
+        if args.box:
+            resolved_box_labels = [
+                int(label)
+                for label in (args.box_label if args.box_label else [True for _ in args.box])
+            ]
+            request["bounding_boxes"] = [box_cxcywh_to_xywh(box) for box in args.box]
+            request["bounding_box_labels"] = resolved_box_labels
+        prompt_response = predictor.handle_request(request)
+        merge_frame_outputs(
+            frame_outputs,
+            int(prompt_response["frame_index"]),
+            prompt_response["outputs"],
+        )
+
+        for response in predictor.handle_stream_request(
+            {
+                "type": "propagate_in_video",
+                "session_id": session_id,
+                "start_frame_index": 0,
+                "max_frame_num_to_track": len(frame_paths),
+            }
+        ):
+            merge_frame_outputs(
+                frame_outputs, int(response["frame_index"]), response["outputs"]
+            )
+
+        results = []
+        for frame_idx, frame_path in enumerate(frame_paths):
+            frame_image = Image.open(frame_path).convert("RGB")
+            outputs = frame_outputs.get(
+                frame_idx,
+                {
+                    "out_obj_ids": [],
+                    "out_probs": [],
+                    "out_boxes_xywh": [],
+                    "out_binary_masks": [],
+                },
+            )
+            results.append(
+                render_video_reference_frame(
+                    frame_image=frame_image,
+                    frame_idx=frame_idx,
+                    frame_path=frame_path,
+                    outputs=outputs,
+                    masks_dir=masks_dir,
+                    masked_frames_dir=masked_frames_dir,
+                    bundle_root=output_dir,
+                    prompt_text=args.prompt,
+                    used_explicit_geometry=bool(args.box),
+                )
+            )
+
+        metadata = {
+            "bundle_version": 1,
+            "mode": "video_reference",
+            "source_path": str(source_video_path),
+            "source_kind": "video_file" if source_video_path.is_file() else "image_folder",
+            "session_frame_count": len(frame_paths),
+            "exported_frame_count": len(results),
+            "frame_stride": 1,
+            "tokenizer_path": (
+                str(resolve_tokenizer_path(checkpoint_path))
+                if resolve_tokenizer_path(checkpoint_path) is not None
+                else None
+            ),
+            "prompt_text": args.prompt,
+            "points_xy_normalized": [],
+            "point_labels": [],
+            "boxes_cxcywh_normalized": [list(box) for box in args.box],
+            "box_labels": resolved_box_labels if args.box else [],
+            "frames_dir": "frames",
+            "masks_dir": "masks",
+            "masked_frames_dir": "masked_frames",
+            "results_path": "video_results.json",
+            "video_apply_temporal_disambiguation": args.video_apply_temporal_disambiguation,
+            "checkpoint_path": str(checkpoint_path),
+            "bpe_path": str(bpe_path),
+        }
+        with open(output_dir / "video_results.json", "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2)
+        with open(output_dir / "reference.json", "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
+
+        print(f"saved video reference bundle to {output_dir}")
+        print(f"  metadata: {output_dir / 'reference.json'}")
+        print(f"  results: {output_dir / 'video_results.json'}")
+        print(f"  frames: {frames_dir}")
+        print(f"  masks: {masks_dir}")
+        print(f"  masked frames: {masked_frames_dir}")
+        return
 
     def run_trunk_with_debug(trunk, image_tensor, debug_blocks):
         debug_blocks = set(debug_blocks)

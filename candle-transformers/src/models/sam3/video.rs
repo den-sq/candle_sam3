@@ -320,6 +320,7 @@ pub struct TrackedObject {
     pub obj_id: u32,
     pub creation_frame: usize,
     pub last_updated_frame: usize,
+    pub has_inference_history: bool,
     pub prompt_frames: BTreeMap<usize, SessionPrompt>,
     pub frame_outputs: BTreeMap<usize, ObjectFrameOutput>,
     pub tracker_states: BTreeMap<usize, TrackerFrameState>,
@@ -331,6 +332,7 @@ impl TrackedObject {
             obj_id,
             creation_frame,
             last_updated_frame: creation_frame,
+            has_inference_history: false,
             prompt_frames: BTreeMap::new(),
             frame_outputs: BTreeMap::new(),
             tracker_states: BTreeMap::new(),
@@ -1055,6 +1057,7 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
             .insert(frame_idx, stored_output.clone());
         tracked.tracker_states.insert(frame_idx, stored_state);
         tracked.last_updated_frame = frame_idx;
+        tracked.has_inference_history = true;
         session
             .frame_outputs
             .entry(frame_idx)
@@ -1075,9 +1078,13 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
         prompt: &SessionPrompt,
     ) -> Result<ObjectFrameOutput> {
         let visual = session.get_visual_features(model, compute_device, frame_idx)?;
+        let use_visual_box_prompt = uses_initial_visual_box_prompt(object, frame_idx, prompt);
         let text_encoding = match prompt.text.as_deref() {
             Some(text_prompt) => {
                 Some(session.cached_text_encoding(model, text_prompt, compute_device)?)
+            }
+            None if use_visual_box_prompt && session.tokenizer.is_some() => {
+                Some(session.cached_text_encoding(model, "visual", compute_device)?)
             }
             None => None,
         };
@@ -1095,8 +1102,10 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
                     )
                 })?;
         let grounding = ground_from_encoded_prompt(model, &visual, &encoded_prompt)?;
-        let mask_input = grounding.masks.gt(0.5)?.to_dtype(DType::F32)?;
         let history = self.history_on_device(object, frame_idx, direction, compute_device)?;
+        // Upstream video inference seeds tracker memory from detector masks on the prompt
+        // frame, including the initial box-as-visual prompt case.
+        let mask_input = grounding.mask_logits.gt(0f32)?.to_dtype(DType::F32)?;
         let step = self.tracker.track_frame(
             &visual,
             frame_idx,
@@ -1110,9 +1119,9 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
             matches!(direction, PropagationDirection::Backward),
             false,
         )?;
-        let output = tracker_state_to_object_output(
+        let output = grounding_to_object_output(
             object.obj_id,
-            &step.state,
+            &grounding,
             Some(frame_idx),
             trim_memory_frame_indices(step.memory_frame_indices, config.memory_frame_count),
             prompt.text.clone(),
@@ -1206,14 +1215,18 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
         let text_prompt = object
             .latest_text_prompt(frame_idx, direction)
             .map(|(_, text)| text);
+        let used_explicit_geometry = prompt_frame_idx
+            .and_then(|idx| object.prompt_frames.get(&idx))
+            .map(|prompt| prompt.has_geometry())
+            .unwrap_or(false);
         let output = tracker_state_to_object_output(
             object.obj_id,
             &step.state,
             prompt_frame_idx,
             trim_memory_frame_indices(step.memory_frame_indices, config.memory_frame_count),
             text_prompt,
-            false,
-            false,
+            used_explicit_geometry,
+            true,
             session.video_size(),
         )?;
         Ok(Some(self.store_object_result(
@@ -2250,6 +2263,22 @@ fn build_effective_prompt(
     ))
 }
 
+fn uses_initial_visual_box_prompt(
+    object: &TrackedObject,
+    frame_idx: usize,
+    prompt: &SessionPrompt,
+) -> bool {
+    !object.has_inference_history
+        && object.creation_frame == frame_idx
+        && prompt.text.is_none()
+        && prompt
+            .points
+            .as_ref()
+            .map(|points| points.is_empty())
+            .unwrap_or(true)
+        && matches!(prompt.boxes.as_ref(), Some(boxes) if boxes.len() == 1)
+}
+
 fn first_box_xyxy(boxes_xyxy: &Tensor) -> Result<[f32; 4]> {
     let values = boxes_xyxy.flatten_all()?.to_vec1::<f32>()?;
     if values.len() < 4 {
@@ -2477,6 +2506,37 @@ fn tracker_state_to_object_output(
         boxes_xyxy: mask_to_normalized_xyxy(&masks)?,
         scores: canonicalize_score_tensor(&state.iou_scores)?,
         presence_scores: Some(candle_nn::ops::sigmoid(&state.object_score_logits)?),
+        prompt_frame_idx,
+        memory_frame_indices,
+        text_prompt,
+        used_explicit_geometry,
+        reused_previous_output,
+    })
+}
+
+fn grounding_to_object_output(
+    obj_id: u32,
+    grounding: &GroundingOutput,
+    prompt_frame_idx: Option<usize>,
+    memory_frame_indices: Vec<usize>,
+    text_prompt: Option<String>,
+    used_explicit_geometry: bool,
+    reused_previous_output: bool,
+    video_size: ImageSize,
+) -> Result<ObjectFrameOutput> {
+    let mask_logits = resize_mask_logits_to_video(&grounding.mask_logits, video_size)?;
+    let masks = candle_nn::ops::sigmoid(&mask_logits)?;
+    Ok(ObjectFrameOutput {
+        obj_id,
+        mask_logits,
+        masks: masks.clone(),
+        boxes_xyxy: mask_to_normalized_xyxy(&masks)?,
+        scores: canonicalize_score_tensor(&grounding.scores)?,
+        presence_scores: grounding
+            .presence_scores
+            .as_ref()
+            .map(canonicalize_score_tensor)
+            .transpose()?,
         prompt_frame_idx,
         memory_frame_indices,
         text_prompt,
@@ -3090,6 +3150,94 @@ mod tests {
         assert_eq!(output.scores.to_vec1::<f32>()?, vec![0.25]);
         assert_eq!(output.boxes_xyxy.dims(), &[1, 4]);
         Ok(())
+    }
+
+    #[test]
+    fn detector_seed_outputs_are_resized_to_video_space_from_masks() -> Result<()> {
+        let device = Device::Cpu;
+        let grounding = GroundingOutput {
+            mask_logits: Tensor::from_vec(
+                vec![
+                    -5.0f32, -5.0, -5.0, -5.0, //
+                    -5.0, 5.0, 5.0, -5.0, //
+                    -5.0, 5.0, 5.0, -5.0, //
+                    -5.0, -5.0, -5.0, -5.0, //
+                ],
+                (1, 4, 4),
+                &device,
+            )?,
+            masks: Tensor::zeros((1, 4, 4), DType::F32, &device)?,
+            boxes_xyxy: Tensor::zeros((1, 4), DType::F32, &device)?,
+            scores: Tensor::from_vec(vec![0.75f32], (1, 1), &device)?,
+            presence_scores: Some(Tensor::from_vec(vec![1.5f32], (1, 1), &device)?),
+        };
+        let output = grounding_to_object_output(
+            9,
+            &grounding,
+            Some(0),
+            vec![],
+            None,
+            true,
+            false,
+            ImageSize::new(2, 6),
+        )?;
+        assert_eq!(output.mask_logits.dims(), &[1, 1, 2, 6]);
+        assert_eq!(output.masks.dims(), &[1, 1, 2, 6]);
+        assert_eq!(output.scores.to_vec1::<f32>()?, vec![0.75]);
+        assert_eq!(
+            output
+                .presence_scores
+                .as_ref()
+                .expect("presence scores should be preserved")
+                .to_vec1::<f32>()?,
+            vec![1.5]
+        );
+        assert_ne!(
+            output.boxes_xyxy.to_vec2::<f32>()?,
+            vec![vec![0.0, 0.0, 0.0, 0.0]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn initial_single_box_prompt_is_treated_as_visual_prompt() {
+        let mut object = TrackedObject::new(4, 0);
+        object.prompt_frames.insert(
+            0,
+            SessionPrompt {
+                text: None,
+                points: None,
+                point_labels: None,
+                boxes: Some(vec![(0.5, 0.5, 0.2, 0.3)]),
+                box_labels: Some(vec![1]),
+            },
+        );
+        let prompt = object
+            .prompt_frames
+            .get(&0)
+            .expect("prompt should be present");
+        assert!(uses_initial_visual_box_prompt(&object, 0, prompt));
+    }
+
+    #[test]
+    fn later_box_prompt_is_not_treated_as_initial_visual_prompt() {
+        let mut object = TrackedObject::new(4, 0);
+        object.has_inference_history = true;
+        object.prompt_frames.insert(
+            0,
+            SessionPrompt {
+                text: None,
+                points: None,
+                point_labels: None,
+                boxes: Some(vec![(0.5, 0.5, 0.2, 0.3)]),
+                box_labels: Some(vec![1]),
+            },
+        );
+        let prompt = object
+            .prompt_frames
+            .get(&0)
+            .expect("prompt should be present");
+        assert!(!uses_initial_visual_box_prompt(&object, 0, prompt));
     }
 
     #[test]

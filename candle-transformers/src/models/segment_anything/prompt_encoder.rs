@@ -191,10 +191,18 @@ impl PromptEncoder {
         let corner_embedding = self
             .pe_layer
             .forward_with_coords(&coords, self.input_image_size)?;
-        let ce1 = corner_embedding.i((.., 0))?;
-        let ce2 = corner_embedding.i((.., 1))?;
-        let ce1 = (ce1 + self.point_embeddings[2].embeddings())?;
-        let ce2 = (ce2 + self.point_embeddings[3].embeddings())?;
+        let ce1 = corner_embedding.i((.., 0..1, ..))?;
+        let ce2 = corner_embedding.i((.., 1..2, ..))?;
+        let ce1 = (ce1.clone()
+            + self.point_embeddings[2]
+                .embeddings()
+                .reshape((1, 1, self.embed_dim))?
+                .broadcast_as(ce1.shape())?)?;
+        let ce2 = (ce2.clone()
+            + self.point_embeddings[3]
+                .embeddings()
+                .reshape((1, 1, self.embed_dim))?
+                .broadcast_as(ce2.shape())?)?;
         Tensor::cat(&[&ce1, &ce2], 1)
     }
 
@@ -236,5 +244,30 @@ impl PromptEncoder {
             Some(masks) => self.embed_masks(masks)?,
         };
         Ok((sparse_embeddings, dense_embeddings))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use candle::{Device, Result, Tensor};
+    use candle_nn::VarBuilder;
+
+    use super::PromptEncoder;
+
+    #[test]
+    fn box_prompts_keep_the_sparse_token_axis() -> Result<()> {
+        let device = Device::Cpu;
+        let encoder = PromptEncoder::new(
+            8,
+            (4, 4),
+            (16, 16),
+            16,
+            VarBuilder::zeros(candle::DType::F32, &device),
+        )?;
+        let boxes = Tensor::from_vec(vec![1f32, 2.0, 5.0, 6.0], (1, 4), &device)?;
+        let (sparse_embeddings, dense_embeddings) = encoder.forward(None, Some(&boxes), None)?;
+        assert_eq!(sparse_embeddings.dims3()?, (1, 2, 8));
+        assert_eq!(dense_embeddings.dims4()?, (1, 8, 4, 4));
+        Ok(())
     }
 }
