@@ -2,7 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 #[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -157,7 +159,7 @@ impl Default for VideoConfig {
             score_threshold: 0.5,
             hotstart_delay: 0,
             max_objects: usize::MAX,
-            memory_frame_count: 2,
+            memory_frame_count: 6,
             max_memory_boxes: 2,
             derive_mask_centroid_points: true,
         }
@@ -488,10 +490,12 @@ impl VideoSource {
                 config.image.image_mean,
                 config.image.image_std,
             )?)),
-            Self::VideoFile(path) => candle::bail!(
-                "video file loading is not wired into the Rust predictor yet; extract frames into an image directory first: {}",
-                path.display()
-            ),
+            Self::VideoFile(path) => Ok(Box::new(VideoFileFrameSource::new(
+                path,
+                config.image.image_size,
+                config.image.image_mean,
+                config.image.image_std,
+            )?)),
         }
     }
 }
@@ -560,6 +564,10 @@ impl Sam3VideoSession {
 
     pub fn num_frames(&self) -> usize {
         self.frame_source.frame_count()
+    }
+
+    pub fn video_size(&self) -> ImageSize {
+        self.frame_source.video_size()
     }
 
     pub fn cache_stats(&self) -> SessionCacheStats {
@@ -1059,6 +1067,7 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
         &self,
         model: &Sam3ImageModel,
         compute_device: &Device,
+        config: &VideoConfig,
         session: &mut Sam3VideoSession,
         object: &TrackedObject,
         frame_idx: usize,
@@ -1101,15 +1110,16 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
             matches!(direction, PropagationDirection::Backward),
             false,
         )?;
-        let output = ObjectFrameOutput::from_grounding(
+        let output = tracker_state_to_object_output(
             object.obj_id,
-            grounding,
+            &step.state,
             Some(frame_idx),
-            step.memory_frame_indices,
+            trim_memory_frame_indices(step.memory_frame_indices, config.memory_frame_count),
             prompt.text.clone(),
             prompt.has_geometry(),
             false,
-        );
+            session.video_size(),
+        )?;
         self.store_object_result(session, frame_idx, output, step.state)
     }
 
@@ -1117,6 +1127,7 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
         &self,
         model: &Sam3ImageModel,
         compute_device: &Device,
+        config: &VideoConfig,
         session: &mut Sam3VideoSession,
         object: &TrackedObject,
         frame_idx: usize,
@@ -1149,10 +1160,11 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
             object.obj_id,
             &step.state,
             Some(frame_idx),
-            step.memory_frame_indices,
+            trim_memory_frame_indices(step.memory_frame_indices, config.memory_frame_count),
             prompt.text.clone(),
             prompt.has_geometry(),
             false,
+            session.video_size(),
         )?;
         self.store_object_result(session, frame_idx, output, step.state)
     }
@@ -1161,6 +1173,7 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
         &self,
         model: &Sam3ImageModel,
         compute_device: &Device,
+        config: &VideoConfig,
         session: &mut Sam3VideoSession,
         object: &TrackedObject,
         frame_idx: usize,
@@ -1197,10 +1210,11 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
             object.obj_id,
             &step.state,
             prompt_frame_idx,
-            step.memory_frame_indices,
+            trim_memory_frame_indices(step.memory_frame_indices, config.memory_frame_count),
             text_prompt,
             false,
             false,
+            session.video_size(),
         )?;
         Ok(Some(self.store_object_result(
             session, frame_idx, output, step.state,
@@ -1211,6 +1225,7 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
         &self,
         model: &Sam3ImageModel,
         compute_device: &Device,
+        config: &VideoConfig,
         session: &mut Sam3VideoSession,
         object: TrackedObject,
         frame_idx: usize,
@@ -1226,6 +1241,7 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
                     .seed_with_detector(
                         model,
                         compute_device,
+                        config,
                         session,
                         &object,
                         frame_idx,
@@ -1239,6 +1255,7 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
                     .seed_with_tracker_points(
                         model,
                         compute_device,
+                        config,
                         session,
                         &object,
                         frame_idx,
@@ -1252,6 +1269,7 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
         self.propagate_with_tracker(
             model,
             compute_device,
+            config,
             session,
             &object,
             frame_idx,
@@ -1265,7 +1283,7 @@ impl VideoTrackerBackend for Sam3MemoryAttentionVideoTrackerBackend<'_> {
         &self,
         model: &Sam3ImageModel,
         compute_device: &Device,
-        _config: &VideoConfig,
+        config: &VideoConfig,
         session: &mut Sam3VideoSession,
         frame_idx: usize,
         direction: PropagationDirection,
@@ -1288,6 +1306,7 @@ impl VideoTrackerBackend for Sam3MemoryAttentionVideoTrackerBackend<'_> {
             if let Some(output) = self.infer_object_on_frame(
                 model,
                 compute_device,
+                config,
                 session,
                 object,
                 frame_idx,
@@ -1626,6 +1645,97 @@ impl FrameSource for ImageFolderFrameSource {
     }
 }
 
+struct VideoFileFrameSource {
+    video_path: PathBuf,
+    image_size: usize,
+    image_mean: [f32; 3],
+    image_std: [f32; 3],
+    cache: HashMap<usize, FrameBlob>,
+    video_size: ImageSize,
+    frame_count: usize,
+}
+
+impl VideoFileFrameSource {
+    fn new(
+        video_path: PathBuf,
+        image_size: usize,
+        image_mean: [f32; 3],
+        image_std: [f32; 3],
+    ) -> Result<Self> {
+        let metadata = probe_video_file(&video_path)?;
+        Ok(Self {
+            video_path,
+            image_size,
+            image_mean,
+            image_std,
+            cache: HashMap::new(),
+            video_size: metadata.video_size,
+            frame_count: metadata.frame_count,
+        })
+    }
+
+    fn ensure_loaded(&mut self, frame_idx: usize) -> Result<()> {
+        if self.cache.contains_key(&frame_idx) {
+            return Ok(());
+        }
+        if frame_idx >= self.frame_count {
+            candle::bail!(
+                "frame_idx {} out of bounds for video with {} frames",
+                frame_idx,
+                self.frame_count
+            );
+        }
+        let blob = decode_video_frame_blob(
+            &self.video_path,
+            frame_idx,
+            self.image_size,
+            self.image_mean,
+            self.image_std,
+            self.video_size,
+        )?;
+        self.cache.insert(frame_idx, blob);
+        Ok(())
+    }
+}
+
+impl FrameSource for VideoFileFrameSource {
+    fn frame_count(&self) -> usize {
+        self.frame_count
+    }
+
+    fn video_size(&self) -> ImageSize {
+        self.video_size
+    }
+
+    fn get_frame(&mut self, frame_idx: usize, target_device: &Device) -> Result<Tensor> {
+        self.ensure_loaded(frame_idx)?;
+        self.cache
+            .get(&frame_idx)
+            .ok_or_else(|| candle::Error::Msg(format!("frame_idx {} not cached", frame_idx)))?
+            .to_tensor(target_device)
+    }
+
+    fn prefetch(&mut self, frame_indices: &[usize]) -> Result<()> {
+        for frame_idx in frame_indices {
+            self.ensure_loaded(*frame_idx)?;
+        }
+        Ok(())
+    }
+
+    fn evict_except(&mut self, keep_frame_indices: &BTreeSet<usize>) {
+        self.cache
+            .retain(|frame_idx, _| keep_frame_indices.contains(frame_idx));
+    }
+
+    fn loaded_frame_count(&self) -> usize {
+        self.cache.len()
+    }
+
+    fn close(&mut self) {
+        self.cache.clear();
+    }
+}
+
 fn load_frame_blob(
     image_path: &Path,
     image_size: usize,
@@ -1637,12 +1747,30 @@ fn load_frame_blob(
         .decode()
         .map_err(candle::Error::wrap)?
         .to_rgb8();
+    frame_blob_from_rgb_image(
+        image,
+        image_size,
+        image_mean,
+        image_std,
+        expected_video_size,
+        &image_path.display().to_string(),
+    )
+}
+
+fn frame_blob_from_rgb_image(
+    image: image::RgbImage,
+    image_size: usize,
+    image_mean: [f32; 3],
+    image_std: [f32; 3],
+    expected_video_size: ImageSize,
+    source_label: &str,
+) -> Result<FrameBlob> {
     let (width, height) = image.dimensions();
     let current_size = ImageSize::new(height as usize, width as usize);
     if current_size != expected_video_size {
         candle::bail!(
             "frame {} has size {}x{} but the session expects {}x{}",
-            image_path.display(),
+            source_label,
             current_size.height,
             current_size.width,
             expected_video_size.height,
@@ -1662,6 +1790,185 @@ fn load_frame_blob(
         data: normalized.flatten_all()?.to_vec1::<f32>()?,
         frame_size: ImageSize::square(image_size),
     })
+}
+
+#[derive(Debug)]
+struct VideoProbeMetadata {
+    video_size: ImageSize,
+    frame_count: usize,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FfprobeOutput {
+    streams: Vec<FfprobeStream>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FfprobeStream {
+    width: Option<usize>,
+    height: Option<usize>,
+    nb_frames: Option<String>,
+    nb_read_frames: Option<String>,
+    duration: Option<String>,
+    r_frame_rate: Option<String>,
+}
+
+fn probe_video_file(video_path: &Path) -> Result<VideoProbeMetadata> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-count_frames",
+            "-show_entries",
+            "stream=width,height,nb_frames,nb_read_frames,duration,r_frame_rate",
+            "-of",
+            "json",
+        ])
+        .arg(video_path)
+        .output()
+        .map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to run ffprobe for {}: {}",
+                video_path.display(),
+                err
+            ))
+        })?;
+    if !output.status.success() {
+        candle::bail!(
+            "ffprobe failed for {}: {}",
+            video_path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let parsed: FfprobeOutput = serde_json::from_slice(&output.stdout).map_err(|err| {
+        candle::Error::Msg(format!(
+            "failed to parse ffprobe output for {}: {}",
+            video_path.display(),
+            err
+        ))
+    })?;
+    let stream = parsed.streams.into_iter().next().ok_or_else(|| {
+        candle::Error::Msg(format!(
+            "ffprobe found no video stream in {}",
+            video_path.display()
+        ))
+    })?;
+    let width = stream.width.ok_or_else(|| {
+        candle::Error::Msg(format!(
+            "ffprobe did not report width for {}",
+            video_path.display()
+        ))
+    })?;
+    let height = stream.height.ok_or_else(|| {
+        candle::Error::Msg(format!(
+            "ffprobe did not report height for {}",
+            video_path.display()
+        ))
+    })?;
+    let frame_count = parse_frame_count(&stream).ok_or_else(|| {
+        candle::Error::Msg(format!(
+            "could not determine frame count for {} from ffprobe metadata",
+            video_path.display()
+        ))
+    })?;
+    if frame_count == 0 {
+        candle::bail!(
+            "video {} contains zero readable frames",
+            video_path.display()
+        );
+    }
+    Ok(VideoProbeMetadata {
+        video_size: ImageSize::new(height, width),
+        frame_count,
+    })
+}
+
+fn parse_frame_count(stream: &FfprobeStream) -> Option<usize> {
+    parse_optional_usize(stream.nb_read_frames.as_deref())
+        .or_else(|| parse_optional_usize(stream.nb_frames.as_deref()))
+        .or_else(|| {
+            let duration = stream.duration.as_deref()?.parse::<f64>().ok()?;
+            let fps = parse_rational_f64(stream.r_frame_rate.as_deref()?)?;
+            let approx = (duration * fps).round();
+            (approx.is_finite() && approx > 0.0).then_some(approx as usize)
+        })
+}
+
+fn parse_optional_usize(value: Option<&str>) -> Option<usize> {
+    let value = value?;
+    if value == "N/A" {
+        return None;
+    }
+    value.parse::<usize>().ok().filter(|value| *value > 0)
+}
+
+fn parse_rational_f64(value: &str) -> Option<f64> {
+    let (numerator, denominator) = value.split_once('/')?;
+    let numerator = numerator.parse::<f64>().ok()?;
+    let denominator = denominator.parse::<f64>().ok()?;
+    (denominator != 0.0).then_some(numerator / denominator)
+}
+
+fn decode_video_frame_blob(
+    video_path: &Path,
+    frame_idx: usize,
+    image_size: usize,
+    image_mean: [f32; 3],
+    image_std: [f32; 3],
+    expected_video_size: ImageSize,
+) -> Result<FrameBlob> {
+    let select_filter = format!("select=eq(n\\,{frame_idx})");
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(video_path)
+        .args([
+            "-vf",
+            &select_filter,
+            "-vframes",
+            "1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "-",
+        ])
+        .output()
+        .map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to run ffmpeg for {} frame {}: {}",
+                video_path.display(),
+                frame_idx,
+                err
+            ))
+        })?;
+    if !output.status.success() {
+        candle::bail!(
+            "ffmpeg failed for {} frame {}: {}",
+            video_path.display(),
+            frame_idx,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if output.stdout.is_empty() {
+        candle::bail!(
+            "ffmpeg produced no bytes for {} frame {}",
+            video_path.display(),
+            frame_idx
+        );
+    }
+    let image = image::load(Cursor::new(output.stdout), image::ImageFormat::Png)
+        .map_err(candle::Error::wrap)?
+        .to_rgb8();
+    frame_blob_from_rgb_image(
+        image,
+        image_size,
+        image_mean,
+        image_std,
+        expected_video_size,
+        &format!("{}#{}", video_path.display(), frame_idx),
+    )
 }
 
 fn sorted_image_paths(dir_path: &Path) -> Result<Vec<PathBuf>> {
@@ -2087,7 +2394,7 @@ fn mask_to_normalized_xyxy(mask: &Tensor) -> Result<Tensor> {
         2 => mask.clone(),
         rank => candle::bail!("expected mask rank 2, 3, or 4, got {}", rank),
     };
-    let values = mask.gt(0f32)?.to_vec2::<u8>()?;
+    let values = mask.ge(0.5f32)?.to_vec2::<u8>()?;
     if values.is_empty() || values[0].is_empty() {
         return Tensor::zeros((1, 4), DType::F32, mask.device());
     }
@@ -2124,6 +2431,33 @@ fn mask_to_normalized_xyxy(mask: &Tensor) -> Result<Tensor> {
     )
 }
 
+fn resize_mask_logits_to_video(mask_logits: &Tensor, video_size: ImageSize) -> Result<Tensor> {
+    let mask_logits = match mask_logits.rank() {
+        2 => mask_logits.unsqueeze(0)?.unsqueeze(0)?,
+        3 => mask_logits.unsqueeze(0)?,
+        4 => mask_logits.clone(),
+        rank => candle::bail!("expected mask logits rank 2, 3, or 4, got {}", rank),
+    };
+    mask_logits.upsample_bilinear2d(video_size.height, video_size.width, false)
+}
+
+fn canonicalize_score_tensor(scores: &Tensor) -> Result<Tensor> {
+    let values = scores.flatten_all()?.to_vec1::<f32>()?;
+    Tensor::from_vec(values, (scores.elem_count(),), scores.device())
+}
+
+fn trim_memory_frame_indices(
+    mut memory_frame_indices: Vec<usize>,
+    max_memory_frames: usize,
+) -> Vec<usize> {
+    if max_memory_frames == 0 || memory_frame_indices.len() <= max_memory_frames {
+        return memory_frame_indices;
+    }
+    let drop_count = memory_frame_indices.len() - max_memory_frames;
+    memory_frame_indices.drain(..drop_count);
+    memory_frame_indices
+}
+
 fn tracker_state_to_object_output(
     obj_id: u32,
     state: &TrackerFrameState,
@@ -2132,13 +2466,16 @@ fn tracker_state_to_object_output(
     text_prompt: Option<String>,
     used_explicit_geometry: bool,
     reused_previous_output: bool,
+    video_size: ImageSize,
 ) -> Result<ObjectFrameOutput> {
+    let mask_logits = resize_mask_logits_to_video(&state.high_res_masks, video_size)?;
+    let masks = candle_nn::ops::sigmoid(&mask_logits)?;
     Ok(ObjectFrameOutput {
         obj_id,
-        mask_logits: state.high_res_masks.clone(),
-        masks: candle_nn::ops::sigmoid(&state.high_res_masks)?,
-        boxes_xyxy: mask_to_normalized_xyxy(&state.high_res_masks)?,
-        scores: state.iou_scores.clone(),
+        mask_logits,
+        masks: masks.clone(),
+        boxes_xyxy: mask_to_normalized_xyxy(&masks)?,
+        scores: canonicalize_score_tensor(&state.iou_scores)?,
         presence_scores: Some(candle_nn::ops::sigmoid(&state.object_score_logits)?),
         prompt_frame_idx,
         memory_frame_indices,
@@ -2308,6 +2645,58 @@ mod tests {
         })
     }
 
+    fn ffmpeg_tools_available() -> bool {
+        for tool in ["ffmpeg", "ffprobe"] {
+            let Ok(output) = Command::new(tool).arg("-version").output() else {
+                return false;
+            };
+            if !output.status.success() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn write_test_video(video_path: &Path, red_values: &[u8]) -> Result<()> {
+        let frames_dir = video_path.with_extension("frames");
+        fs::create_dir_all(&frames_dir)?;
+        for (idx, red_value) in red_values.iter().enumerate() {
+            write_test_image(&frames_dir.join(format!("{idx}.png")), *red_value)?;
+        }
+
+        let output = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-framerate",
+                "1",
+                "-start_number",
+                "0",
+                "-i",
+            ])
+            .arg(frames_dir.join("%d.png"))
+            .args(["-c:v", "mpeg4", "-pix_fmt", "yuv420p"])
+            .arg(video_path)
+            .output()
+            .map_err(|err| {
+                candle::Error::Msg(format!(
+                    "failed to run ffmpeg to create {}: {}",
+                    video_path.display(),
+                    err
+                ))
+            })?;
+        if !output.status.success() {
+            candle::bail!(
+                "ffmpeg failed to create {}: {}",
+                video_path.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        fs::remove_dir_all(&frames_dir)?;
+        Ok(())
+    }
+
     #[test]
     fn image_folder_frame_source_sorts_numeric_stems() -> Result<()> {
         let dir = temp_path("numeric-sort");
@@ -2329,6 +2718,56 @@ mod tests {
         assert!(red0 < red1);
         assert!(red1 < red2);
         frame_source.close();
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn video_file_frame_source_decodes_lazily_and_preserves_order() -> Result<()> {
+        if !ffmpeg_tools_available() {
+            eprintln!("skipping video decode test because ffmpeg/ffprobe are unavailable");
+            return Ok(());
+        }
+
+        let dir = temp_path("video-file-source");
+        fs::create_dir_all(&dir)?;
+        let video_path = dir.join("clip.mp4");
+        write_test_video(&video_path, &[32, 96, 160])?;
+
+        let config = tiny_segmentation_config();
+        let source = VideoSource::from_path(&video_path)?;
+        let mut frame_source = source.into_frame_source(&config)?;
+
+        assert_eq!(frame_source.frame_count(), 3);
+        assert_eq!(frame_source.video_size(), ImageSize::new(4, 4));
+        assert_eq!(frame_source.loaded_frame_count(), 0);
+
+        let frame1 = frame_source.get_frame(1, &Device::Cpu)?;
+        assert_eq!(frame_source.loaded_frame_count(), 1);
+
+        frame_source.prefetch(&[0, 2])?;
+        assert_eq!(frame_source.loaded_frame_count(), 3);
+
+        let frame0 = frame_source.get_frame(0, &Device::Cpu)?;
+        let frame2 = frame_source.get_frame(2, &Device::Cpu)?;
+        let red0 = frame0.i((0, 0, 0))?.to_scalar::<f32>()?;
+        let red1 = frame1.i((0, 0, 0))?.to_scalar::<f32>()?;
+        let red2 = frame2.i((0, 0, 0))?.to_scalar::<f32>()?;
+        assert!(
+            red0 < red1,
+            "expected frame 0 red {red0} < frame 1 red {red1}"
+        );
+        assert!(
+            red1 < red2,
+            "expected frame 1 red {red1} < frame 2 red {red2}"
+        );
+
+        let keep = BTreeSet::from([1usize]);
+        frame_source.evict_except(&keep);
+        assert_eq!(frame_source.loaded_frame_count(), 1);
+        frame_source.close();
+        assert_eq!(frame_source.loaded_frame_count(), 0);
+
         fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -2594,5 +3033,72 @@ mod tests {
             "unexpected error: {err}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn probability_masks_use_half_threshold_for_box_extraction() -> Result<()> {
+        let device = Device::Cpu;
+        let mask = Tensor::from_vec(
+            vec![
+                0.1f32, 0.1, 0.1, 0.1, //
+                0.1, 0.9, 0.9, 0.1, //
+                0.1, 0.9, 0.9, 0.1, //
+                0.1, 0.1, 0.1, 0.1, //
+            ],
+            (1, 1, 4, 4),
+            &device,
+        )?;
+        let boxes = mask_to_normalized_xyxy(&mask)?;
+        assert_eq!(boxes.to_vec2::<f32>()?, vec![vec![0.25, 0.25, 0.75, 0.75]]);
+        Ok(())
+    }
+
+    #[test]
+    fn tracker_outputs_are_resized_to_video_space_and_scores_are_flattened() -> Result<()> {
+        let device = Device::Cpu;
+        let state = TrackerFrameState {
+            low_res_masks: Tensor::zeros((1, 1, 2, 2), DType::F32, &device)?,
+            high_res_masks: Tensor::from_vec(
+                vec![
+                    -5.0f32, -5.0, -5.0, -5.0, //
+                    -5.0, 5.0, 5.0, -5.0, //
+                    -5.0, 5.0, 5.0, -5.0, //
+                    -5.0, -5.0, -5.0, -5.0, //
+                ],
+                (1, 1, 4, 4),
+                &device,
+            )?,
+            iou_scores: Tensor::from_vec(vec![0.25f32], (1, 1), &device)?,
+            obj_ptr: Tensor::zeros((1, 8), DType::F32, &device)?,
+            object_score_logits: Tensor::from_vec(vec![2.0f32], (1, 1), &device)?,
+            maskmem_features: None,
+            maskmem_pos_enc: None,
+            is_cond_frame: true,
+        };
+        let output = tracker_state_to_object_output(
+            7,
+            &state,
+            Some(0),
+            vec![0, 1, 2],
+            None,
+            true,
+            false,
+            ImageSize::new(2, 6),
+        )?;
+        assert_eq!(output.mask_logits.dims(), &[1, 1, 2, 6]);
+        assert_eq!(output.masks.dims(), &[1, 1, 2, 6]);
+        assert_eq!(output.scores.to_vec1::<f32>()?, vec![0.25]);
+        assert_eq!(output.boxes_xyxy.dims(), &[1, 4]);
+        Ok(())
+    }
+
+    #[test]
+    fn memory_frame_indices_trim_to_configured_window() {
+        assert_eq!(VideoConfig::default().memory_frame_count, 6);
+        assert_eq!(
+            trim_memory_frame_indices(vec![0, 1, 2, 3, 4, 5, 6], 6),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+        assert_eq!(trim_memory_frame_indices(vec![3, 4], 6), vec![3, 4]);
     }
 }

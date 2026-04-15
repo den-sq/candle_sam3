@@ -131,9 +131,18 @@ pub fn run_video_prediction(
 fn object_to_json(object: &sam3::ObjectFrameOutput) -> serde_json::Value {
     serde_json::json!({
         "obj_id": object.obj_id,
-        "scores": object.scores.to_vec1::<f32>().unwrap_or_default(),
+        "scores": object
+            .scores
+            .flatten_all()
+            .and_then(|tensor| tensor.to_vec1::<f32>())
+            .unwrap_or_default(),
         "boxes_xyxy": object.boxes_xyxy.to_vec2::<f32>().unwrap_or_default(),
         "mask_shape": object.masks.dims(),
+        "presence_scores": object
+            .presence_scores
+            .as_ref()
+            .and_then(|tensor| tensor.flatten_all().ok())
+            .and_then(|tensor| tensor.to_vec1::<f32>().ok()),
         "prompt_frame_idx": object.prompt_frame_idx,
         "memory_frame_indices": object.memory_frame_indices,
         "text_prompt": object.text_prompt,
