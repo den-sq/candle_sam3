@@ -102,6 +102,22 @@ struct Args {
     #[arg(long, default_value = "1")]
     video_frame_stride: usize,
 
+    /// Number of future frames to prefetch around the active video frame.
+    #[arg(long, default_value = "2")]
+    video_prefetch_ahead: usize,
+
+    /// Number of past frames to keep prefetched around the active video frame.
+    #[arg(long, default_value = "1")]
+    video_prefetch_behind: usize,
+
+    /// Maximum number of per-frame visual feature entries to cache.
+    #[arg(long, default_value = "2")]
+    video_max_feature_cache_entries: usize,
+
+    /// Offload finalized video state tensors to CPU storage when possible.
+    #[arg(long)]
+    video_offload_state_to_cpu: bool,
+
     /// Enable interactive refinement mode for the specified image.
     #[arg(long)]
     interactive: Option<String>,
@@ -2601,12 +2617,17 @@ pub fn main() -> anyhow::Result<()> {
             .unwrap_or_default();
         let video_mode = video::VideoMode {
             video_path: video_path.to_string(),
+            tokenizer_path: args.tokenizer.clone(),
             prompt_text: args.video_prompt.clone(),
             points,
             point_labels,
             boxes,
             box_labels,
             frame_stride: args.video_frame_stride,
+            prefetch_ahead: args.video_prefetch_ahead,
+            prefetch_behind: args.video_prefetch_behind,
+            max_feature_cache_entries: args.video_max_feature_cache_entries,
+            offload_state_to_cpu: args.video_offload_state_to_cpu || !args.cpu,
         };
         video::run_video_prediction(
             model
