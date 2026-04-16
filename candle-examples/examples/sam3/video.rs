@@ -503,6 +503,9 @@ pub fn run_video_reference_comparison(
     bundle_path: &str,
     output_dir: &Path,
     device: &Device,
+    debug_bundle_override: bool,
+    debug_obj_ids_override: &[u32],
+    debug_frame_indices_override: &[usize],
 ) -> Result<()> {
     let (metadata, reference_results, bundle_root) = load_video_bundle(Path::new(bundle_path))?;
     let reference_frames_dir = bundle_root.join(&metadata.frames_dir);
@@ -522,6 +525,26 @@ pub fn run_video_reference_comparison(
         .as_ref()
         .map(|path| load_video_debug_manifest(path))
         .transpose()?;
+    let requested_debug_bundle = debug_bundle_override
+        || !debug_obj_ids_override.is_empty()
+        || !debug_frame_indices_override.is_empty();
+    let debug_bundle = requested_debug_bundle || reference_debug.is_some();
+    let debug_obj_ids = if !debug_obj_ids_override.is_empty() {
+        debug_obj_ids_override.to_vec()
+    } else {
+        reference_debug
+            .as_ref()
+            .map(|manifest| manifest.capture_obj_ids.clone())
+            .unwrap_or_default()
+    };
+    let debug_frame_indices = if !debug_frame_indices_override.is_empty() {
+        debug_frame_indices_override.to_vec()
+    } else {
+        reference_debug
+            .as_ref()
+            .map(|manifest| manifest.capture_frame_indices.clone())
+            .unwrap_or_default()
+    };
     let video_mode = VideoMode {
         video_path: reference_frames_dir.display().to_string(),
         tokenizer_path: metadata.tokenizer_path.clone(),
@@ -543,15 +566,9 @@ pub fn run_video_reference_comparison(
         prefetch_behind: 1,
         max_feature_cache_entries: 2,
         offload_state_to_cpu: false,
-        debug_bundle: reference_debug.is_some(),
-        debug_obj_ids: reference_debug
-            .as_ref()
-            .map(|manifest| manifest.capture_obj_ids.clone())
-            .unwrap_or_default(),
-        debug_frame_indices: reference_debug
-            .as_ref()
-            .map(|manifest| manifest.capture_frame_indices.clone())
-            .unwrap_or_default(),
+        debug_bundle,
+        debug_obj_ids,
+        debug_frame_indices,
     };
 
     run_video_prediction(model, tracker, &video_mode, output_dir, device)?;
@@ -929,6 +946,26 @@ fn classify_debug_divergence(
     reference_area_growth_ratio: Option<f32>,
     notes: &mut Vec<String>,
 ) -> String {
+    if let Some(metrics) = detector_vs_seed {
+        if metrics.mask_iou_threshold_0_5.is_some_and(|iou| iou < 0.9)
+            || metrics.box_iou.is_some_and(|iou| iou < 0.85)
+            || metrics.mean_box_abs_diff.is_some_and(|diff| diff >= 0.02)
+        {
+            notes.push(
+                "Candle tracker seed already diverges from Candle detector grounding on the prompt frame".to_owned(),
+            );
+            return "handoff".to_owned();
+        }
+    }
+    if let Some(metrics) = seed_vs_reference {
+        if metrics.mask_iou_threshold_0_5.is_some_and(|iou| iou < 0.9)
+            || metrics.box_iou.is_some_and(|iou| iou < 0.85)
+            || metrics.mean_box_abs_diff.is_some_and(|diff| diff >= 0.02)
+        {
+            notes.push("prompt-frame detector output is still not close to upstream".to_owned());
+            return "handoff".to_owned();
+        }
+    }
     if let Some(metrics) = propagated_vs_reference {
         if let (Some(mask_iou), Some(box_iou), Some(box_abs_diff)) = (
             metrics.mask_iou_threshold_0_5,
@@ -941,16 +978,6 @@ fn classify_debug_divergence(
                 );
                 return "postprocess".to_owned();
             }
-        }
-    }
-    if let Some(metrics) = detector_vs_seed {
-        if metrics.mask_iou_threshold_0_5.is_some_and(|iou| iou < 0.9)
-            || metrics.mean_box_abs_diff.is_some_and(|diff| diff >= 0.05)
-        {
-            notes.push(
-                "Candle tracker seed already diverges from Candle detector grounding on the prompt frame".to_owned(),
-            );
-            return "handoff".to_owned();
         }
     }
     if let Some(metrics) = propagated_vs_reference {
@@ -967,12 +994,6 @@ fn classify_debug_divergence(
                 "Candle mask area grows faster than upstream between the prompt frame and first propagated frame ({candle_ratio:.3} vs {reference_ratio:.3})"
             ));
             return "propagation".to_owned();
-        }
-    }
-    if let Some(metrics) = seed_vs_reference {
-        if metrics.mask_iou_threshold_0_5.is_some_and(|iou| iou < 0.9) {
-            notes.push("prompt-frame detector output is still not close to upstream".to_owned());
-            return "handoff".to_owned();
         }
     }
     notes.push(
@@ -1566,6 +1587,70 @@ mod tests {
             &actual_manifest,
         )?;
         assert_eq!(report.verdict, "postprocess");
+        Ok(())
+    }
+
+    #[test]
+    fn debug_comparison_classifies_seed_box_drift_as_handoff() -> Result<()> {
+        let reference_root = temp_path("debug-report-reference-handoff");
+        let actual_root = temp_path("debug-report-actual-handoff");
+        fs::create_dir_all(&reference_root)?;
+        fs::create_dir_all(&actual_root)?;
+        write_mask(&reference_root.join("prompt.png"), &[&[255, 0], &[0, 0]])?;
+        write_mask(&reference_root.join("prop.png"), &[&[255, 0], &[0, 0]])?;
+        write_mask(&actual_root.join("detector.png"), &[&[255, 0], &[0, 0]])?;
+        write_mask(&actual_root.join("seed.png"), &[&[255, 0], &[0, 0]])?;
+        write_mask(&actual_root.join("prop.png"), &[&[255, 0], &[0, 0]])?;
+
+        let reference_manifest = base_manifest(
+            "upstream",
+            vec![
+                debug_record(
+                    "prompt_frame_output",
+                    0,
+                    0,
+                    "prompt.png",
+                    [0.4, 0.5, 0.7, 0.8],
+                ),
+                debug_record(
+                    "first_propagated_output",
+                    1,
+                    0,
+                    "prop.png",
+                    [0.4, 0.5, 0.7, 0.8],
+                ),
+            ],
+        );
+        let actual_manifest = base_manifest(
+            "candle",
+            vec![
+                debug_record(
+                    "detector_grounding",
+                    0,
+                    0,
+                    "detector.png",
+                    [0.4, 0.5, 0.7, 0.8],
+                ),
+                debug_record("tracker_seed", 0, 0, "seed.png", [0.4, 0.5, 0.7, 1.0]),
+                debug_record(
+                    "first_propagated_output",
+                    1,
+                    0,
+                    "prop.png",
+                    [0.4, 0.5, 0.7, 0.8],
+                ),
+            ],
+        );
+
+        let report = build_video_debug_comparison_report(
+            &reference_root,
+            "reference_bundle",
+            &reference_manifest,
+            &actual_root,
+            &actual_root,
+            &actual_manifest,
+        )?;
+        assert_eq!(report.verdict, "handoff");
         Ok(())
     }
 }

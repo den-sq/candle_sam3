@@ -753,6 +753,7 @@ pub struct TrackedObject {
     pub obj_id: u32,
     pub creation_frame: usize,
     pub last_updated_frame: usize,
+    pub display_score: Option<f32>,
     pub has_inference_history: bool,
     pub prompt_frames: BTreeMap<usize, SessionPrompt>,
     pub frame_outputs: BTreeMap<usize, ObjectFrameOutput>,
@@ -765,6 +766,7 @@ impl TrackedObject {
             obj_id,
             creation_frame,
             last_updated_frame: creation_frame,
+            display_score: None,
             has_inference_history: false,
             prompt_frames: BTreeMap::new(),
             frame_outputs: BTreeMap::new(),
@@ -1495,6 +1497,7 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
         frame_idx: usize,
         output: ObjectFrameOutput,
         state: TrackerFrameState,
+        new_display_score: Option<f32>,
     ) -> Result<ObjectFrameOutput> {
         let stored_output = output.to_storage_device(session.storage_device())?;
         let stored_state = state.to_storage_device(session.storage_device())?;
@@ -1509,6 +1512,9 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
             .insert(frame_idx, stored_output.clone());
         tracked.tracker_states.insert(frame_idx, stored_state);
         tracked.last_updated_frame = frame_idx;
+        if let Some(display_score) = new_display_score {
+            tracked.display_score = Some(display_score);
+        }
         tracked.has_inference_history = true;
         session
             .frame_outputs
@@ -1578,7 +1584,14 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
         let history = self.history_on_device(object, frame_idx, direction, compute_device)?;
         // Upstream video inference seeds tracker memory from detector masks on the prompt
         // frame, including the initial box-as-visual prompt case.
-        let mask_input = grounding.mask_logits.gt(0f32)?.to_dtype(DType::F32)?;
+        let display_score = detector_output.score_value()?;
+        let tracker_input_size = self.tracker.input_mask_size();
+        let tracker_seed_probs = resize_mask_probs(
+            &detector_output.masks,
+            tracker_input_size,
+            tracker_input_size,
+        )?;
+        let mask_input = threshold_mask_probs(&tracker_seed_probs, VIDEO_DEBUG_MASK_THRESHOLD)?;
         let step = self.tracker.track_frame(
             &visual,
             frame_idx,
@@ -1603,6 +1616,7 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
             let tracker_seed_output = tracker_state_to_object_output(
                 object.obj_id,
                 &step.state,
+                Some(display_score),
                 Some(frame_idx),
                 trimmed_memory_frame_indices,
                 prompt.text.clone(),
@@ -1619,7 +1633,7 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
                 &step.state,
             )?;
         }
-        self.store_object_result(session, frame_idx, output, step.state)
+        self.store_object_result(session, frame_idx, output, step.state, Some(display_score))
     }
 
     fn seed_with_tracker_points(
@@ -1642,6 +1656,7 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
             Some((coords, labels)) => (Some(coords), Some(labels)),
             None => (None, None),
         };
+        let display_score = 1.0;
         let step = self.tracker.track_frame(
             &visual,
             frame_idx,
@@ -1658,6 +1673,7 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
         let output = tracker_state_to_object_output(
             object.obj_id,
             &step.state,
+            Some(display_score),
             Some(frame_idx),
             trim_memory_frame_indices(step.memory_frame_indices, config.memory_frame_count),
             prompt.text.clone(),
@@ -1665,7 +1681,7 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
             false,
             session.video_size(),
         )?;
-        self.store_object_result(session, frame_idx, output, step.state)
+        self.store_object_result(session, frame_idx, output, step.state, Some(display_score))
     }
 
     fn propagate_with_tracker(
@@ -1715,6 +1731,7 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
         let output = tracker_state_to_object_output(
             object.obj_id,
             &step.state,
+            object.display_score,
             prompt_frame_idx,
             trim_memory_frame_indices(step.memory_frame_indices, config.memory_frame_count),
             text_prompt,
@@ -1736,7 +1753,7 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
             )?;
         }
         Ok(Some(self.store_object_result(
-            session, frame_idx, output, step.state,
+            session, frame_idx, output, step.state, None,
         )?))
     }
 
@@ -3086,9 +3103,27 @@ fn resize_mask_logits_to_video(mask_logits: &Tensor, video_size: ImageSize) -> R
     mask_logits.upsample_bilinear2d(video_size.height, video_size.width, false)
 }
 
+fn threshold_mask_probs(mask_probs: &Tensor, threshold: f32) -> Result<Tensor> {
+    mask_probs.ge(threshold)?.to_dtype(DType::F32)
+}
+
+fn resize_mask_probs(mask_probs: &Tensor, height: usize, width: usize) -> Result<Tensor> {
+    let mask_probs = match mask_probs.rank() {
+        2 => mask_probs.unsqueeze(0)?.unsqueeze(0)?,
+        3 => mask_probs.unsqueeze(0)?,
+        4 => mask_probs.clone(),
+        rank => candle::bail!("expected mask probabilities rank 2, 3, or 4, got {}", rank),
+    };
+    mask_probs.upsample_bilinear2d(height, width, false)
+}
+
 fn canonicalize_score_tensor(scores: &Tensor) -> Result<Tensor> {
     let values = scores.flatten_all()?.to_vec1::<f32>()?;
     Tensor::from_vec(values, (scores.elem_count(),), scores.device())
+}
+
+fn score_tensor_from_value(score: f32, device: &Device) -> Result<Tensor> {
+    Tensor::from_vec(vec![score], (1,), device)
 }
 
 fn trim_memory_frame_indices(
@@ -3106,6 +3141,7 @@ fn trim_memory_frame_indices(
 fn tracker_state_to_object_output(
     obj_id: u32,
     state: &TrackerFrameState,
+    score_override: Option<f32>,
     prompt_frame_idx: Option<usize>,
     memory_frame_indices: Vec<usize>,
     text_prompt: Option<String>,
@@ -3120,7 +3156,10 @@ fn tracker_state_to_object_output(
         mask_logits,
         masks: masks.clone(),
         boxes_xyxy: mask_to_normalized_xyxy(&masks)?,
-        scores: canonicalize_score_tensor(&state.iou_scores)?,
+        scores: match score_override {
+            Some(score) => score_tensor_from_value(score, state.iou_scores.device())?,
+            None => canonicalize_score_tensor(&state.iou_scores)?,
+        },
         presence_scores: Some(candle_nn::ops::sigmoid(&state.object_score_logits)?),
         prompt_frame_idx,
         memory_frame_indices,
@@ -3754,6 +3793,7 @@ mod tests {
         let output = tracker_state_to_object_output(
             7,
             &state,
+            None,
             Some(0),
             vec![0, 1, 2],
             None,
@@ -3765,6 +3805,34 @@ mod tests {
         assert_eq!(output.masks.dims(), &[1, 1, 2, 6]);
         assert_eq!(output.scores.to_vec1::<f32>()?, vec![0.25]);
         assert_eq!(output.boxes_xyxy.dims(), &[1, 4]);
+        Ok(())
+    }
+
+    #[test]
+    fn tracker_outputs_can_use_persistent_display_scores() -> Result<()> {
+        let device = Device::Cpu;
+        let state = TrackerFrameState {
+            low_res_masks: Tensor::zeros((1, 1, 2, 2), DType::F32, &device)?,
+            high_res_masks: Tensor::zeros((1, 1, 2, 2), DType::F32, &device)?,
+            iou_scores: Tensor::from_vec(vec![0.25f32], (1, 1), &device)?,
+            obj_ptr: Tensor::zeros((1, 8), DType::F32, &device)?,
+            object_score_logits: Tensor::from_vec(vec![2.0f32], (1, 1), &device)?,
+            maskmem_features: None,
+            maskmem_pos_enc: None,
+            is_cond_frame: true,
+        };
+        let output = tracker_state_to_object_output(
+            7,
+            &state,
+            Some(0.9),
+            Some(0),
+            vec![0],
+            None,
+            true,
+            false,
+            ImageSize::new(2, 2),
+        )?;
+        assert_eq!(output.scores.to_vec1::<f32>()?, vec![0.9]);
         Ok(())
     }
 
@@ -3811,6 +3879,25 @@ mod tests {
         assert_ne!(
             output.boxes_xyxy.to_vec2::<f32>()?,
             vec![vec![0.0, 0.0, 0.0, 0.0]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tracker_seed_masks_are_thresholded_from_video_space_probabilities() -> Result<()> {
+        let device = Device::Cpu;
+        let mask_probs = Tensor::from_vec(
+            vec![
+                0.4f32, 0.6, 0.49, 0.51, //
+                0.6, 0.4, 0.51, 0.49, //
+            ],
+            (1, 2, 4),
+            &device,
+        )?;
+        let mask_input = threshold_mask_probs(&mask_probs, VIDEO_DEBUG_MASK_THRESHOLD)?;
+        assert_eq!(
+            mask_input.to_vec3::<f32>()?,
+            vec![vec![vec![0.0, 1.0, 0.0, 1.0], vec![1.0, 0.0, 1.0, 0.0],]]
         );
         Ok(())
     }

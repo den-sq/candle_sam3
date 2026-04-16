@@ -2584,6 +2584,9 @@ pub fn main() -> anyhow::Result<()> {
                 bundle_path,
                 Path::new(&args.output_dir),
                 &device,
+                args.video_debug_bundle,
+                &args.video_debug_obj_ids,
+                &args.video_debug_frames,
             )?;
         } else {
             run_reference_comparison(

@@ -27,6 +27,8 @@ pub struct Sam3TrackerConfig {
     pub tracker_num_layers: usize,
     pub tracker_feedforward_dim: usize,
     pub maskmem_interpol_size: usize,
+    pub multimask_output_in_sam: bool,
+    pub multimask_output_for_tracking: bool,
     pub multimask_min_pt_num: usize,
     pub multimask_max_pt_num: usize,
 }
@@ -45,7 +47,9 @@ impl Default for Sam3TrackerConfig {
             tracker_num_layers: 4,
             tracker_feedforward_dim: 2048,
             maskmem_interpol_size: 1152,
-            multimask_min_pt_num: 1,
+            multimask_output_in_sam: true,
+            multimask_output_for_tracking: true,
+            multimask_min_pt_num: 0,
             multimask_max_pt_num: 1,
         }
     }
@@ -66,6 +70,19 @@ impl Sam3TrackerConfig {
 
     fn low_res_mask_size(&self) -> usize {
         self.image_embedding_size() * 4
+    }
+
+    fn use_multimask(
+        &self,
+        is_init_cond_frame: bool,
+        has_box_prompt: bool,
+        point_count: usize,
+    ) -> bool {
+        self.multimask_output_in_sam
+            && !has_box_prompt
+            && (is_init_cond_frame || self.multimask_output_for_tracking)
+            && point_count >= self.multimask_min_pt_num
+            && point_count <= self.multimask_max_pt_num
     }
 }
 
@@ -355,11 +372,15 @@ impl Sam3TrackerMaskDecoder {
         let high_res_multimasks =
             low_res_multimasks.upsample_bilinear2d(height * 4, width * 4, false)?;
         let iou_pred = self.iou_prediction_head.forward(&iou_token_out)?;
-        let sam_tokens_out = if multimask_output && self.use_multimask_token_for_obj_ptr {
-            mask_tokens_out.i((.., 1..))?
-        } else {
-            mask_tokens_out.i((.., 0..1))?
-        };
+        let (low_res_multimasks, high_res_multimasks, iou_pred, sam_tokens_out) =
+            slice_tracker_decoder_outputs(
+                &low_res_multimasks,
+                &high_res_multimasks,
+                &iou_pred,
+                &mask_tokens_out,
+                multimask_output,
+                self.use_multimask_token_for_obj_ptr,
+            )?;
 
         Ok(Sam3TrackerMaskDecoderOutput {
             low_res_multimasks,
@@ -368,6 +389,36 @@ impl Sam3TrackerMaskDecoder {
             sam_tokens_out,
             object_score_logits,
         })
+    }
+}
+
+fn slice_tracker_decoder_outputs(
+    low_res_multimasks: &Tensor,
+    high_res_multimasks: &Tensor,
+    iou_pred: &Tensor,
+    mask_tokens_out: &Tensor,
+    multimask_output: bool,
+    use_multimask_token_for_obj_ptr: bool,
+) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+    if multimask_output {
+        let sam_tokens_out = if use_multimask_token_for_obj_ptr {
+            mask_tokens_out.i((.., 1..))?
+        } else {
+            mask_tokens_out.i((.., 0..1))?
+        };
+        Ok((
+            low_res_multimasks.i((.., 1..))?,
+            high_res_multimasks.i((.., 1..))?,
+            iou_pred.i((.., 1..))?,
+            sam_tokens_out,
+        ))
+    } else {
+        Ok((
+            low_res_multimasks.i((.., 0..1))?,
+            high_res_multimasks.i((.., 0..1))?,
+            iou_pred.i((.., 0..1))?,
+            mask_tokens_out.i((.., 0..1))?,
+        ))
     }
 }
 
@@ -1000,6 +1051,10 @@ impl Sam3TrackerModel {
         &self.config
     }
 
+    pub fn input_mask_size(&self) -> usize {
+        self.config.low_res_mask_size() * 4
+    }
+
     pub fn track_frame(
         &self,
         visual: &VisualBackboneOutput,
@@ -1077,10 +1132,9 @@ impl Sam3TrackerModel {
                 .map(|coords| coords.dim(1))
                 .transpose()?
                 .unwrap_or(0);
-            let multimask_output = is_conditioning_frame
-                && boxes_xyxy.is_none()
-                && point_count >= self.config.multimask_min_pt_num
-                && point_count <= self.config.multimask_max_pt_num;
+            let multimask_output =
+                self.config
+                    .use_multimask(is_init_cond_frame, boxes_xyxy.is_some(), point_count);
             self.forward_sam_heads(
                 &pix_feat_with_mem,
                 &image_pe,
@@ -1132,24 +1186,17 @@ impl Sam3TrackerModel {
             self.config.low_res_mask_size(),
             false,
         )?;
-        let mask_prompt = self
+        let sam_mask_prompt = self
             .mask_downsample
             .forward(&mask_input.to_dtype(DType::F32)?)?;
+        let (sparse_embeddings, dense_embeddings) =
+            self.prompt_encoder
+                .forward(None, None, Some(&sam_mask_prompt))?;
         let image_pe = self.prompt_encoder.get_dense_pe()?;
-        let empty_sparse = Tensor::zeros(
-            (mask_input.dim(0)?, 0, self.config.hidden_dim),
-            DType::F32,
-            mask_input.device(),
-        )?;
-        let dense_embeddings = if mask_prompt.rank() == 4 {
-            mask_prompt
-        } else {
-            mask_prompt.unsqueeze(1)?
-        };
         let mut sam = self.forward_sam_heads(
             backbone_features,
             &image_pe,
-            &empty_sparse,
+            &sparse_embeddings,
             &dense_embeddings,
             false,
             high_res_features,
@@ -1165,6 +1212,8 @@ impl Sam3TrackerModel {
                 .affine(-1.0, 1.0)?
                 .broadcast_mul(&self.no_obj_ptr.broadcast_as(sam.state.obj_ptr.shape())?)?),
         )?;
+        sam.state.iou_scores =
+            Tensor::ones((mask_input.dim(0)?, 1), DType::F32, mask_input.device())?;
         sam.state.low_res_masks = low_res_masks;
         sam.state.high_res_masks = high_res_masks;
         sam.state.object_score_logits = lambda.affine(20.0, -10.0)?;
@@ -1356,6 +1405,7 @@ impl Sam3TrackerModel {
             }
             let prev = history
                 .get(&prev_frame_idx)
+                .filter(|state| !state.is_cond_frame)
                 .or_else(|| unselected_cond_outputs.get(&prev_frame_idx).copied());
             if let Some(prev) = prev {
                 t_pos_and_states.push((t_pos, prev_frame_idx, prev, false));
@@ -1384,6 +1434,7 @@ impl Sam3TrackerModel {
         prompt_frame_indices.sort_unstable();
         memory_frame_indices.sort_unstable();
 
+        let max_obj_ptrs_in_encoder = self.config.max_obj_ptrs_in_encoder.min(num_frames);
         let mut pos_and_ptrs = selected_cond_outputs
             .iter()
             .filter(|(idx, _)| {
@@ -1395,7 +1446,7 @@ impl Sam3TrackerModel {
             })
             .map(|(idx, state)| (frame_distance(frame_idx, *idx), state.obj_ptr.clone()))
             .collect::<Vec<_>>();
-        for t_diff in 1..self.config.max_obj_ptrs_in_encoder.min(num_frames) {
+        for t_diff in 1..max_obj_ptrs_in_encoder {
             let prev_frame_idx = if reverse {
                 frame_idx + t_diff
             } else if frame_idx >= t_diff {
@@ -1408,6 +1459,7 @@ impl Sam3TrackerModel {
             }
             if let Some(prev) = history
                 .get(&prev_frame_idx)
+                .filter(|state| !state.is_cond_frame)
                 .or_else(|| unselected_cond_outputs.get(&prev_frame_idx).copied())
             {
                 pos_and_ptrs.push((t_diff, prev.obj_ptr.clone()));
@@ -1423,7 +1475,8 @@ impl Sam3TrackerModel {
                 ptrs.push(ptr.clone());
             }
             let obj_ptrs = Tensor::stack(&ptrs.iter().collect::<Vec<_>>(), 1)?;
-            let obj_pos = self.get_obj_ptr_tpos(&pos_values, obj_ptrs.device())?;
+            let obj_pos =
+                self.get_obj_ptr_tpos(&pos_values, max_obj_ptrs_in_encoder, obj_ptrs.device())?;
             if self.config.memory_dim < self.config.hidden_dim {
                 let splits = self.config.hidden_dim / self.config.memory_dim;
                 let obj_ptrs = obj_ptrs.reshape((
@@ -1476,8 +1529,14 @@ impl Sam3TrackerModel {
         ))
     }
 
-    fn get_obj_ptr_tpos(&self, positions: &[f32], device: &candle::Device) -> Result<Tensor> {
-        let pe = get_1d_sine_pe(positions, self.config.hidden_dim, device)?;
+    fn get_obj_ptr_tpos(
+        &self,
+        positions: &[f32],
+        max_abs_pos: usize,
+        device: &candle::Device,
+    ) -> Result<Tensor> {
+        let positions = normalize_obj_ptr_positions(positions, max_abs_pos);
+        let pe = get_1d_sine_pe(&positions, self.config.hidden_dim, device)?;
         let pe = self.obj_ptr_tpos_proj.forward(&pe.contiguous()?)?;
         pe.unsqueeze(0)
     }
@@ -1485,6 +1544,11 @@ impl Sam3TrackerModel {
 
 fn frame_distance(current: usize, other: usize) -> usize {
     current.abs_diff(other)
+}
+
+fn normalize_obj_ptr_positions(positions: &[f32], max_abs_pos: usize) -> Vec<f32> {
+    let denom = max_abs_pos.saturating_sub(1).max(1) as f32;
+    positions.iter().map(|value| *value / denom).collect()
 }
 
 fn build_2d_sine_position_encoding(feature: &Tensor, d_model: usize) -> Result<Tensor> {
@@ -1607,6 +1671,90 @@ fn get_1d_sine_pe(positions: &[f32], dim: usize, device: &candle::Device) -> Res
         }
     }
     Tensor::from_slice(&values, (positions.len(), dim), device)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle::Device;
+
+    fn tracker_state(device: &Device, is_cond_frame: bool) -> Result<TrackerFrameState> {
+        Ok(TrackerFrameState {
+            low_res_masks: Tensor::zeros((1, 1, 2, 2), DType::F32, device)?,
+            high_res_masks: Tensor::zeros((1, 1, 2, 2), DType::F32, device)?,
+            iou_scores: Tensor::zeros((1, 1), DType::F32, device)?,
+            obj_ptr: Tensor::zeros((1, 8), DType::F32, device)?,
+            object_score_logits: Tensor::zeros((1, 1), DType::F32, device)?,
+            maskmem_features: None,
+            maskmem_pos_enc: None,
+            is_cond_frame,
+        })
+    }
+
+    #[test]
+    fn selected_conditioning_frames_are_not_reused_as_memory() -> Result<()> {
+        let device = Device::Cpu;
+        let mut history = BTreeMap::new();
+        history.insert(0usize, tracker_state(&device, true)?);
+        history.insert(1usize, tracker_state(&device, false)?);
+        let unselected_cond_outputs: BTreeMap<usize, &TrackerFrameState> = BTreeMap::new();
+
+        let selected_cond = history
+            .get(&0)
+            .filter(|state| !state.is_cond_frame)
+            .or_else(|| unselected_cond_outputs.get(&0).copied());
+        let non_cond = history
+            .get(&1)
+            .filter(|state| !state.is_cond_frame)
+            .or_else(|| unselected_cond_outputs.get(&1).copied());
+
+        assert!(selected_cond.is_none());
+        assert!(non_cond.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn object_pointer_positions_are_normalized_by_max_pointer_count() {
+        assert_eq!(
+            normalize_obj_ptr_positions(&[1.0, 2.0, 15.0], 16),
+            vec![1.0 / 15.0, 2.0 / 15.0, 1.0]
+        );
+        assert_eq!(normalize_obj_ptr_positions(&[1.0], 1), vec![1.0]);
+    }
+
+    #[test]
+    fn tracker_input_mask_size_matches_upstream_shape_contract() {
+        let config = Sam3TrackerConfig::default();
+        assert_eq!(config.low_res_mask_size(), 288);
+        assert_eq!(config.low_res_mask_size() * 4, 1152);
+    }
+
+    #[test]
+    fn propagated_tracking_uses_multimask_under_upstream_defaults() {
+        let config = Sam3TrackerConfig::default();
+        assert!(config.use_multimask(false, false, 0));
+        assert!(config.use_multimask(true, false, 0));
+        assert!(!config.use_multimask(false, true, 0));
+        assert!(!config.use_multimask(false, false, 2));
+    }
+
+    #[test]
+    fn multimask_decoder_slices_iou_and_tokens_consistently() -> Result<()> {
+        let device = Device::Cpu;
+        let low = Tensor::zeros((1, 4, 2, 2), DType::F32, &device)?;
+        let high = Tensor::zeros((1, 4, 4, 4), DType::F32, &device)?;
+        let iou = Tensor::from_vec(vec![0f32, 1f32, 2f32, 3f32], (1, 4), &device)?;
+        let tokens = Tensor::zeros((1, 4, 8), DType::F32, &device)?;
+
+        let (low, high, iou, tok) =
+            slice_tracker_decoder_outputs(&low, &high, &iou, &tokens, true, true)?;
+        assert_eq!(low.dims(), &[1, 3, 2, 2]);
+        assert_eq!(high.dims(), &[1, 3, 4, 4]);
+        assert_eq!(iou.dims(), &[1, 3]);
+        assert_eq!(tok.dims(), &[1, 3, 8]);
+        assert_eq!(iou.to_vec2::<f32>()?, vec![vec![1.0, 2.0, 3.0]]);
+        Ok(())
+    }
 }
 
 fn repeat_interleave(xs: &Tensor, repeats: usize, dim: usize) -> Result<Tensor> {
