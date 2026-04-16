@@ -51,10 +51,10 @@ The downloaded upstream notebooks split into three groups:
   - `sam3_image_batched_inference.ipynb`
 - partially mapped:
   - `sam3_image_interactive.ipynb`
+  - `sam3_video_predictor_example.ipynb`
 - not yet supported:
   - `sam3_for_sam1_task_example.ipynb`
   - `sam3_for_sam2_video_task_example.ipynb`
-  - `sam3_video_predictor_example.ipynb`
   - `sam3_agent.ipynb`
 
 What is implemented in this Candle example:
@@ -65,13 +65,14 @@ What is implemented in this Candle example:
 - sequential batch-manifest execution that mirrors the batched notebook workflow at the CLI level
 - a canned `--image-predictor-example` mode that replays the inputs from `sam3_image_predictor_example.ipynb`
 - Phase 12 MVP for deterministic `--interactive` image refinement replays
-- Phase 12 scaffolding for `--video` session runs
+- 30-frame video export bundles with frame, mask, and masked-frame artifacts
+- video reference comparison against upstream exported bundles
 
 What is not implemented here yet:
 
 - Jupyter widget interaction
 - live GUI-driven interactive refinement UX
-- true multi-frame video tracking and object propagation
+- full upstream notebook parity for complex multi-object video workflows
 - agent / LLM integration
 
 ## Relevant modules
@@ -420,6 +421,58 @@ It also writes rendered artifacts for each replay step under:
 - `step_000_<name>/mask.png`
 - `step_000_<name>/summary.json`
 
+### Export 30-Frame Video Reference Bundle
+
+The video exporter writes the first 30 frames used for inference plus the
+per-frame masks and masked-frame overlays from the upstream SAM3 video
+predictor. This example seeds the foreground dancer on frame `0` with a single
+box prompt:
+
+```bash
+python candle-examples/examples/sam3/export_reference.py \
+  --sam3-repo /home/dnorthover/extcode/sam3_baseline \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --video /home/dnorthover/extcode/sam3_baseline/assets/videos/bedroom.mp4 \
+  --video-frame-count 30 \
+  --box 0.57,0.70,0.28,0.52 \
+  --box-label 1 \
+  --output-dir candle-examples/examples/sam3/reference_video_box
+```
+
+This writes:
+
+- `candle-examples/examples/sam3/reference_video_box/reference.json`
+- `candle-examples/examples/sam3/reference_video_box/video_results.json`
+- `candle-examples/examples/sam3/reference_video_box/frames/frame_000000.png` through `frame_000029.png`
+- `candle-examples/examples/sam3/reference_video_box/masks/frame_000000_obj_000000.png` ...
+- `candle-examples/examples/sam3/reference_video_box/masked_frames/frame_000000_obj_000000.png` ...
+
+### Export 30-Frame Video Reference Bundle With Debug Artifacts
+
+Add `--video-debug-bundle` to export the prompt-frame output plus the first
+propagated-frame observable debug bundle under `debug/`:
+
+```bash
+python candle-examples/examples/sam3/export_reference.py \
+  --sam3-repo /home/dnorthover/extcode/sam3_baseline \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --video /home/dnorthover/extcode/sam3_baseline/assets/videos/bedroom.mp4 \
+  --video-frame-count 30 \
+  --box 0.57,0.70,0.28,0.52 \
+  --box-label 1 \
+  --video-debug-bundle \
+  --output-dir candle-examples/examples/sam3/reference_video_box_debug
+```
+
+This adds:
+
+- `candle-examples/examples/sam3/reference_video_box_debug/debug/debug_manifest.json`
+- `candle-examples/examples/sam3/reference_video_box_debug/debug/frame_000000_obj_000000_prompt_frame_output_mask.png`
+- `candle-examples/examples/sam3/reference_video_box_debug/debug/frame_000001_obj_000000_first_propagated_mask.png`
+
+You can narrow capture if needed with `--video-debug-obj-id <id>` and
+`--video-debug-frame <idx>`.
+
 ### Export `shoe` Text Reference Bundle
 
 This matches the text-prompt part of `sam3_image_predictor_example.ipynb`.
@@ -471,6 +524,52 @@ cargo run -p candle-examples --example sam3 -- \
   --parity-bundle candle-examples/examples/sam3/reference \
   --output-dir candle-examples/examples/sam3/output
 ```
+
+### Run Rust Video Export
+
+The Rust video example now exports bundle-style video artifacts directly:
+
+```bash
+cargo run -p candle-examples --example sam3 --features cuda --release -- \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --video candle-examples/examples/sam3/upstream_video_subset \
+  --box 0.57,0.70,0.28,0.52 \
+  --box-label 1 \
+  --output-dir candle-examples/examples/sam3/output/video_box
+```
+
+This writes:
+
+- `candle-examples/examples/sam3/output/video_box/reference.json`
+- `candle-examples/examples/sam3/output/video_box/video_results.json`
+- `candle-examples/examples/sam3/output/video_box/frames/...`
+- `candle-examples/examples/sam3/output/video_box/masks/...`
+- `candle-examples/examples/sam3/output/video_box/masked_frames/...`
+
+### Run Rust Video Export With Debug Artifacts
+
+Add `--video-debug-bundle` to write the detector-grounding, tracker-seed, and
+first-propagated debug artifacts under `debug/`:
+
+```bash
+cargo run -p candle-examples --example sam3 --features cuda --release -- \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --video candle-examples/examples/sam3/upstream_video_subset \
+  --box 0.57,0.70,0.28,0.52 \
+  --box-label 1 \
+  --video-debug-bundle \
+  --output-dir candle-examples/examples/sam3/output/video_box_debug
+```
+
+This adds:
+
+- `candle-examples/examples/sam3/output/video_box_debug/debug/debug_manifest.json`
+- `candle-examples/examples/sam3/output/video_box_debug/debug/frame_000000_obj_000000_detector_mask.png`
+- `candle-examples/examples/sam3/output/video_box_debug/debug/frame_000000_obj_000000_tracker_seed_mask.png`
+- `candle-examples/examples/sam3/output/video_box_debug/debug/frame_000001_obj_000000_first_propagated_mask.png`
+
+You can narrow capture if needed with `--video-debug-obj-id <id>` and
+`--video-debug-frame <idx>`.
 
 ## Reference Comparison Mode
 
@@ -560,6 +659,51 @@ That writes:
 The interactive report includes per-step stage diffs plus final score / box /
 mask comparison metrics for each replay step, and Candle also saves rendered
 per-step masks and masked-image overlays in the output directory.
+
+Video reference bundles exported by `export_reference.py --video` can be
+compared through the same `--compare-reference-bundle` flag. The CLI
+auto-detects the video bundle, reruns Candle video prediction on the bundled
+30 extracted frames, exports its own `frames/`, `masks/`, and
+`masked_frames/`, and writes a frame-by-frame comparison report:
+
+```bash
+cargo run -p candle-examples --example sam3 --features cuda --release -- \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --compare-reference-bundle candle-examples/examples/sam3/reference_video_box \
+  --output-dir candle-examples/examples/sam3/output/reference_compare_video_box
+```
+
+That writes:
+
+- `candle-examples/examples/sam3/output/reference_compare_video_box/reference.json`
+- `candle-examples/examples/sam3/output/reference_compare_video_box/video_results.json`
+- `candle-examples/examples/sam3/output/reference_compare_video_box/frames/...`
+- `candle-examples/examples/sam3/output/reference_compare_video_box/masks/...`
+- `candle-examples/examples/sam3/output/reference_compare_video_box/masked_frames/...`
+- `candle-examples/examples/sam3/output/reference_compare_video_box/video_reference_comparison_report.json`
+
+### Run Video Reference Comparison With Debug Artifacts
+
+If the upstream bundle was exported with `--video-debug-bundle`, add the same
+flag on the Candle side to generate both debug manifests plus a focused
+step-4/5 comparison report:
+
+```bash
+cargo run -p candle-examples --example sam3 --features cuda --release -- \
+  --checkpoint /home/dnorthover/extcode/hf_sam3 \
+  --compare-reference-bundle candle-examples/examples/sam3/reference_video_box_debug \
+  --video-debug-bundle \
+  --output-dir candle-examples/examples/sam3/output/reference_compare_video_box_debug
+```
+
+This adds:
+
+- `candle-examples/examples/sam3/output/reference_compare_video_box_debug/debug/debug_manifest.json`
+- `candle-examples/examples/sam3/output/reference_compare_video_box_debug/debug/debug_compare.json`
+
+`debug_compare.json` classifies the first divergence as `handoff`,
+`propagation`, or `postprocess` using the prompt-frame and first-propagated
+artifacts.
 
 For the box-conditioned geometry checks above, run parity like this.
 

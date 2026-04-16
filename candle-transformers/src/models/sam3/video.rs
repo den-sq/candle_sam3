@@ -9,7 +9,8 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use candle::{DType, Device, IndexOp, Result, Tensor};
-use image::ImageReader;
+use image::{GrayImage, ImageReader, Luma};
+use serde::{Deserialize, Serialize};
 use tokenizers::{PaddingDirection, PaddingParams, Tokenizer, TruncationParams};
 
 use super::{
@@ -21,6 +22,8 @@ use super::{
 };
 
 const CLIP_EOT_TOKEN: &str = "<|endoftext|>";
+const VIDEO_DEBUG_MANIFEST_FILE: &str = "debug_manifest.json";
+const VIDEO_DEBUG_MASK_THRESHOLD: f32 = 0.5;
 
 #[derive(Debug, Clone)]
 pub struct SessionPrompt {
@@ -186,6 +189,436 @@ impl Default for VideoSessionOptions {
             prefetch_behind: 1,
             max_feature_cache_entries: 2,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VideoDebugConfig {
+    pub enabled: bool,
+    pub capture_obj_ids: Vec<u32>,
+    pub capture_frame_indices: Vec<usize>,
+    pub capture_first_propagated_only: bool,
+    pub output_root: Option<PathBuf>,
+}
+
+impl Default for VideoDebugConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            capture_obj_ids: Vec::new(),
+            capture_frame_indices: Vec::new(),
+            capture_first_propagated_only: true,
+            output_root: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VideoDebugManifest {
+    bundle_version: usize,
+    mode: String,
+    source: String,
+    session_id: String,
+    internal_tracker_state_available: bool,
+    capture_obj_ids: Vec<u32>,
+    capture_frame_indices: Vec<usize>,
+    capture_first_propagated_only: bool,
+    records: Vec<VideoDebugRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VideoDebugRecord {
+    stage: String,
+    obj_id: u32,
+    frame_idx: usize,
+    prompt_frame_idx: Option<usize>,
+    prompt_metadata: Option<VideoDebugPromptMetadata>,
+    observable: Option<VideoDebugObservableSummary>,
+    tracker_state: Option<VideoDebugTrackerStateSummary>,
+    propagation_input: Option<VideoDebugPropagationInputSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VideoDebugPromptMetadata {
+    text_prompt: Option<String>,
+    used_visual_text_prompt: bool,
+    normalized_points_xy: Vec<Vec<f32>>,
+    point_labels: Vec<u32>,
+    normalized_boxes_cxcywh: Vec<Vec<f32>>,
+    box_labels: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VideoDebugObservableSummary {
+    mask_path: Option<String>,
+    mask_threshold: f32,
+    foreground_pixel_count: usize,
+    mask_area_ratio: f32,
+    boxes_xyxy: Vec<Vec<f32>>,
+    scores: Vec<f32>,
+    presence_scores: Option<Vec<f32>>,
+    mask_logits_stats: TensorDebugSummary,
+    mask_prob_stats: TensorDebugSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VideoDebugTrackerStateSummary {
+    is_cond_frame: bool,
+    low_res_masks_stats: TensorDebugSummary,
+    high_res_masks_stats: TensorDebugSummary,
+    iou_scores_stats: TensorDebugSummary,
+    object_score_logits_stats: TensorDebugSummary,
+    obj_ptr_stats: TensorDebugSummary,
+    maskmem_features_stats: Option<TensorDebugSummary>,
+    maskmem_pos_enc_stats: Option<TensorDebugSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VideoDebugPropagationInputSummary {
+    history_frames: Vec<VideoDebugHistoryFrameSummary>,
+    history_frame_order: Vec<usize>,
+    chosen_prompt_frame_indices: Vec<usize>,
+    chosen_memory_frame_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VideoDebugHistoryFrameSummary {
+    frame_idx: usize,
+    is_cond_frame: bool,
+    low_res_masks_stats: TensorDebugSummary,
+    high_res_masks_stats: TensorDebugSummary,
+    obj_ptr_stats: TensorDebugSummary,
+    maskmem_features_stats: Option<TensorDebugSummary>,
+    maskmem_pos_enc_stats: Option<TensorDebugSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TensorDebugSummary {
+    shape: Vec<usize>,
+    dtype: String,
+    min: f32,
+    max: f32,
+    mean: f32,
+    l2_norm: f32,
+    foreground_pixel_count: Option<usize>,
+}
+
+#[derive(Debug)]
+struct VideoDebugRecorder {
+    config: VideoDebugConfig,
+    output_root: PathBuf,
+    manifest: VideoDebugManifest,
+}
+
+impl VideoDebugRecorder {
+    fn new(session_id: &str, config: VideoDebugConfig) -> Result<Option<Self>> {
+        if !config.enabled {
+            return Ok(None);
+        }
+        let output_root = config
+            .output_root
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("debug"));
+        fs::create_dir_all(&output_root).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to create debug output root {}: {}",
+                output_root.display(),
+                err
+            ))
+        })?;
+        let recorder = Self {
+            output_root,
+            manifest: VideoDebugManifest {
+                bundle_version: 1,
+                mode: "video_debug_bundle".to_owned(),
+                source: "candle".to_owned(),
+                session_id: session_id.to_owned(),
+                internal_tracker_state_available: true,
+                capture_obj_ids: config.capture_obj_ids.clone(),
+                capture_frame_indices: config.capture_frame_indices.clone(),
+                capture_first_propagated_only: config.capture_first_propagated_only,
+                records: Vec::new(),
+            },
+            config,
+        };
+        recorder.flush_manifest()?;
+        Ok(Some(recorder))
+    }
+
+    fn should_capture_obj(&self, obj_id: u32) -> bool {
+        self.config.capture_obj_ids.is_empty() || self.config.capture_obj_ids.contains(&obj_id)
+    }
+
+    fn should_capture_stage(
+        &self,
+        object: &TrackedObject,
+        obj_id: u32,
+        frame_idx: usize,
+        direction: PropagationDirection,
+        prompt_frame_idx: Option<usize>,
+        stage: &str,
+    ) -> bool {
+        if !self.should_capture_obj(obj_id) {
+            return false;
+        }
+        if self.config.capture_frame_indices.contains(&frame_idx) {
+            return true;
+        }
+        if !self.config.capture_frame_indices.is_empty() {
+            return false;
+        }
+        match stage {
+            "detector_grounding" | "tracker_seed" => object.prompt_frames.contains_key(&frame_idx),
+            "propagation_input" | "first_propagated_output" => {
+                if !self.config.capture_first_propagated_only {
+                    return true;
+                }
+                let Some(prompt_frame_idx) = prompt_frame_idx else {
+                    return false;
+                };
+                match direction {
+                    PropagationDirection::Forward | PropagationDirection::Both => {
+                        frame_idx == prompt_frame_idx.saturating_add(1)
+                    }
+                    PropagationDirection::Backward => {
+                        prompt_frame_idx == frame_idx.saturating_add(1)
+                    }
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn record_detector_grounding(
+        &mut self,
+        object: &TrackedObject,
+        frame_idx: usize,
+        direction: PropagationDirection,
+        prompt_metadata: VideoDebugPromptMetadata,
+        output: &ObjectFrameOutput,
+    ) -> Result<()> {
+        if !self.should_capture_stage(
+            object,
+            object.obj_id,
+            frame_idx,
+            direction,
+            Some(frame_idx),
+            "detector_grounding",
+        ) {
+            return Ok(());
+        }
+        let observable =
+            self.build_observable_summary(frame_idx, object.obj_id, "detector_mask", output)?;
+        self.push_record(VideoDebugRecord {
+            stage: "detector_grounding".to_owned(),
+            obj_id: object.obj_id,
+            frame_idx,
+            prompt_frame_idx: Some(frame_idx),
+            prompt_metadata: Some(prompt_metadata),
+            observable: Some(observable),
+            tracker_state: None,
+            propagation_input: None,
+        })
+    }
+
+    fn record_tracker_seed(
+        &mut self,
+        object: &TrackedObject,
+        frame_idx: usize,
+        direction: PropagationDirection,
+        prompt_metadata: VideoDebugPromptMetadata,
+        output: &ObjectFrameOutput,
+        state: &TrackerFrameState,
+    ) -> Result<()> {
+        if !self.should_capture_stage(
+            object,
+            object.obj_id,
+            frame_idx,
+            direction,
+            Some(frame_idx),
+            "tracker_seed",
+        ) {
+            return Ok(());
+        }
+        let observable =
+            self.build_observable_summary(frame_idx, object.obj_id, "tracker_seed_mask", output)?;
+        let tracker_state = summarize_tracker_state(state)?;
+        self.push_record(VideoDebugRecord {
+            stage: "tracker_seed".to_owned(),
+            obj_id: object.obj_id,
+            frame_idx,
+            prompt_frame_idx: Some(frame_idx),
+            prompt_metadata: Some(prompt_metadata),
+            observable: Some(observable),
+            tracker_state: Some(tracker_state),
+            propagation_input: None,
+        })
+    }
+
+    fn record_first_propagation(
+        &mut self,
+        object: &TrackedObject,
+        frame_idx: usize,
+        direction: PropagationDirection,
+        prompt_frame_idx: Option<usize>,
+        output: &ObjectFrameOutput,
+        history: &BTreeMap<usize, TrackerFrameState>,
+        chosen_prompt_frame_indices: &[usize],
+        chosen_memory_frame_indices: &[usize],
+    ) -> Result<()> {
+        if !self.should_capture_stage(
+            object,
+            object.obj_id,
+            frame_idx,
+            direction,
+            prompt_frame_idx,
+            "first_propagated_output",
+        ) {
+            return Ok(());
+        }
+        let history_frames = history
+            .iter()
+            .map(|(history_frame_idx, state)| {
+                Ok(VideoDebugHistoryFrameSummary {
+                    frame_idx: *history_frame_idx,
+                    is_cond_frame: state.is_cond_frame,
+                    low_res_masks_stats: summarize_tensor(&state.low_res_masks, Some(0.0))?,
+                    high_res_masks_stats: summarize_tensor(&state.high_res_masks, Some(0.0))?,
+                    obj_ptr_stats: summarize_tensor(&state.obj_ptr, None)?,
+                    maskmem_features_stats: state
+                        .maskmem_features
+                        .as_ref()
+                        .map(|tensor| summarize_tensor(tensor, None))
+                        .transpose()?,
+                    maskmem_pos_enc_stats: state
+                        .maskmem_pos_enc
+                        .as_ref()
+                        .map(|tensor| summarize_tensor(tensor, None))
+                        .transpose()?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let propagation_input = VideoDebugPropagationInputSummary {
+            history_frame_order: history.keys().copied().collect(),
+            history_frames,
+            chosen_prompt_frame_indices: chosen_prompt_frame_indices.to_vec(),
+            chosen_memory_frame_indices: chosen_memory_frame_indices.to_vec(),
+        };
+        let observable = self.build_observable_summary(
+            frame_idx,
+            object.obj_id,
+            "first_propagated_mask",
+            output,
+        )?;
+        self.push_record(VideoDebugRecord {
+            stage: "propagation_input".to_owned(),
+            obj_id: object.obj_id,
+            frame_idx,
+            prompt_frame_idx,
+            prompt_metadata: None,
+            observable: None,
+            tracker_state: None,
+            propagation_input: Some(propagation_input),
+        })?;
+        self.push_record(VideoDebugRecord {
+            stage: "first_propagated_output".to_owned(),
+            obj_id: object.obj_id,
+            frame_idx,
+            prompt_frame_idx,
+            prompt_metadata: None,
+            observable: Some(observable),
+            tracker_state: None,
+            propagation_input: None,
+        })
+    }
+
+    fn push_record(&mut self, record: VideoDebugRecord) -> Result<()> {
+        self.manifest.records.push(record);
+        self.flush_manifest()
+    }
+
+    fn build_observable_summary(
+        &self,
+        frame_idx: usize,
+        obj_id: u32,
+        suffix: &str,
+        output: &ObjectFrameOutput,
+    ) -> Result<VideoDebugObservableSummary> {
+        let mask_probs = tensor_to_mask_probs_2d(&output.masks)?;
+        let mask_path = self
+            .write_binary_mask(
+                &format!("frame_{frame_idx:06}_obj_{obj_id:06}_{suffix}.png"),
+                &mask_probs,
+            )?
+            .display()
+            .to_string();
+        let foreground_pixel_count =
+            count_foreground_pixels(&mask_probs, VIDEO_DEBUG_MASK_THRESHOLD);
+        let total_pixels = mask_probs
+            .len()
+            .saturating_mul(mask_probs.first().map(Vec::len).unwrap_or(0))
+            .max(1);
+        Ok(VideoDebugObservableSummary {
+            mask_path: Some(mask_path),
+            mask_threshold: VIDEO_DEBUG_MASK_THRESHOLD,
+            foreground_pixel_count,
+            mask_area_ratio: foreground_pixel_count as f32 / total_pixels as f32,
+            boxes_xyxy: output.boxes_xyxy.to_vec2::<f32>()?,
+            scores: output.scores.flatten_all()?.to_vec1::<f32>()?,
+            presence_scores: output
+                .presence_scores
+                .as_ref()
+                .map(|tensor| tensor.flatten_all()?.to_vec1::<f32>())
+                .transpose()?,
+            mask_logits_stats: summarize_tensor(&output.mask_logits, Some(0.0))?,
+            mask_prob_stats: summarize_tensor(&output.masks, Some(VIDEO_DEBUG_MASK_THRESHOLD))?,
+        })
+    }
+
+    fn write_binary_mask(&self, file_name: &str, mask_probs: &[Vec<f32>]) -> Result<PathBuf> {
+        let height = mask_probs.len() as u32;
+        let width = mask_probs.first().map(Vec::len).unwrap_or(0) as u32;
+        let mut image = GrayImage::new(width, height);
+        for (y, row) in mask_probs.iter().enumerate() {
+            for (x, value) in row.iter().enumerate() {
+                let pixel = if *value >= VIDEO_DEBUG_MASK_THRESHOLD {
+                    255u8
+                } else {
+                    0u8
+                };
+                image.put_pixel(x as u32, y as u32, Luma([pixel]));
+            }
+        }
+        let path = self.output_root.join(file_name);
+        image.save(&path).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to save debug mask {}: {}",
+                path.display(),
+                err
+            ))
+        })?;
+        Ok(path
+            .strip_prefix(&self.output_root)
+            .unwrap_or(&path)
+            .to_path_buf())
+    }
+
+    fn flush_manifest(&self) -> Result<()> {
+        let manifest_path = self.output_root.join(VIDEO_DEBUG_MANIFEST_FILE);
+        let bytes = serde_json::to_vec_pretty(&self.manifest).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to serialize debug manifest {}: {}",
+                manifest_path.display(),
+                err
+            ))
+        })?;
+        fs::write(&manifest_path, bytes).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to write debug manifest {}: {}",
+                manifest_path.display(),
+                err
+            ))
+        })
     }
 }
 
@@ -517,6 +950,7 @@ pub struct Sam3VideoSession {
     frame_source: Box<dyn FrameSource>,
     session_options: VideoSessionOptions,
     tokenizer: Option<Tokenizer>,
+    debug_recorder: Option<VideoDebugRecorder>,
     storage_device: Device,
     tracked_objects: BTreeMap<u32, TrackedObject>,
     next_obj_id: u32,
@@ -531,6 +965,7 @@ impl Sam3VideoSession {
         session_id: String,
         frame_source: Box<dyn FrameSource>,
         session_options: VideoSessionOptions,
+        debug_config: VideoDebugConfig,
         model: &Sam3ImageModel,
         compute_device: &Device,
     ) -> Result<Self> {
@@ -546,10 +981,11 @@ impl Sam3VideoSession {
                 compute_device.clone()
             };
         Ok(Self {
-            session_id,
+            session_id: session_id.clone(),
             frame_source,
             session_options,
             tokenizer,
+            debug_recorder: VideoDebugRecorder::new(&session_id, debug_config)?,
             storage_device,
             tracked_objects: BTreeMap::new(),
             next_obj_id: 0,
@@ -590,6 +1026,10 @@ impl Sam3VideoSession {
 
     fn storage_device(&self) -> &Device {
         &self.storage_device
+    }
+
+    fn debug_recorder_mut(&mut self) -> Option<&mut VideoDebugRecorder> {
+        self.debug_recorder.as_mut()
     }
 
     fn allocate_object(&mut self, creation_frame: usize) -> u32 {
@@ -681,12 +1121,16 @@ impl Sam3VideoSession {
     }
 
     fn close(&mut self) {
+        if let Some(recorder) = self.debug_recorder.as_ref() {
+            let _ = recorder.flush_manifest();
+        }
         self.frame_source.close();
         self.feature_cache.clear();
         self.feature_cache_order.clear();
         self.frame_outputs.clear();
         self.tracked_objects.clear();
         self.text_cache.clear();
+        self.debug_recorder = None;
     }
 
     fn get_frame(&mut self, frame_idx: usize, target_device: &Device) -> Result<Tensor> {
@@ -798,6 +1242,7 @@ pub struct Sam3VideoPredictor<'a> {
     model: &'a Sam3ImageModel,
     device: &'a Device,
     video_config: VideoConfig,
+    debug_config: VideoDebugConfig,
     sessions: HashMap<String, Sam3VideoSession>,
     next_session_id: usize,
     backend: Box<dyn VideoTrackerBackend + 'a>,
@@ -809,6 +1254,7 @@ impl<'a> Sam3VideoPredictor<'a> {
             model,
             device,
             video_config: VideoConfig::default(),
+            debug_config: VideoDebugConfig::default(),
             sessions: HashMap::new(),
             next_session_id: 0,
             backend: Box::new(HeuristicVideoTrackerBackend::default()),
@@ -825,6 +1271,11 @@ impl<'a> Sam3VideoPredictor<'a> {
         self
     }
 
+    pub fn with_debug_config(mut self, config: VideoDebugConfig) -> Self {
+        self.debug_config = config;
+        self
+    }
+
     pub fn start_session(
         &mut self,
         source: VideoSource,
@@ -837,6 +1288,7 @@ impl<'a> Sam3VideoPredictor<'a> {
             session_id.clone(),
             frame_source,
             options,
+            self.debug_config.clone(),
             self.model,
             self.device,
         )?;
@@ -1102,6 +1554,27 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
                     )
                 })?;
         let grounding = ground_from_encoded_prompt(model, &visual, &encoded_prompt)?;
+        let detector_output = grounding_to_object_output(
+            object.obj_id,
+            &grounding,
+            Some(frame_idx),
+            Vec::new(),
+            prompt.text.clone(),
+            prompt.has_geometry(),
+            false,
+            session.video_size(),
+        )?;
+        let prompt_metadata =
+            debug_prompt_metadata(prompt, prompt.text.is_none() && use_visual_box_prompt)?;
+        if let Some(recorder) = session.debug_recorder_mut() {
+            recorder.record_detector_grounding(
+                object,
+                frame_idx,
+                direction,
+                prompt_metadata.clone(),
+                &detector_output,
+            )?;
+        }
         let history = self.history_on_device(object, frame_idx, direction, compute_device)?;
         // Upstream video inference seeds tracker memory from detector masks on the prompt
         // frame, including the initial box-as-visual prompt case.
@@ -1119,16 +1592,33 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
             matches!(direction, PropagationDirection::Backward),
             false,
         )?;
-        let output = grounding_to_object_output(
-            object.obj_id,
-            &grounding,
-            Some(frame_idx),
-            trim_memory_frame_indices(step.memory_frame_indices, config.memory_frame_count),
-            prompt.text.clone(),
-            prompt.has_geometry(),
-            false,
-            session.video_size(),
-        )?;
+        let trimmed_memory_frame_indices =
+            trim_memory_frame_indices(step.memory_frame_indices.clone(), config.memory_frame_count);
+        let output = ObjectFrameOutput {
+            memory_frame_indices: trimmed_memory_frame_indices.clone(),
+            ..detector_output.clone()
+        };
+        let video_size = session.video_size();
+        if let Some(recorder) = session.debug_recorder_mut() {
+            let tracker_seed_output = tracker_state_to_object_output(
+                object.obj_id,
+                &step.state,
+                Some(frame_idx),
+                trimmed_memory_frame_indices,
+                prompt.text.clone(),
+                prompt.has_geometry(),
+                false,
+                video_size,
+            )?;
+            recorder.record_tracker_seed(
+                object,
+                frame_idx,
+                direction,
+                prompt_metadata,
+                &tracker_seed_output,
+                &step.state,
+            )?;
+        }
         self.store_object_result(session, frame_idx, output, step.state)
     }
 
@@ -1192,6 +1682,9 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
         if history.is_empty() {
             return Ok(None);
         }
+        let nearest_prompt_frame_idx = object
+            .nearest_prompt(frame_idx, direction)
+            .map(|(idx, _)| idx);
         let visual = session.get_visual_features(model, compute_device, frame_idx)?;
         let step = self.tracker.track_frame(
             &visual,
@@ -1229,6 +1722,19 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
             true,
             session.video_size(),
         )?;
+        let trimmed_memory_frame_indices = output.memory_frame_indices.clone();
+        if let Some(recorder) = session.debug_recorder_mut() {
+            recorder.record_first_propagation(
+                object,
+                frame_idx,
+                direction,
+                prompt_frame_idx.or(nearest_prompt_frame_idx),
+                &output,
+                &history,
+                &step.prompt_frame_indices,
+                &trimmed_memory_frame_indices,
+            )?;
+        }
         Ok(Some(self.store_object_result(
             session, frame_idx, output, step.state,
         )?))
@@ -2279,12 +2785,122 @@ fn uses_initial_visual_box_prompt(
         && matches!(prompt.boxes.as_ref(), Some(boxes) if boxes.len() == 1)
 }
 
+fn debug_prompt_metadata(
+    prompt: &SessionPrompt,
+    used_visual_text_prompt: bool,
+) -> Result<VideoDebugPromptMetadata> {
+    Ok(VideoDebugPromptMetadata {
+        text_prompt: prompt.text.clone(),
+        used_visual_text_prompt,
+        normalized_points_xy: prompt
+            .points
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(x, y)| vec![x, y])
+            .collect(),
+        point_labels: prompt.point_labels.clone().unwrap_or_default(),
+        normalized_boxes_cxcywh: prompt
+            .boxes
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(cx, cy, w, h)| vec![cx, cy, w, h])
+            .collect(),
+        box_labels: prompt.box_labels.clone().unwrap_or_default(),
+    })
+}
+
 fn first_box_xyxy(boxes_xyxy: &Tensor) -> Result<[f32; 4]> {
     let values = boxes_xyxy.flatten_all()?.to_vec1::<f32>()?;
     if values.len() < 4 {
         candle::bail!("expected at least 4 box coordinates, got {}", values.len())
     }
     Ok([values[0], values[1], values[2], values[3]])
+}
+
+fn tensor_to_mask_probs_2d(tensor: &Tensor) -> Result<Vec<Vec<f32>>> {
+    let tensor = match tensor.rank() {
+        2 => tensor.clone(),
+        3 => tensor.i(0)?,
+        4 => tensor.i((0, 0))?,
+        rank => candle::bail!("expected mask tensor rank 2/3/4, got {rank}"),
+    };
+    tensor.to_vec2::<f32>()
+}
+
+fn count_foreground_pixels(mask_probs: &[Vec<f32>], threshold: f32) -> usize {
+    mask_probs
+        .iter()
+        .flat_map(|row| row.iter())
+        .filter(|value| **value >= threshold)
+        .count()
+}
+
+fn summarize_tensor(
+    tensor: &Tensor,
+    foreground_threshold: Option<f32>,
+) -> Result<TensorDebugSummary> {
+    let shape = tensor.shape().dims().to_vec();
+    let values = tensor
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    if values.is_empty() {
+        return Ok(TensorDebugSummary {
+            shape,
+            dtype: format!("{:?}", tensor.dtype()),
+            min: 0.0,
+            max: 0.0,
+            mean: 0.0,
+            l2_norm: 0.0,
+            foreground_pixel_count: Some(0).filter(|_| foreground_threshold.is_some()),
+        });
+    }
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut sum = 0.0f32;
+    let mut l2_sum = 0.0f32;
+    let mut foreground_pixel_count = 0usize;
+    for value in values.iter().copied() {
+        min = min.min(value);
+        max = max.max(value);
+        sum += value;
+        l2_sum += value * value;
+        if foreground_threshold.is_some_and(|threshold| value >= threshold) {
+            foreground_pixel_count += 1;
+        }
+    }
+    Ok(TensorDebugSummary {
+        shape,
+        dtype: format!("{:?}", tensor.dtype()),
+        min,
+        max,
+        mean: sum / values.len() as f32,
+        l2_norm: l2_sum.sqrt(),
+        foreground_pixel_count: foreground_threshold.map(|_| foreground_pixel_count),
+    })
+}
+
+fn summarize_tracker_state(state: &TrackerFrameState) -> Result<VideoDebugTrackerStateSummary> {
+    Ok(VideoDebugTrackerStateSummary {
+        is_cond_frame: state.is_cond_frame,
+        low_res_masks_stats: summarize_tensor(&state.low_res_masks, Some(0.0))?,
+        high_res_masks_stats: summarize_tensor(&state.high_res_masks, Some(0.0))?,
+        iou_scores_stats: summarize_tensor(&state.iou_scores, None)?,
+        object_score_logits_stats: summarize_tensor(&state.object_score_logits, None)?,
+        obj_ptr_stats: summarize_tensor(&state.obj_ptr, None)?,
+        maskmem_features_stats: state
+            .maskmem_features
+            .as_ref()
+            .map(|tensor| summarize_tensor(tensor, None))
+            .transpose()?,
+        maskmem_pos_enc_stats: state
+            .maskmem_pos_enc
+            .as_ref()
+            .map(|tensor| summarize_tensor(tensor, None))
+            .transpose()?,
+    })
 }
 
 fn xyxy_to_cxcywh(box_xyxy: [f32; 4]) -> (f32, f32, f32, f32) {
@@ -3248,5 +3864,227 @@ mod tests {
             vec![1, 2, 3, 4, 5, 6]
         );
         assert_eq!(trim_memory_frame_indices(vec![3, 4], 6), vec![3, 4]);
+    }
+
+    #[test]
+    fn debug_capture_writes_seed_and_first_propagation_records() -> Result<()> {
+        let device = Device::Cpu;
+        let debug_root = temp_path("debug-capture");
+        let mut recorder = VideoDebugRecorder::new(
+            "session_0",
+            VideoDebugConfig {
+                enabled: true,
+                capture_obj_ids: Vec::new(),
+                capture_frame_indices: vec![0, 1],
+                capture_first_propagated_only: true,
+                output_root: Some(debug_root.clone()),
+            },
+        )?
+        .expect("debug recorder should be created");
+        let mut object = TrackedObject::new(0, 0);
+        object.prompt_frames.insert(
+            0,
+            SessionPrompt {
+                text: None,
+                points: None,
+                point_labels: None,
+                boxes: Some(vec![(0.5, 0.5, 0.25, 0.25)]),
+                box_labels: Some(vec![1]),
+            },
+        );
+        let mask_logits = Tensor::from_vec(
+            vec![
+                -10.0f32, -10.0, //
+                -10.0, 10.0, //
+            ],
+            (1, 1, 2, 2),
+            &device,
+        )?;
+        let masks = candle_nn::ops::sigmoid(&mask_logits)?;
+        let output = ObjectFrameOutput {
+            obj_id: 0,
+            mask_logits: mask_logits.clone(),
+            masks: masks.clone(),
+            boxes_xyxy: mask_to_normalized_xyxy(&masks)?,
+            scores: Tensor::from_vec(vec![0.9f32], (1,), &device)?,
+            presence_scores: Some(Tensor::from_vec(vec![0.8f32], (1,), &device)?),
+            prompt_frame_idx: Some(0),
+            memory_frame_indices: Vec::new(),
+            text_prompt: None,
+            used_explicit_geometry: true,
+            reused_previous_output: false,
+        };
+        let state = TrackerFrameState {
+            low_res_masks: mask_logits.clone(),
+            high_res_masks: mask_logits.clone(),
+            iou_scores: Tensor::from_vec(vec![0.9f32], (1, 1), &device)?,
+            obj_ptr: Tensor::zeros((1, 8), DType::F32, &device)?,
+            object_score_logits: Tensor::from_vec(vec![1.0f32], (1, 1), &device)?,
+            maskmem_features: Some(Tensor::zeros((1, 8, 1, 1), DType::F32, &device)?),
+            maskmem_pos_enc: Some(Tensor::zeros((1, 8, 1, 1), DType::F32, &device)?),
+            is_cond_frame: true,
+        };
+        let prompt_metadata =
+            debug_prompt_metadata(object.prompt_frames.get(&0).expect("prompt exists"), true)?;
+        recorder.record_detector_grounding(
+            &object,
+            0,
+            PropagationDirection::Forward,
+            prompt_metadata.clone(),
+            &output,
+        )?;
+        recorder.record_tracker_seed(
+            &object,
+            0,
+            PropagationDirection::Forward,
+            prompt_metadata,
+            &output,
+            &state,
+        )?;
+        let mut history = BTreeMap::new();
+        history.insert(0, state);
+        recorder.record_first_propagation(
+            &object,
+            1,
+            PropagationDirection::Forward,
+            Some(0),
+            &ObjectFrameOutput {
+                prompt_frame_idx: Some(0),
+                memory_frame_indices: vec![0],
+                reused_previous_output: true,
+                ..output
+            },
+            &history,
+            &[0],
+            &[0],
+        )?;
+
+        let manifest: VideoDebugManifest = serde_json::from_str(&fs::read_to_string(
+            debug_root.join(VIDEO_DEBUG_MANIFEST_FILE),
+        )?)
+        .map_err(|err| candle::Error::Msg(err.to_string()))?;
+        assert!(manifest
+            .records
+            .iter()
+            .any(|record| record.stage == "detector_grounding"));
+        assert!(manifest
+            .records
+            .iter()
+            .any(|record| record.stage == "tracker_seed"));
+        let propagation_input = manifest
+            .records
+            .iter()
+            .find(|record| record.stage == "propagation_input")
+            .expect("propagation input should be captured");
+        assert_eq!(propagation_input.frame_idx, 1);
+        let propagation_input = propagation_input
+            .propagation_input
+            .as_ref()
+            .expect("propagation input summary should be present");
+        assert_eq!(propagation_input.history_frame_order, vec![0]);
+        assert_eq!(propagation_input.history_frames.len(), 1);
+        assert!(propagation_input.history_frames[0].is_cond_frame);
+        let detector = manifest
+            .records
+            .iter()
+            .find(|record| record.stage == "detector_grounding")
+            .and_then(|record| record.observable.as_ref())
+            .expect("detector observable should be present");
+        let detector_mask = image::open(
+            debug_root.join(
+                detector
+                    .mask_path
+                    .as_ref()
+                    .expect("detector mask path should be present"),
+            ),
+        )
+        .map_err(|err| candle::Error::Msg(err.to_string()))?
+        .to_luma8();
+        assert!(detector_mask
+            .pixels()
+            .all(|pixel| matches!(pixel[0], 0 | 255)));
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_debug_capture_writes_no_artifacts_and_keeps_outputs_stable() -> Result<()> {
+        let device = Device::Cpu;
+        let model = tiny_model(&device)?;
+        let frames = vec![
+            Tensor::zeros((3, 56, 56), DType::F32, &device)?,
+            Tensor::zeros((3, 56, 56), DType::F32, &device)?,
+        ];
+        let prompt = SessionPrompt {
+            text: None,
+            points: None,
+            point_labels: None,
+            boxes: Some(vec![(0.5, 0.5, 0.25, 0.25)]),
+            box_labels: Some(vec![1]),
+        };
+
+        let mut baseline = Sam3VideoPredictor::new(&model, &device);
+        let baseline_session = baseline.start_session_from_tensors(
+            frames.iter().cloned().collect(),
+            VideoSessionOptions::default(),
+        )?;
+        baseline.add_prompt(&baseline_session, 0, prompt.clone(), None, true, true)?;
+        let baseline_output = baseline.propagate_in_video(
+            &baseline_session,
+            PropagationOptions {
+                direction: PropagationDirection::Forward,
+                start_frame_idx: None,
+                max_frame_num_to_track: Some(2),
+                output_prob_threshold: None,
+            },
+        )?;
+
+        let debug_root = temp_path("debug-disabled");
+        let mut debug_predictor =
+            Sam3VideoPredictor::new(&model, &device).with_debug_config(VideoDebugConfig {
+                enabled: false,
+                capture_obj_ids: Vec::new(),
+                capture_frame_indices: vec![0, 1],
+                capture_first_propagated_only: true,
+                output_root: Some(debug_root.clone()),
+            });
+        let debug_session =
+            debug_predictor.start_session_from_tensors(frames, VideoSessionOptions::default())?;
+        debug_predictor.add_prompt(&debug_session, 0, prompt, None, true, true)?;
+        let debug_output = debug_predictor.propagate_in_video(
+            &debug_session,
+            PropagationOptions {
+                direction: PropagationDirection::Forward,
+                start_frame_idx: None,
+                max_frame_num_to_track: Some(2),
+                output_prob_threshold: None,
+            },
+        )?;
+
+        assert_eq!(baseline_output.frames.len(), debug_output.frames.len());
+        for (baseline_frame, debug_frame) in baseline_output
+            .frames
+            .iter()
+            .zip(debug_output.frames.iter())
+        {
+            assert_eq!(baseline_frame.frame_idx, debug_frame.frame_idx);
+            assert_eq!(baseline_frame.objects.len(), debug_frame.objects.len());
+            for (lhs, rhs) in baseline_frame
+                .objects
+                .iter()
+                .zip(debug_frame.objects.iter())
+            {
+                assert_eq!(lhs.obj_id, rhs.obj_id);
+                assert_eq!(
+                    lhs.boxes_xyxy.to_vec2::<f32>()?,
+                    rhs.boxes_xyxy.to_vec2::<f32>()?
+                );
+                assert_eq!(
+                    lhs.scores.flatten_all()?.to_vec1::<f32>()?,
+                    rhs.scores.flatten_all()?.to_vec1::<f32>()?
+                );
+            }
+        }
+        assert!(!debug_root.exists());
+        Ok(())
     }
 }

@@ -96,6 +96,25 @@ def parse_args():
         help="Enable upstream temporal disambiguation for video export. Disabled by default so example bundles keep raw propagated masks instead of suppressing unconfirmed tracklets.",
     )
     parser.add_argument(
+        "--video-debug-bundle",
+        action="store_true",
+        help="Write a focused video tracker debug bundle under <output-dir>/debug for prompt-frame and first-propagated-frame comparison.",
+    )
+    parser.add_argument(
+        "--video-debug-obj-id",
+        action="append",
+        type=int,
+        default=[],
+        help="Restrict video debug export to the specified object id. Can be passed multiple times.",
+    )
+    parser.add_argument(
+        "--video-debug-frame",
+        action="append",
+        type=int,
+        default=[],
+        help="Restrict video debug export to the specified frame index. Can be passed multiple times.",
+    )
+    parser.add_argument(
         "--device",
         default=None,
         help="Explicit torch device, e.g. cpu or cuda. Defaults to cuda when available.",
@@ -597,6 +616,93 @@ def render_video_reference_frame(
     }
 
 
+def should_capture_video_debug(args, frame_idx, prompt_frame_idx=None):
+    if args.video_debug_frame:
+        return frame_idx in args.video_debug_frame
+    if frame_idx == 0:
+        return True
+    if prompt_frame_idx is None:
+        return False
+    return frame_idx == prompt_frame_idx + 1
+
+
+def should_capture_video_debug_obj(args, obj_id):
+    return not args.video_debug_obj_id or int(obj_id) in args.video_debug_obj_id
+
+
+def build_video_debug_prompt_metadata(args):
+    return {
+        "text_prompt": args.prompt,
+        "used_visual_text_prompt": args.prompt is None and len(args.box) == 1,
+        "normalized_points_xy": [],
+        "point_labels": [],
+        "normalized_boxes_cxcywh": [list(box) for box in args.box],
+        "box_labels": [
+            int(label)
+            for label in (
+                args.box_label if args.box_label else [True for _ in args.box]
+            )
+        ],
+    }
+
+
+def write_video_debug_binary_mask(mask, path):
+    write_binary_mask(mask, path)
+
+
+def build_video_debug_observable(
+    output_dir,
+    frame_idx,
+    obj_id,
+    stage_suffix,
+    mask,
+    score,
+    box_xywh,
+):
+    import numpy as np
+
+    mask_array = np.asarray(mask)
+    if mask_array.ndim == 3:
+        mask_array = mask_array[0]
+    mask_array = mask_array.astype("uint8")
+    foreground_pixel_count = int(mask_array.sum())
+    mask_path = output_dir / f"frame_{frame_idx:06d}_obj_{int(obj_id):06d}_{stage_suffix}.png"
+    write_video_debug_binary_mask(mask_array, mask_path)
+    total_pixels = max(mask_array.size, 1)
+    return {
+        "mask_path": str(mask_path.relative_to(output_dir)),
+        "mask_threshold": 0.5,
+        "foreground_pixel_count": foreground_pixel_count,
+        "mask_area_ratio": foreground_pixel_count / total_pixels,
+        "boxes_xyxy": [[
+            float(box_xywh[0]),
+            float(box_xywh[1]),
+            float(box_xywh[0] + box_xywh[2]),
+            float(box_xywh[1] + box_xywh[3]),
+        ]],
+        "scores": [float(score)],
+        "presence_scores": None,
+        "mask_logits_stats": {
+            "shape": list(mask_array.shape),
+            "dtype": str(mask_array.dtype),
+            "min": float(mask_array.min()) if mask_array.size else 0.0,
+            "max": float(mask_array.max()) if mask_array.size else 0.0,
+            "mean": float(mask_array.mean()) if mask_array.size else 0.0,
+            "l2_norm": float(np.linalg.norm(mask_array.astype("float32"))),
+            "foreground_pixel_count": foreground_pixel_count,
+        },
+        "mask_prob_stats": {
+            "shape": list(mask_array.shape),
+            "dtype": str(mask_array.dtype),
+            "min": float(mask_array.min()) if mask_array.size else 0.0,
+            "max": float(mask_array.max()) if mask_array.size else 0.0,
+            "mean": float(mask_array.mean()) if mask_array.size else 0.0,
+            "l2_norm": float(np.linalg.norm(mask_array.astype("float32"))),
+            "foreground_pixel_count": foreground_pixel_count,
+        },
+    }
+
+
 def main():
     args = parse_args()
     if (args.image is None) == (args.video is None):
@@ -747,8 +853,13 @@ def main():
         frames_dir = output_dir / "frames"
         masks_dir = output_dir / "masks"
         masked_frames_dir = output_dir / "masked_frames"
+        debug_dir = output_dir / "debug"
         masks_dir.mkdir(parents=True, exist_ok=True)
         masked_frames_dir.mkdir(parents=True, exist_ok=True)
+        if args.video_debug_bundle:
+            if debug_dir.exists():
+                shutil.rmtree(debug_dir)
+            debug_dir.mkdir(parents=True, exist_ok=True)
         frame_paths = prepare_video_frames(
             source_video_path, frames_dir, max_frames=args.video_frame_count
         )
@@ -766,6 +877,7 @@ def main():
         )
         session_id = response["session_id"]
         frame_outputs = {}
+        debug_records = []
 
         request = {
             "type": "add_prompt",
@@ -787,6 +899,38 @@ def main():
             int(prompt_response["frame_index"]),
             prompt_response["outputs"],
         )
+        if args.video_debug_bundle:
+            prompt_outputs = prompt_response.get("outputs", {})
+            for obj_id, score, box_xywh, mask in zip(
+                prompt_outputs.get("out_obj_ids", []),
+                prompt_outputs.get("out_probs", []),
+                prompt_outputs.get("out_boxes_xywh", []),
+                prompt_outputs.get("out_binary_masks", []),
+            ):
+                if not should_capture_video_debug(args, 0, 0):
+                    continue
+                if not should_capture_video_debug_obj(args, obj_id):
+                    continue
+                debug_records.append(
+                    {
+                        "stage": "prompt_frame_output",
+                        "obj_id": int(obj_id),
+                        "frame_idx": 0,
+                        "prompt_frame_idx": 0,
+                        "prompt_metadata": build_video_debug_prompt_metadata(args),
+                        "observable": build_video_debug_observable(
+                            debug_dir,
+                            0,
+                            obj_id,
+                            "prompt_frame_output_mask",
+                            mask,
+                            score,
+                            box_xywh,
+                        ),
+                        "tracker_state": None,
+                        "propagation_input": None,
+                    }
+                )
 
         for response in predictor.handle_stream_request(
             {
@@ -799,6 +943,47 @@ def main():
             merge_frame_outputs(
                 frame_outputs, int(response["frame_index"]), response["outputs"]
             )
+            if args.video_debug_bundle:
+                frame_index = int(response["frame_index"])
+                if frame_index == 0:
+                    continue
+                if not should_capture_video_debug(args, frame_index, 0):
+                    continue
+                outputs = response.get("outputs", {})
+                for obj_id, score, box_xywh, mask in zip(
+                    outputs.get("out_obj_ids", []),
+                    outputs.get("out_probs", []),
+                    outputs.get("out_boxes_xywh", []),
+                    outputs.get("out_binary_masks", []),
+                ):
+                    if not should_capture_video_debug_obj(args, obj_id):
+                        continue
+                    if any(
+                        record["stage"] == "first_propagated_output"
+                        and record["obj_id"] == int(obj_id)
+                        for record in debug_records
+                    ):
+                        continue
+                    debug_records.append(
+                        {
+                            "stage": "first_propagated_output",
+                            "obj_id": int(obj_id),
+                            "frame_idx": frame_index,
+                            "prompt_frame_idx": 0,
+                            "prompt_metadata": None,
+                            "observable": build_video_debug_observable(
+                                debug_dir,
+                                frame_index,
+                                obj_id,
+                                "first_propagated_mask",
+                                mask,
+                                score,
+                                box_xywh,
+                            ),
+                            "tracker_state": None,
+                            "propagation_input": None,
+                        }
+                    )
 
         results = []
         for frame_idx, frame_path in enumerate(frame_paths):
@@ -848,6 +1033,7 @@ def main():
             "masks_dir": "masks",
             "masked_frames_dir": "masked_frames",
             "results_path": "video_results.json",
+            "debug_dir": "debug" if args.video_debug_bundle else None,
             "video_apply_temporal_disambiguation": args.video_apply_temporal_disambiguation,
             "checkpoint_path": str(checkpoint_path),
             "bpe_path": str(bpe_path),
@@ -856,6 +1042,20 @@ def main():
             json.dump(results, f, indent=2)
         with open(output_dir / "reference.json", "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)
+        if args.video_debug_bundle:
+            debug_manifest = {
+                "bundle_version": 1,
+                "mode": "video_debug_bundle",
+                "source": "upstream",
+                "session_id": session_id,
+                "internal_tracker_state_available": False,
+                "capture_obj_ids": [int(obj_id) for obj_id in args.video_debug_obj_id],
+                "capture_frame_indices": [int(frame_idx) for frame_idx in args.video_debug_frame],
+                "capture_first_propagated_only": True,
+                "records": debug_records,
+            }
+            with open(debug_dir / "debug_manifest.json", "w", encoding="utf-8") as f:
+                json.dump(debug_manifest, f, indent=2)
 
         print(f"saved video reference bundle to {output_dir}")
         print(f"  metadata: {output_dir / 'reference.json'}")

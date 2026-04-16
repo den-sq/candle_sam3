@@ -118,6 +118,18 @@ struct Args {
     #[arg(long)]
     video_offload_state_to_cpu: bool,
 
+    /// Write a focused frame-0/frame-1 video tracker debug bundle under `<output-dir>/debug`.
+    #[arg(long)]
+    video_debug_bundle: bool,
+
+    /// Restrict video tracker debug capture to the specified object id. Can be passed multiple times.
+    #[arg(long = "video-debug-obj-id")]
+    video_debug_obj_ids: Vec<u32>,
+
+    /// Restrict video tracker debug capture to the specified frame index. Can be passed multiple times.
+    #[arg(long = "video-debug-frame")]
+    video_debug_frames: Vec<usize>,
+
     /// Enable interactive refinement mode for the specified image.
     #[arg(long)]
     interactive: Option<String>,
@@ -2664,6 +2676,9 @@ pub fn main() -> anyhow::Result<()> {
             prefetch_behind: args.video_prefetch_behind,
             max_feature_cache_entries: args.video_max_feature_cache_entries,
             offload_state_to_cpu: args.video_offload_state_to_cpu || !args.cpu,
+            debug_bundle: args.video_debug_bundle,
+            debug_obj_ids: args.video_debug_obj_ids.clone(),
+            debug_frame_indices: args.video_debug_frames.clone(),
         };
         let checkpoint = checkpoint_source
             .as_ref()

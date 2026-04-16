@@ -18,6 +18,9 @@ const VIDEO_RESULTS_FILE: &str = "video_results.json";
 const VIDEO_FRAMES_DIR: &str = "frames";
 const VIDEO_MASKS_DIR: &str = "masks";
 const VIDEO_MASKED_FRAMES_DIR: &str = "masked_frames";
+const VIDEO_DEBUG_DIR: &str = "debug";
+const VIDEO_DEBUG_MANIFEST_FILE: &str = "debug_manifest.json";
+const VIDEO_DEBUG_COMPARE_FILE: &str = "debug_compare.json";
 const MASK_COLOR: [u8; 3] = [56, 201, 84];
 const MASK_THRESHOLD: f32 = 0.5;
 
@@ -34,6 +37,9 @@ pub struct VideoMode {
     pub prefetch_behind: usize,
     pub max_feature_cache_entries: usize,
     pub offload_state_to_cpu: bool,
+    pub debug_bundle: bool,
+    pub debug_obj_ids: Vec<u32>,
+    pub debug_frame_indices: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +62,8 @@ struct VideoExportMetadata {
     masks_dir: String,
     masked_frames_dir: String,
     results_path: String,
+    #[serde(default)]
+    debug_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +86,118 @@ struct VideoObjectRecord {
     text_prompt: Option<String>,
     used_explicit_geometry: bool,
     reused_previous_output: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VideoDebugManifest {
+    bundle_version: usize,
+    mode: String,
+    source: String,
+    session_id: String,
+    internal_tracker_state_available: bool,
+    #[serde(default)]
+    capture_obj_ids: Vec<u32>,
+    #[serde(default)]
+    capture_frame_indices: Vec<usize>,
+    capture_first_propagated_only: bool,
+    records: Vec<VideoDebugRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VideoDebugRecord {
+    stage: String,
+    obj_id: u32,
+    frame_idx: usize,
+    prompt_frame_idx: Option<usize>,
+    prompt_metadata: Option<VideoDebugPromptMetadata>,
+    observable: Option<VideoDebugObservableSummary>,
+    tracker_state: Option<VideoDebugTrackerStateSummary>,
+    propagation_input: Option<VideoDebugPropagationInputSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VideoDebugPromptMetadata {
+    text_prompt: Option<String>,
+    used_visual_text_prompt: bool,
+    normalized_points_xy: Vec<Vec<f32>>,
+    point_labels: Vec<u32>,
+    normalized_boxes_cxcywh: Vec<Vec<f32>>,
+    box_labels: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VideoDebugObservableSummary {
+    mask_path: Option<String>,
+    mask_threshold: f32,
+    foreground_pixel_count: usize,
+    mask_area_ratio: f32,
+    boxes_xyxy: Vec<Vec<f32>>,
+    scores: Vec<f32>,
+    presence_scores: Option<Vec<f32>>,
+    mask_logits_stats: TensorDebugSummary,
+    mask_prob_stats: TensorDebugSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VideoDebugTrackerStateSummary {
+    is_cond_frame: bool,
+    low_res_masks_stats: TensorDebugSummary,
+    high_res_masks_stats: TensorDebugSummary,
+    iou_scores_stats: TensorDebugSummary,
+    object_score_logits_stats: TensorDebugSummary,
+    obj_ptr_stats: TensorDebugSummary,
+    maskmem_features_stats: Option<TensorDebugSummary>,
+    maskmem_pos_enc_stats: Option<TensorDebugSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VideoDebugPropagationInputSummary {
+    history_frames: Vec<VideoDebugHistoryFrameSummary>,
+    history_frame_order: Vec<usize>,
+    chosen_prompt_frame_indices: Vec<usize>,
+    chosen_memory_frame_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VideoDebugHistoryFrameSummary {
+    frame_idx: usize,
+    is_cond_frame: bool,
+    low_res_masks_stats: TensorDebugSummary,
+    high_res_masks_stats: TensorDebugSummary,
+    obj_ptr_stats: TensorDebugSummary,
+    maskmem_features_stats: Option<TensorDebugSummary>,
+    maskmem_pos_enc_stats: Option<TensorDebugSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TensorDebugSummary {
+    shape: Vec<usize>,
+    dtype: String,
+    min: f32,
+    max: f32,
+    mean: f32,
+    l2_norm: f32,
+    foreground_pixel_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VideoDebugComparisonReport {
+    reference_bundle: String,
+    candle_output_dir: String,
+    seed_frame_prompt_vs_detector: Option<VideoDebugMetricSummary>,
+    seed_frame_detector_vs_tracker_seed: Option<VideoDebugMetricSummary>,
+    first_propagated_vs_reference: Option<VideoDebugMetricSummary>,
+    candle_area_growth_ratio: Option<f32>,
+    reference_area_growth_ratio: Option<f32>,
+    verdict: String,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VideoDebugMetricSummary {
+    mask_iou_threshold_0_5: Option<f32>,
+    box_iou: Option<f32>,
+    mean_box_abs_diff: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -201,10 +321,22 @@ pub fn run_video_prediction(
         prefetch_behind: video_mode.prefetch_behind,
         max_feature_cache_entries: video_mode.max_feature_cache_entries,
     };
+    let debug_root = output_dir.join(VIDEO_DEBUG_DIR);
+    if video_mode.debug_bundle {
+        clear_output_dir(&debug_root)?;
+    }
 
-    let mut predictor = sam3::Sam3VideoPredictor::new(model, device).with_backend(Box::new(
-        sam3::Sam3MemoryAttentionVideoTrackerBackend::new(tracker),
-    ));
+    let mut predictor = sam3::Sam3VideoPredictor::new(model, device)
+        .with_backend(Box::new(sam3::Sam3MemoryAttentionVideoTrackerBackend::new(
+            tracker,
+        )))
+        .with_debug_config(sam3::VideoDebugConfig {
+            enabled: video_mode.debug_bundle,
+            capture_obj_ids: video_mode.debug_obj_ids.clone(),
+            capture_frame_indices: video_mode.debug_frame_indices.clone(),
+            capture_first_propagated_only: true,
+            output_root: video_mode.debug_bundle.then_some(debug_root.clone()),
+        });
     let session_id = predictor.start_session(source, session_options)?;
     let num_frames = predictor.session_frame_count(&session_id)?;
     println!("Created video session {session_id} with {num_frames} frames");
@@ -319,6 +451,7 @@ pub fn run_video_prediction(
         masks_dir: VIDEO_MASKS_DIR.to_owned(),
         masked_frames_dir: VIDEO_MASKED_FRAMES_DIR.to_owned(),
         results_path: VIDEO_RESULTS_FILE.to_owned(),
+        debug_dir: video_mode.debug_bundle.then(|| VIDEO_DEBUG_DIR.to_owned()),
     };
     let metadata_path = output_dir.join(VIDEO_REFERENCE_METADATA_FILE);
     fs::write(&metadata_path, serde_json::to_string_pretty(&metadata)?)?;
@@ -373,6 +506,22 @@ pub fn run_video_reference_comparison(
 ) -> Result<()> {
     let (metadata, reference_results, bundle_root) = load_video_bundle(Path::new(bundle_path))?;
     let reference_frames_dir = bundle_root.join(&metadata.frames_dir);
+    let reference_debug_root = metadata
+        .debug_dir
+        .as_ref()
+        .map(|dir| bundle_root.join(dir))
+        .filter(|path| path.join(VIDEO_DEBUG_MANIFEST_FILE).exists())
+        .or_else(|| {
+            let fallback = bundle_root.join(VIDEO_DEBUG_DIR);
+            fallback
+                .join(VIDEO_DEBUG_MANIFEST_FILE)
+                .exists()
+                .then_some(fallback)
+        });
+    let reference_debug = reference_debug_root
+        .as_ref()
+        .map(|path| load_video_debug_manifest(path))
+        .transpose()?;
     let video_mode = VideoMode {
         video_path: reference_frames_dir.display().to_string(),
         tokenizer_path: metadata.tokenizer_path.clone(),
@@ -394,6 +543,15 @@ pub fn run_video_reference_comparison(
         prefetch_behind: 1,
         max_feature_cache_entries: 2,
         offload_state_to_cpu: false,
+        debug_bundle: reference_debug.is_some(),
+        debug_obj_ids: reference_debug
+            .as_ref()
+            .map(|manifest| manifest.capture_obj_ids.clone())
+            .unwrap_or_default(),
+        debug_frame_indices: reference_debug
+            .as_ref()
+            .map(|manifest| manifest.capture_frame_indices.clone())
+            .unwrap_or_default(),
     };
 
     run_video_prediction(model, tracker, &video_mode, output_dir, device)?;
@@ -413,6 +571,32 @@ pub fn run_video_reference_comparison(
         "video reference comparison report written to {}",
         report_path.display()
     );
+    if let (Some(reference_debug_root), Some(reference_debug)) =
+        (reference_debug_root, reference_debug)
+    {
+        let actual_debug_root = output_dir.join(VIDEO_DEBUG_DIR);
+        if actual_debug_root.join(VIDEO_DEBUG_MANIFEST_FILE).exists() {
+            let actual_debug = load_video_debug_manifest(&actual_debug_root)?;
+            let debug_report = build_video_debug_comparison_report(
+                &reference_debug_root,
+                bundle_path,
+                &reference_debug,
+                &actual_debug_root,
+                output_dir,
+                &actual_debug,
+            )?;
+            let debug_report_path = actual_debug_root.join(VIDEO_DEBUG_COMPARE_FILE);
+            fs::create_dir_all(&actual_debug_root)?;
+            fs::write(
+                &debug_report_path,
+                serde_json::to_string_pretty(&debug_report)?,
+            )?;
+            println!(
+                "video debug comparison report written to {}",
+                debug_report_path.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -561,6 +745,240 @@ fn load_video_bundle(path: &Path) -> Result<(VideoExportMetadata, Vec<VideoFrame
             )
         })?;
     Ok((metadata, results, root))
+}
+
+fn load_video_debug_manifest(path: &Path) -> Result<VideoDebugManifest> {
+    let manifest_path = if path.is_dir() {
+        path.join(VIDEO_DEBUG_MANIFEST_FILE)
+    } else {
+        path.to_path_buf()
+    };
+    serde_json::from_str(&fs::read_to_string(&manifest_path).with_context(|| {
+        format!(
+            "failed to read video debug manifest from {}",
+            manifest_path.display()
+        )
+    })?)
+    .with_context(|| {
+        format!(
+            "failed to parse video debug manifest from {}",
+            manifest_path.display()
+        )
+    })
+}
+
+fn build_video_debug_comparison_report(
+    reference_root: &Path,
+    reference_bundle: &str,
+    reference_manifest: &VideoDebugManifest,
+    actual_root: &Path,
+    actual_output_dir: &Path,
+    actual_manifest: &VideoDebugManifest,
+) -> Result<VideoDebugComparisonReport> {
+    let candle_detector = actual_manifest
+        .records
+        .iter()
+        .find(|record| record.stage == "detector_grounding");
+    let candle_tracker_seed = actual_manifest
+        .records
+        .iter()
+        .find(|record| record.stage == "tracker_seed");
+    let candle_first_propagated = actual_manifest
+        .records
+        .iter()
+        .find(|record| record.stage == "first_propagated_output");
+    let reference_prompt = reference_manifest
+        .records
+        .iter()
+        .find(|record| record.stage == "prompt_frame_output");
+    let reference_first_propagated = reference_manifest
+        .records
+        .iter()
+        .find(|record| record.stage == "first_propagated_output");
+
+    let seed_frame_prompt_vs_detector = match (reference_prompt, candle_detector) {
+        (Some(reference), Some(candle)) => Some(compare_debug_records(
+            reference_root,
+            Some(reference),
+            actual_root,
+            Some(candle),
+        )?),
+        _ => None,
+    };
+    let seed_frame_detector_vs_tracker_seed = match (candle_detector, candle_tracker_seed) {
+        (Some(detector), Some(seed)) => Some(compare_debug_records(
+            actual_root,
+            Some(detector),
+            actual_root,
+            Some(seed),
+        )?),
+        _ => None,
+    };
+    let first_propagated_vs_reference = match (reference_first_propagated, candle_first_propagated)
+    {
+        (Some(reference), Some(candle)) => Some(compare_debug_records(
+            reference_root,
+            Some(reference),
+            actual_root,
+            Some(candle),
+        )?),
+        _ => None,
+    };
+
+    let candle_area_growth_ratio = area_growth_ratio(candle_detector, candle_first_propagated);
+    let reference_area_growth_ratio =
+        area_growth_ratio(reference_prompt, reference_first_propagated);
+    let mut notes = Vec::new();
+    let verdict = classify_debug_divergence(
+        seed_frame_prompt_vs_detector.as_ref(),
+        seed_frame_detector_vs_tracker_seed.as_ref(),
+        first_propagated_vs_reference.as_ref(),
+        candle_area_growth_ratio,
+        reference_area_growth_ratio,
+        &mut notes,
+    );
+
+    if !reference_manifest.internal_tracker_state_available {
+        notes.push("upstream debug bundle is observable-output-only; internal tracker state is unavailable".to_owned());
+    }
+
+    Ok(VideoDebugComparisonReport {
+        reference_bundle: reference_bundle.to_owned(),
+        candle_output_dir: actual_output_dir.display().to_string(),
+        seed_frame_prompt_vs_detector,
+        seed_frame_detector_vs_tracker_seed,
+        first_propagated_vs_reference,
+        candle_area_growth_ratio,
+        reference_area_growth_ratio,
+        verdict,
+        notes,
+    })
+}
+
+fn compare_debug_records(
+    lhs_root: &Path,
+    lhs: Option<&VideoDebugRecord>,
+    rhs_root: &Path,
+    rhs: Option<&VideoDebugRecord>,
+) -> Result<VideoDebugMetricSummary> {
+    let lhs = lhs.context("missing lhs debug record for comparison")?;
+    let rhs = rhs.context("missing rhs debug record for comparison")?;
+    let mask_iou = match (
+        lhs.observable
+            .as_ref()
+            .and_then(|summary| summary.mask_path.as_ref()),
+        rhs.observable
+            .as_ref()
+            .and_then(|summary| summary.mask_path.as_ref()),
+    ) {
+        (Some(lhs_mask_path), Some(rhs_mask_path)) => {
+            let lhs_mask = load_mask_probs(&lhs_root.join(lhs_mask_path))?;
+            let rhs_mask = load_mask_probs(&rhs_root.join(rhs_mask_path))?;
+            Some(crate::mask_iou_at_threshold(
+                &lhs_mask,
+                &rhs_mask,
+                MASK_THRESHOLD,
+                None,
+            )?)
+        }
+        _ => None,
+    };
+    let lhs_box = lhs
+        .observable
+        .as_ref()
+        .and_then(|summary| summary.boxes_xyxy.first())
+        .cloned();
+    let rhs_box = rhs
+        .observable
+        .as_ref()
+        .and_then(|summary| summary.boxes_xyxy.first())
+        .cloned();
+    let (box_iou, mean_box_abs_diff) = match (lhs_box.as_deref(), rhs_box.as_deref()) {
+        (Some(lhs_box), Some(rhs_box)) => {
+            let mean_abs = lhs_box
+                .iter()
+                .zip(rhs_box.iter())
+                .map(|(lhs, rhs)| (lhs - rhs).abs())
+                .sum::<f32>()
+                / lhs_box.len().max(1) as f32;
+            (Some(crate::box_iou(lhs_box, rhs_box)), Some(mean_abs))
+        }
+        _ => (None, None),
+    };
+    Ok(VideoDebugMetricSummary {
+        mask_iou_threshold_0_5: mask_iou,
+        box_iou,
+        mean_box_abs_diff,
+    })
+}
+
+fn area_growth_ratio(
+    first: Option<&VideoDebugRecord>,
+    second: Option<&VideoDebugRecord>,
+) -> Option<f32> {
+    let first = first?.observable.as_ref()?;
+    let second = second?.observable.as_ref()?;
+    Some(second.mask_area_ratio / first.mask_area_ratio.max(1e-6))
+}
+
+fn classify_debug_divergence(
+    seed_vs_reference: Option<&VideoDebugMetricSummary>,
+    detector_vs_seed: Option<&VideoDebugMetricSummary>,
+    propagated_vs_reference: Option<&VideoDebugMetricSummary>,
+    candle_area_growth_ratio: Option<f32>,
+    reference_area_growth_ratio: Option<f32>,
+    notes: &mut Vec<String>,
+) -> String {
+    if let Some(metrics) = propagated_vs_reference {
+        if let (Some(mask_iou), Some(box_iou), Some(box_abs_diff)) = (
+            metrics.mask_iou_threshold_0_5,
+            metrics.box_iou,
+            metrics.mean_box_abs_diff,
+        ) {
+            if mask_iou >= 0.9 && (box_iou < 0.8 || box_abs_diff >= 0.05) {
+                notes.push(
+                    "propagated masks stay close while boxes diverge, pointing at postprocess/box extraction".to_owned(),
+                );
+                return "postprocess".to_owned();
+            }
+        }
+    }
+    if let Some(metrics) = detector_vs_seed {
+        if metrics.mask_iou_threshold_0_5.is_some_and(|iou| iou < 0.9)
+            || metrics.mean_box_abs_diff.is_some_and(|diff| diff >= 0.05)
+        {
+            notes.push(
+                "Candle tracker seed already diverges from Candle detector grounding on the prompt frame".to_owned(),
+            );
+            return "handoff".to_owned();
+        }
+    }
+    if let Some(metrics) = propagated_vs_reference {
+        if metrics.mask_iou_threshold_0_5.is_some_and(|iou| iou < 0.9) {
+            notes.push("first propagated Candle mask diverges from upstream".to_owned());
+            return "propagation".to_owned();
+        }
+    }
+    if let (Some(candle_ratio), Some(reference_ratio)) =
+        (candle_area_growth_ratio, reference_area_growth_ratio)
+    {
+        if candle_ratio > reference_ratio * 1.5 {
+            notes.push(format!(
+                "Candle mask area grows faster than upstream between the prompt frame and first propagated frame ({candle_ratio:.3} vs {reference_ratio:.3})"
+            ));
+            return "propagation".to_owned();
+        }
+    }
+    if let Some(metrics) = seed_vs_reference {
+        if metrics.mask_iou_threshold_0_5.is_some_and(|iou| iou < 0.9) {
+            notes.push("prompt-frame detector output is still not close to upstream".to_owned());
+            return "handoff".to_owned();
+        }
+    }
+    notes.push(
+        "no strong divergence signal was detected from the frame-0/frame-1 debug bundle".to_owned(),
+    );
+    "propagation".to_owned()
 }
 
 fn build_video_reference_comparison_report(
@@ -935,5 +1353,219 @@ fn compare_image_paths(lhs: &Path, rhs: &Path) -> std::cmp::Ordering {
         _ => lhs_stem
             .cmp(rhs_stem)
             .then_with(|| lhs.file_name().cmp(&rhs.file_name())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{GrayImage, Luma};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("sam3-video-debug-{name}-{unique}"))
+    }
+
+    fn write_mask(path: &Path, rows: &[&[u8]]) -> Result<()> {
+        let height = rows.len() as u32;
+        let width = rows.first().map(|row| row.len()).unwrap_or(0) as u32;
+        let mut image = GrayImage::new(width, height);
+        for (y, row) in rows.iter().enumerate() {
+            for (x, value) in row.iter().enumerate() {
+                image.put_pixel(x as u32, y as u32, Luma([*value]));
+            }
+        }
+        image.save(path)?;
+        Ok(())
+    }
+
+    fn debug_record(
+        stage: &str,
+        frame_idx: usize,
+        obj_id: u32,
+        mask_path: &str,
+        box_xyxy: [f32; 4],
+    ) -> VideoDebugRecord {
+        VideoDebugRecord {
+            stage: stage.to_owned(),
+            obj_id,
+            frame_idx,
+            prompt_frame_idx: Some(0),
+            prompt_metadata: None,
+            observable: Some(VideoDebugObservableSummary {
+                mask_path: Some(mask_path.to_owned()),
+                mask_threshold: 0.5,
+                foreground_pixel_count: 1,
+                mask_area_ratio: 0.25,
+                boxes_xyxy: vec![box_xyxy.into()],
+                scores: vec![0.9],
+                presence_scores: None,
+                mask_logits_stats: TensorDebugSummary {
+                    shape: vec![2, 2],
+                    dtype: "u8".to_owned(),
+                    min: 0.0,
+                    max: 1.0,
+                    mean: 0.25,
+                    l2_norm: 1.0,
+                    foreground_pixel_count: Some(1),
+                },
+                mask_prob_stats: TensorDebugSummary {
+                    shape: vec![2, 2],
+                    dtype: "u8".to_owned(),
+                    min: 0.0,
+                    max: 1.0,
+                    mean: 0.25,
+                    l2_norm: 1.0,
+                    foreground_pixel_count: Some(1),
+                },
+            }),
+            tracker_state: None,
+            propagation_input: None,
+        }
+    }
+
+    fn base_manifest(source: &str, records: Vec<VideoDebugRecord>) -> VideoDebugManifest {
+        VideoDebugManifest {
+            bundle_version: 1,
+            mode: "video_debug_bundle".to_owned(),
+            source: source.to_owned(),
+            session_id: "session_0".to_owned(),
+            internal_tracker_state_available: source == "candle",
+            capture_obj_ids: Vec::new(),
+            capture_frame_indices: vec![0, 1],
+            capture_first_propagated_only: true,
+            records,
+        }
+    }
+
+    #[test]
+    fn debug_comparison_detects_propagation_area_blow_up() -> Result<()> {
+        let reference_root = temp_path("debug-report-reference");
+        let actual_root = temp_path("debug-report-actual");
+        fs::create_dir_all(&reference_root)?;
+        fs::create_dir_all(&actual_root)?;
+        write_mask(&reference_root.join("prompt.png"), &[&[255, 0], &[0, 0]])?;
+        write_mask(&reference_root.join("prop.png"), &[&[255, 0], &[0, 0]])?;
+        write_mask(&actual_root.join("detector.png"), &[&[255, 0], &[0, 0]])?;
+        write_mask(&actual_root.join("seed.png"), &[&[255, 0], &[0, 0]])?;
+        write_mask(&actual_root.join("prop.png"), &[&[255, 255], &[255, 255]])?;
+
+        let reference_manifest = base_manifest(
+            "upstream",
+            vec![
+                debug_record(
+                    "prompt_frame_output",
+                    0,
+                    0,
+                    "prompt.png",
+                    [0.4, 0.5, 0.7, 0.8],
+                ),
+                debug_record(
+                    "first_propagated_output",
+                    1,
+                    0,
+                    "prop.png",
+                    [0.41, 0.5, 0.7, 0.8],
+                ),
+            ],
+        );
+        let actual_manifest = base_manifest(
+            "candle",
+            vec![
+                debug_record(
+                    "detector_grounding",
+                    0,
+                    0,
+                    "detector.png",
+                    [0.4, 0.5, 0.7, 0.8],
+                ),
+                debug_record("tracker_seed", 0, 0, "seed.png", [0.4, 0.5, 0.7, 0.8]),
+                debug_record(
+                    "first_propagated_output",
+                    1,
+                    0,
+                    "prop.png",
+                    [0.0, 0.0, 1.0, 1.0],
+                ),
+            ],
+        );
+
+        let report = build_video_debug_comparison_report(
+            &reference_root,
+            "reference_bundle",
+            &reference_manifest,
+            &actual_root,
+            &actual_root,
+            &actual_manifest,
+        )?;
+        assert_eq!(report.verdict, "propagation");
+        Ok(())
+    }
+
+    #[test]
+    fn debug_comparison_classifies_mask_close_box_far_as_postprocess() -> Result<()> {
+        let reference_root = temp_path("debug-report-reference-postprocess");
+        let actual_root = temp_path("debug-report-actual-postprocess");
+        fs::create_dir_all(&reference_root)?;
+        fs::create_dir_all(&actual_root)?;
+        write_mask(&reference_root.join("prompt.png"), &[&[255, 0], &[0, 0]])?;
+        write_mask(&reference_root.join("prop.png"), &[&[255, 0], &[0, 0]])?;
+        write_mask(&actual_root.join("detector.png"), &[&[255, 0], &[0, 0]])?;
+        write_mask(&actual_root.join("seed.png"), &[&[255, 0], &[0, 0]])?;
+        write_mask(&actual_root.join("prop.png"), &[&[255, 0], &[0, 0]])?;
+
+        let reference_manifest = base_manifest(
+            "upstream",
+            vec![
+                debug_record(
+                    "prompt_frame_output",
+                    0,
+                    0,
+                    "prompt.png",
+                    [0.4, 0.5, 0.7, 0.8],
+                ),
+                debug_record(
+                    "first_propagated_output",
+                    1,
+                    0,
+                    "prop.png",
+                    [0.41, 0.5, 0.7, 0.8],
+                ),
+            ],
+        );
+        let actual_manifest = base_manifest(
+            "candle",
+            vec![
+                debug_record(
+                    "detector_grounding",
+                    0,
+                    0,
+                    "detector.png",
+                    [0.4, 0.5, 0.7, 0.8],
+                ),
+                debug_record("tracker_seed", 0, 0, "seed.png", [0.4, 0.5, 0.7, 0.8]),
+                debug_record(
+                    "first_propagated_output",
+                    1,
+                    0,
+                    "prop.png",
+                    [0.0, 0.0, 1.0, 1.0],
+                ),
+            ],
+        );
+
+        let report = build_video_debug_comparison_report(
+            &reference_root,
+            "reference_bundle",
+            &reference_manifest,
+            &actual_root,
+            &actual_root,
+            &actual_manifest,
+        )?;
+        assert_eq!(report.verdict, "postprocess");
+        Ok(())
     }
 }
