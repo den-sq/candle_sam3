@@ -24,6 +24,10 @@ use super::{
 const CLIP_EOT_TOKEN: &str = "<|endoftext|>";
 const VIDEO_DEBUG_MANIFEST_FILE: &str = "debug_manifest.json";
 const VIDEO_DEBUG_MASK_THRESHOLD: f32 = 0.5;
+const TRACKER_SEED_MASK_LOGIT_THRESHOLD: f32 = 0.0;
+const VIDEO_PROPAGATION_FILL_HOLE_AREA: usize = 0;
+const VIDEO_PROPAGATION_HOLE_FILL_LOGIT: f32 = 0.1;
+const VIDEO_PROPAGATION_SPRINKLE_REMOVE_LOGIT: f32 = -0.1;
 
 #[derive(Debug, Clone)]
 pub struct SessionPrompt {
@@ -1477,18 +1481,60 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
         Self { tracker }
     }
 
-    fn history_on_device(
+    fn ensure_history_states_have_memory(
         &self,
-        object: &TrackedObject,
+        model: &Sam3ImageModel,
+        compute_device: &Device,
+        session: &mut Sam3VideoSession,
+        obj_id: u32,
         frame_idx: usize,
         direction: PropagationDirection,
-        compute_device: &Device,
-    ) -> Result<BTreeMap<usize, TrackerFrameState>> {
-        object
-            .tracker_history(frame_idx, direction)
-            .into_iter()
-            .map(|(idx, state)| Ok((idx, state.to_storage_device(compute_device)?)))
-            .collect()
+    ) -> Result<()> {
+        let pending_frame_indices = {
+            let object = session
+                .tracked_objects
+                .get(&obj_id)
+                .ok_or_else(|| candle::Error::Msg(format!("unknown obj_id {}", obj_id)))?;
+            match direction {
+                PropagationDirection::Forward | PropagationDirection::Both => object
+                    .tracker_states
+                    .range(..frame_idx)
+                    .filter_map(|(idx, state)| state.maskmem_features.is_none().then_some(*idx))
+                    .collect::<Vec<_>>(),
+                PropagationDirection::Backward => object
+                    .tracker_states
+                    .range((frame_idx + 1)..)
+                    .filter_map(|(idx, state)| state.maskmem_features.is_none().then_some(*idx))
+                    .collect::<Vec<_>>(),
+            }
+        };
+        for history_frame_idx in pending_frame_indices {
+            let visual = session.get_visual_features(model, compute_device, history_frame_idx)?;
+            let state = session
+                .tracked_objects
+                .get(&obj_id)
+                .and_then(|object| object.tracker_states.get(&history_frame_idx))
+                .ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "missing tracker state for obj_id {} frame {}",
+                        obj_id, history_frame_idx
+                    ))
+                })?
+                .to_storage_device(compute_device)?;
+            let (maskmem_features, maskmem_pos_enc) =
+                self.tracker.encode_state_memory(&visual, &state)?;
+            let mut state = state;
+            state.maskmem_features = Some(maskmem_features);
+            state.maskmem_pos_enc = Some(maskmem_pos_enc);
+            let storage_device = session.storage_device().clone();
+            session
+                .tracked_objects
+                .get_mut(&obj_id)
+                .ok_or_else(|| candle::Error::Msg(format!("unknown obj_id {}", obj_id)))?
+                .tracker_states
+                .insert(history_frame_idx, state.to_storage_device(&storage_device)?);
+        }
+        Ok(())
     }
 
     fn store_object_result(
@@ -1581,17 +1627,24 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
                 &detector_output,
             )?;
         }
-        let history = self.history_on_device(object, frame_idx, direction, compute_device)?;
+        let history = history_on_device_from_session(
+            session,
+            object.obj_id,
+            frame_idx,
+            direction,
+            compute_device,
+        )?;
         // Upstream video inference seeds tracker memory from detector masks on the prompt
         // frame, including the initial box-as-visual prompt case.
         let display_score = detector_output.score_value()?;
         let tracker_input_size = self.tracker.input_mask_size();
-        let tracker_seed_probs = resize_mask_probs(
-            &detector_output.masks,
-            tracker_input_size,
-            tracker_input_size,
+        let tracker_seed_logits = resize_mask_logits_to_video(
+            &grounding.mask_logits,
+            ImageSize::square(tracker_input_size),
         )?;
-        let mask_input = threshold_mask_probs(&tracker_seed_probs, VIDEO_DEBUG_MASK_THRESHOLD)?;
+        let mask_input = tracker_seed_logits
+            .gt(TRACKER_SEED_MASK_LOGIT_THRESHOLD)?
+            .to_dtype(DType::F32)?;
         let step = self.tracker.track_frame(
             &visual,
             frame_idx,
@@ -1604,7 +1657,9 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
             true,
             matches!(direction, PropagationDirection::Backward),
             false,
+            false,
         )?;
+        let stored_state = step.state.clone();
         let trimmed_memory_frame_indices =
             trim_memory_frame_indices(step.memory_frame_indices.clone(), config.memory_frame_count);
         let output = ObjectFrameOutput {
@@ -1615,7 +1670,7 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
         if let Some(recorder) = session.debug_recorder_mut() {
             let tracker_seed_output = tracker_state_to_object_output(
                 object.obj_id,
-                &step.state,
+                &stored_state,
                 Some(display_score),
                 Some(frame_idx),
                 trimmed_memory_frame_indices,
@@ -1630,10 +1685,10 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
                 direction,
                 prompt_metadata,
                 &tracker_seed_output,
-                &step.state,
+                &stored_state,
             )?;
         }
-        self.store_object_result(session, frame_idx, output, step.state, Some(display_score))
+        self.store_object_result(session, frame_idx, output, stored_state, Some(display_score))
     }
 
     fn seed_with_tracker_points(
@@ -1648,7 +1703,13 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
         prompt: &SessionPrompt,
     ) -> Result<ObjectFrameOutput> {
         let visual = session.get_visual_features(model, compute_device, frame_idx)?;
-        let history = self.history_on_device(object, frame_idx, direction, compute_device)?;
+        let history = history_on_device_from_session(
+            session,
+            object.obj_id,
+            frame_idx,
+            direction,
+            compute_device,
+        )?;
         let image_size = model.input_size();
         let point_inputs = session_prompt_to_tracker_points(prompt, image_size, compute_device)?;
         let boxes_xyxy = session_prompt_to_tracker_box(prompt, image_size, compute_device)?;
@@ -1668,6 +1729,7 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
             &history,
             true,
             matches!(direction, PropagationDirection::Backward),
+            false,
             false,
         )?;
         let output = tracker_state_to_object_output(
@@ -1694,11 +1756,30 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
         frame_idx: usize,
         direction: PropagationDirection,
     ) -> Result<Option<ObjectFrameOutput>> {
-        let history = self.history_on_device(object, frame_idx, direction, compute_device)?;
+        self.ensure_history_states_have_memory(
+            model,
+            compute_device,
+            session,
+            object.obj_id,
+            frame_idx,
+            direction,
+        )?;
+        let history = history_on_device_from_session(
+            session,
+            object.obj_id,
+            frame_idx,
+            direction,
+            compute_device,
+        )?;
         if history.is_empty() {
             return Ok(None);
         }
-        let nearest_prompt_frame_idx = object
+        let current_object = session
+            .tracked_objects
+            .get(&object.obj_id)
+            .cloned()
+            .ok_or_else(|| candle::Error::Msg(format!("unknown obj_id {}", object.obj_id)))?;
+        let nearest_prompt_frame_idx = current_object
             .nearest_prompt(frame_idx, direction)
             .map(|(idx, _)| idx);
         let visual = session.get_visual_features(model, compute_device, frame_idx)?;
@@ -1714,24 +1795,45 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
             false,
             matches!(direction, PropagationDirection::Backward),
             true,
+            false,
         )?;
+        let raw_state = step.state;
+        let low_res_masks = postprocess_low_res_mask_logits_for_video(
+            &raw_state.low_res_masks,
+            VIDEO_PROPAGATION_FILL_HOLE_AREA,
+        )?;
+        let tracker_image_size = self.tracker.config().image_size;
+        let output_high_res_masks =
+            low_res_masks.upsample_bilinear2d(tracker_image_size, tracker_image_size, false)?;
+        let (maskmem_features, maskmem_pos_enc) = self.tracker.encode_external_memory(
+            &visual,
+            &raw_state.high_res_masks,
+            &raw_state.object_score_logits,
+            false,
+        )?;
+        let mut stored_state = raw_state.clone();
+        stored_state.maskmem_features = Some(maskmem_features);
+        stored_state.maskmem_pos_enc = Some(maskmem_pos_enc);
+        let mut output_state = stored_state.clone();
+        output_state.low_res_masks = low_res_masks;
+        output_state.high_res_masks = output_high_res_masks;
         let prompt_frame_idx = match direction {
             PropagationDirection::Forward | PropagationDirection::Both => {
                 step.prompt_frame_indices.last().copied()
             }
             PropagationDirection::Backward => step.prompt_frame_indices.first().copied(),
         };
-        let text_prompt = object
+        let text_prompt = current_object
             .latest_text_prompt(frame_idx, direction)
             .map(|(_, text)| text);
         let used_explicit_geometry = prompt_frame_idx
-            .and_then(|idx| object.prompt_frames.get(&idx))
+            .and_then(|idx| current_object.prompt_frames.get(&idx))
             .map(|prompt| prompt.has_geometry())
             .unwrap_or(false);
         let output = tracker_state_to_object_output(
             object.obj_id,
-            &step.state,
-            object.display_score,
+            &output_state,
+            current_object.display_score,
             prompt_frame_idx,
             trim_memory_frame_indices(step.memory_frame_indices, config.memory_frame_count),
             text_prompt,
@@ -1742,7 +1844,7 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
         let trimmed_memory_frame_indices = output.memory_frame_indices.clone();
         if let Some(recorder) = session.debug_recorder_mut() {
             recorder.record_first_propagation(
-                object,
+                &current_object,
                 frame_idx,
                 direction,
                 prompt_frame_idx.or(nearest_prompt_frame_idx),
@@ -1753,7 +1855,7 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
             )?;
         }
         Ok(Some(self.store_object_result(
-            session, frame_idx, output, step.state, None,
+            session, frame_idx, output, stored_state, None,
         )?))
     }
 
@@ -1763,14 +1865,23 @@ impl<'a> Sam3MemoryAttentionVideoTrackerBackend<'a> {
         compute_device: &Device,
         config: &VideoConfig,
         session: &mut Sam3VideoSession,
-        object: TrackedObject,
+        obj_id: u32,
         frame_idx: usize,
         direction: PropagationDirection,
     ) -> Result<Option<ObjectFrameOutput>> {
-        if let Some(cached) = object.frame_outputs.get(&frame_idx) {
+        if let Some(cached) = session
+            .tracked_objects
+            .get(&obj_id)
+            .and_then(|object| object.frame_outputs.get(&frame_idx))
+        {
             return Ok(Some(cached.clone()));
         }
 
+        let object = session
+            .tracked_objects
+            .get(&obj_id)
+            .cloned()
+            .ok_or_else(|| candle::Error::Msg(format!("unknown obj_id {}", obj_id)))?;
         if let Some(prompt) = object.prompt_frames.get(&frame_idx) {
             if prompt.text.is_some() || prompt.boxes.is_some() {
                 return self
@@ -1834,17 +1945,12 @@ impl VideoTrackerBackend for Sam3MemoryAttentionVideoTrackerBackend<'_> {
 
         let mut objects = Vec::new();
         for obj_id in object_ids {
-            let object = session
-                .tracked_objects
-                .get(&obj_id)
-                .cloned()
-                .ok_or_else(|| candle::Error::Msg(format!("unknown obj_id {}", obj_id)))?;
             if let Some(output) = self.infer_object_on_frame(
                 model,
                 compute_device,
                 config,
                 session,
-                object,
+                obj_id,
                 frame_idx,
                 direction,
             )? {
@@ -3138,6 +3244,157 @@ fn trim_memory_frame_indices(
     memory_frame_indices
 }
 
+fn postprocess_low_res_mask_logits_for_video(mask_logits: &Tensor, max_area: usize) -> Result<Tensor> {
+    if max_area == 0 {
+        return Ok(mask_logits.clone());
+    }
+    let device = mask_logits.device().clone();
+    let mask_logits = mask_logits.to_device(&Device::Cpu)?;
+    let (batch, channel, height, width) = mask_logits.dims4()?;
+    let mut processed = Vec::with_capacity(batch * channel * height * width);
+
+    for batch_idx in 0..batch {
+        for channel_idx in 0..channel {
+            let mut plane = mask_logits.i((batch_idx, channel_idx))?.to_vec2::<f32>()?;
+            fill_small_holes_in_plane(&mut plane, height, width, max_area);
+            remove_small_sprinkles_in_plane(&mut plane, height, width, max_area);
+            processed.extend(plane.into_iter().flatten());
+        }
+    }
+
+    Tensor::from_vec(processed, (batch, channel, height, width), &Device::Cpu)?.to_device(&device)
+}
+
+fn fill_small_holes_in_plane(plane: &mut [Vec<f32>], height: usize, width: usize, max_area: usize) {
+    let mut visited = vec![false; height * width];
+    for row in 0..height {
+        for col in 0..width {
+            let idx = row * width + col;
+            if visited[idx] || plane[row][col] > 0.0 {
+                continue;
+            }
+            let component = collect_component(
+                &mut visited,
+                height,
+                width,
+                row,
+                col,
+                |r, c| plane[r][c] <= 0.0,
+            );
+            if component.len() <= max_area {
+                for (r, c) in component {
+                    plane[r][c] = VIDEO_PROPAGATION_HOLE_FILL_LOGIT;
+                }
+            }
+        }
+    }
+}
+
+fn remove_small_sprinkles_in_plane(
+    plane: &mut [Vec<f32>],
+    height: usize,
+    width: usize,
+    max_area: usize,
+) {
+    let total_fg = plane
+        .iter()
+        .flat_map(|row| row.iter())
+        .filter(|value| **value > 0.0)
+        .count();
+    let fg_area_thresh = total_fg.saturating_div(2).min(max_area);
+    if fg_area_thresh == 0 {
+        return;
+    }
+    let mut visited = vec![false; height * width];
+    for row in 0..height {
+        for col in 0..width {
+            let idx = row * width + col;
+            if visited[idx] || plane[row][col] <= 0.0 {
+                continue;
+            }
+            let component = collect_component(
+                &mut visited,
+                height,
+                width,
+                row,
+                col,
+                |r, c| plane[r][c] > 0.0,
+            );
+            if component.len() <= fg_area_thresh {
+                for (r, c) in component {
+                    plane[r][c] = VIDEO_PROPAGATION_SPRINKLE_REMOVE_LOGIT;
+                }
+            }
+        }
+    }
+}
+
+fn collect_component<F>(
+    visited: &mut [bool],
+    height: usize,
+    width: usize,
+    start_row: usize,
+    start_col: usize,
+    predicate: F,
+) -> Vec<(usize, usize)>
+where
+    F: Fn(usize, usize) -> bool,
+{
+    let mut queue = VecDeque::new();
+    let mut component = Vec::new();
+    let start_idx = start_row * width + start_col;
+    visited[start_idx] = true;
+    queue.push_back((start_row, start_col));
+
+    while let Some((row, col)) = queue.pop_front() {
+        component.push((row, col));
+        for (next_row, next_col) in neighbors8(row, col, height, width) {
+            let idx = next_row * width + next_col;
+            if visited[idx] || !predicate(next_row, next_col) {
+                continue;
+            }
+            visited[idx] = true;
+            queue.push_back((next_row, next_col));
+        }
+    }
+
+    component
+}
+
+fn neighbors8(row: usize, col: usize, height: usize, width: usize) -> Vec<(usize, usize)> {
+    let row_start = row.saturating_sub(1);
+    let row_end = (row + 1).min(height.saturating_sub(1));
+    let col_start = col.saturating_sub(1);
+    let col_end = (col + 1).min(width.saturating_sub(1));
+    let mut neighbors = Vec::with_capacity(8);
+    for next_row in row_start..=row_end {
+        for next_col in col_start..=col_end {
+            if next_row == row && next_col == col {
+                continue;
+            }
+            neighbors.push((next_row, next_col));
+        }
+    }
+    neighbors
+}
+
+fn history_on_device_from_session(
+    session: &Sam3VideoSession,
+    obj_id: u32,
+    frame_idx: usize,
+    direction: PropagationDirection,
+    compute_device: &Device,
+) -> Result<BTreeMap<usize, TrackerFrameState>> {
+    session
+        .tracked_objects
+        .get(&obj_id)
+        .ok_or_else(|| candle::Error::Msg(format!("unknown obj_id {}", obj_id)))?
+        .tracker_history(frame_idx, direction)
+        .into_iter()
+        .map(|(idx, state)| Ok((idx, state.to_storage_device(compute_device)?)))
+        .collect()
+}
+
 fn tracker_state_to_object_output(
     obj_id: u32,
     state: &TrackerFrameState,
@@ -3903,6 +4160,135 @@ mod tests {
     }
 
     #[test]
+    fn detector_tracker_seed_masks_threshold_resized_logits_not_probabilities() -> Result<()> {
+        let device = Device::Cpu;
+        let mask_logits = Tensor::from_vec(
+            vec![
+                -0.2f32, 0.0, 0.3, -1.0, //
+                0.8, -0.4, 0.1, -0.05, //
+            ],
+            (1, 2, 4),
+            &device,
+        )?;
+        let mask_probs = candle_nn::ops::sigmoid(&mask_logits)?;
+        let mask_input = mask_logits
+            .gt(TRACKER_SEED_MASK_LOGIT_THRESHOLD)?
+            .to_dtype(DType::F32)?;
+        assert_eq!(
+            mask_input.to_vec3::<f32>()?,
+            vec![vec![vec![0.0, 0.0, 1.0, 0.0], vec![1.0, 0.0, 1.0, 0.0],]]
+        );
+        assert_eq!(
+            mask_probs
+                .gt(TRACKER_SEED_MASK_LOGIT_THRESHOLD)?
+                .to_dtype(DType::F32)?
+                .to_vec3::<f32>()?,
+            vec![vec![vec![1.0, 1.0, 1.0, 1.0], vec![1.0, 1.0, 1.0, 1.0],]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn propagation_mask_postprocess_matches_upstream_fill_and_sprinkle_rules() -> Result<()> {
+        let device = Device::Cpu;
+        let mask_logits = Tensor::from_vec(
+            vec![
+                -1.0f32, -1.0, -1.0, -1.0, -1.0, //
+                -1.0, 1.0, 1.0, 1.0, -1.0, //
+                -1.0, 1.0, -1.0, 1.0, -1.0, //
+                -1.0, 1.0, 1.0, 1.0, -1.0, //
+                1.0, -1.0, -1.0, -1.0, -1.0, //
+            ],
+            (1, 1, 5, 5),
+            &device,
+        )?;
+        let postprocessed = postprocess_low_res_mask_logits_for_video(&mask_logits, 1)?;
+        assert_eq!(
+            postprocessed.i((0, 0))?.to_vec2::<f32>()?,
+            vec![
+                vec![-1.0, -1.0, -1.0, -1.0, -1.0],
+                vec![-1.0, 1.0, 1.0, 1.0, -1.0],
+                vec![-1.0, 1.0, 0.1, 1.0, -1.0],
+                vec![-1.0, 1.0, 1.0, 1.0, -1.0],
+                vec![1.0, -1.0, -1.0, -1.0, -1.0],
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn propagation_history_reads_fresh_session_state_after_preflight_updates() -> Result<()> {
+        let device = Device::Cpu;
+        let model = tiny_model(&device)?;
+        let frames = vec![
+            Tensor::zeros((3, 56, 56), DType::F32, &device)?,
+            Tensor::zeros((3, 56, 56), DType::F32, &device)?,
+        ];
+        let frame_source = VideoSource::TensorFrames(frames).into_frame_source(model.config())?;
+        let mut session = Sam3VideoSession::new(
+            "session-fresh-history".to_owned(),
+            frame_source,
+            VideoSessionOptions::default(),
+            VideoDebugConfig::default(),
+            &model,
+            &device,
+        )?;
+        let obj_id = session.allocate_object(0);
+        let stale_state = TrackerFrameState {
+            low_res_masks: Tensor::zeros((1, 1, 2, 2), DType::F32, &device)?,
+            high_res_masks: Tensor::zeros((1, 1, 2, 2), DType::F32, &device)?,
+            iou_scores: Tensor::zeros((1, 1), DType::F32, &device)?,
+            obj_ptr: Tensor::zeros((1, 8), DType::F32, &device)?,
+            object_score_logits: Tensor::ones((1, 1), DType::F32, &device)?,
+            maskmem_features: None,
+            maskmem_pos_enc: None,
+            is_cond_frame: true,
+        };
+        session
+            .tracked_objects
+            .get_mut(&obj_id)
+            .expect("tracked object should exist")
+            .tracker_states
+            .insert(0, stale_state.clone());
+        let stale_object = session
+            .tracked_objects
+            .get(&obj_id)
+            .expect("tracked object should exist")
+            .clone();
+
+        let mut updated_state = stale_state;
+        updated_state.maskmem_features = Some(Tensor::ones((1, 4, 1, 1), DType::F32, &device)?);
+        updated_state.maskmem_pos_enc = Some(Tensor::ones((1, 4, 1, 1), DType::F32, &device)?);
+        session
+            .tracked_objects
+            .get_mut(&obj_id)
+            .expect("tracked object should exist")
+            .tracker_states
+            .insert(0, updated_state);
+
+        let stale_history = stale_object.tracker_history(1, PropagationDirection::Forward);
+        assert!(stale_history
+            .get(&0)
+            .expect("stale history should contain frame 0")
+            .maskmem_features
+            .is_none());
+
+        let fresh_history = history_on_device_from_session(
+            &session,
+            obj_id,
+            1,
+            PropagationDirection::Forward,
+            &device,
+        )?;
+        let fresh_state = fresh_history
+            .get(&0)
+            .expect("fresh history should contain frame 0");
+        assert!(fresh_state.maskmem_features.is_some());
+        assert!(fresh_state.maskmem_pos_enc.is_some());
+        Ok(())
+    }
+
+    #[test]
     fn initial_single_box_prompt_is_treated_as_visual_prompt() {
         let mut object = TrackedObject::new(4, 0);
         object.prompt_frames.insert(
@@ -4069,6 +4455,8 @@ mod tests {
             .as_ref()
             .expect("propagation input summary should be present");
         assert_eq!(propagation_input.history_frame_order, vec![0]);
+        assert_eq!(propagation_input.chosen_prompt_frame_indices, vec![0]);
+        assert_eq!(propagation_input.chosen_memory_frame_indices, vec![0]);
         assert_eq!(propagation_input.history_frames.len(), 1);
         assert!(propagation_input.history_frames[0].is_cond_frame);
         let detector = manifest
