@@ -326,17 +326,15 @@ pub fn run_video_prediction(
         clear_output_dir(&debug_root)?;
     }
 
-    let mut predictor = sam3::Sam3VideoPredictor::new(model, device)
-        .with_backend(Box::new(sam3::Sam3MemoryAttentionVideoTrackerBackend::new(
-            tracker,
-        )))
-        .with_debug_config(sam3::VideoDebugConfig {
+    let mut predictor = sam3::Sam3VideoPredictor::new(model, tracker, device).with_debug_config(
+        sam3::VideoDebugConfig {
             enabled: video_mode.debug_bundle,
             capture_obj_ids: video_mode.debug_obj_ids.clone(),
             capture_frame_indices: video_mode.debug_frame_indices.clone(),
             capture_first_propagated_only: true,
             output_root: video_mode.debug_bundle.then_some(debug_root.clone()),
-        });
+        },
+    );
     let session_id = predictor.start_session(source, session_options)?;
     let num_frames = predictor.session_frame_count(&session_id)?;
     println!("Created video session {session_id} with {num_frames} frames");

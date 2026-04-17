@@ -50,9 +50,8 @@ pub use segmentation::{SegmentationOutput, UniversalSegmentationHead};
 pub use text::{Sam3TextEncoder, TextEncoding};
 pub use tracker::{Sam3TrackerConfig, Sam3TrackerModel, TrackerFrameState, TrackerStepOutput};
 pub use video::{
-    FrameSource, ObjectFrameOutput, PropagationDirection, PropagationOptions,
-    Sam3MemoryAttentionVideoTrackerBackend, Sam3VideoPredictor, Sam3VideoSession,
-    SessionCacheStats, SessionPrompt, TrackedObject, VideoConfig, VideoDebugConfig,
-    VideoFrameOutput, VideoOutput, VideoSessionOptions, VideoSource,
+    FrameSource, ObjectFrameOutput, PropagationDirection, PropagationOptions, Sam3VideoPredictor,
+    Sam3VideoSession, SessionCacheStats, SessionPrompt, TrackedObject, VideoConfig,
+    VideoDebugConfig, VideoFrameOutput, VideoOutput, VideoSessionOptions, VideoSource,
 };
 pub use vitdet::{Sam3ViTDetTrunk, ViTDetTrunkOutput};
