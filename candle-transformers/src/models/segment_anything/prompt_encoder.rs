@@ -182,6 +182,20 @@ impl PromptEncoder {
             &zeros,
         )?;
         let point_embedding = (point_embedding + labels1)?;
+        let labels2 = labels.eq(2f32)?.where_cond(
+            &self.point_embeddings[2]
+                .embeddings()
+                .broadcast_as(zeros.shape())?,
+            &zeros,
+        )?;
+        let point_embedding = (point_embedding + labels2)?;
+        let labels3 = labels.eq(3f32)?.where_cond(
+            &self.point_embeddings[3]
+                .embeddings()
+                .broadcast_as(zeros.shape())?,
+            &zeros,
+        )?;
+        let point_embedding = (point_embedding + labels3)?;
         Ok(point_embedding)
     }
 
@@ -267,6 +281,25 @@ mod tests {
         let boxes = Tensor::from_vec(vec![1f32, 2.0, 5.0, 6.0], (1, 4), &device)?;
         let (sparse_embeddings, dense_embeddings) = encoder.forward(None, Some(&boxes), None)?;
         assert_eq!(sparse_embeddings.dims3()?, (1, 2, 8));
+        assert_eq!(dense_embeddings.dims4()?, (1, 8, 4, 4));
+        Ok(())
+    }
+
+    #[test]
+    fn point_labels_two_and_three_are_supported() -> Result<()> {
+        let device = Device::Cpu;
+        let encoder = PromptEncoder::new(
+            8,
+            (4, 4),
+            (16, 16),
+            16,
+            VarBuilder::zeros(candle::DType::F32, &device),
+        )?;
+        let points = Tensor::zeros((1, 2, 2), candle::DType::F32, &device)?;
+        let labels = Tensor::from_vec(vec![2f32, 3f32], (1, 2), &device)?;
+        let (sparse_embeddings, dense_embeddings) =
+            encoder.forward(Some((&points, &labels)), None, None)?;
+        assert_eq!(sparse_embeddings.dims3()?, (1, 3, 8));
         assert_eq!(dense_embeddings.dims4()?, (1, 8, 4, 4));
         Ok(())
     }
