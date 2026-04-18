@@ -5,6 +5,7 @@ import json
 import shutil
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import torch
@@ -703,6 +704,454 @@ def build_video_debug_observable(
     }
 
 
+def build_tensor_stats(tensor):
+    tensor = tensor.detach().to("cpu").contiguous()
+    stats_tensor = tensor.float() if not tensor.dtype.is_floating_point else tensor
+    numel = tensor.numel()
+    if numel == 0:
+        return {
+            "shape": list(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "l2_norm": 0.0,
+        }
+    return {
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "min": float(stats_tensor.min().item()),
+        "max": float(stats_tensor.max().item()),
+        "mean": float(stats_tensor.mean().item()),
+        "l2_norm": float(torch.linalg.vector_norm(stats_tensor).item()),
+    }
+
+
+def clone_tensor_for_fixture(tensor):
+    return tensor.detach().to("cpu").contiguous()
+
+
+def add_tracker_output_tensors(target, prefix, frame_output):
+    if frame_output is None:
+        return
+    for key in [
+        "pred_masks",
+        "pred_masks_high_res",
+        "obj_ptr",
+        "object_score_logits",
+        "maskmem_features",
+        "iou_score",
+        "eff_iou_score",
+    ]:
+        value = frame_output.get(key)
+        if torch.is_tensor(value):
+            target[f"{prefix}.{key}"] = value
+    maskmem_pos_enc = frame_output.get("maskmem_pos_enc")
+    if maskmem_pos_enc is not None:
+        for idx, pos_enc in enumerate(maskmem_pos_enc):
+            if torch.is_tensor(pos_enc):
+                target[f"{prefix}.maskmem_pos_enc.{idx}"] = pos_enc
+
+
+class VideoInternalFixtureRecorder:
+    def __init__(self, output_dir: Path, capture_frame_indices):
+        self.output_dir = output_dir
+        self.capture_frame_indices = sorted({int(frame_idx) for frame_idx in capture_frame_indices})
+        self.tensor_store = {}
+        self.records = []
+        self.session_id = None
+        self.tracker_config = None
+        self._context_stack = []
+
+    def should_capture(self, frame_idx):
+        return frame_idx in self.capture_frame_indices
+
+    def set_session_id(self, session_id):
+        self.session_id = session_id
+
+    def set_tracker_config(self, tracker):
+        self.tracker_config = {
+            "image_size": int(tracker.image_size),
+            "backbone_stride": int(tracker.backbone_stride),
+            "low_res_mask_size": int(tracker.low_res_mask_size),
+            "input_mask_size": int(tracker.input_mask_size),
+            "num_maskmem": int(tracker.num_maskmem),
+            "max_cond_frames_in_attn": int(tracker.max_cond_frames_in_attn),
+            "keep_first_cond_frame": bool(tracker.keep_first_cond_frame),
+            "memory_temporal_stride_for_eval": int(tracker.memory_temporal_stride_for_eval),
+            "max_obj_ptrs_in_encoder": int(tracker.max_obj_ptrs_in_encoder),
+            "sigmoid_scale_for_mem_enc": float(tracker.sigmoid_scale_for_mem_enc),
+            "sigmoid_bias_for_mem_enc": float(tracker.sigmoid_bias_for_mem_enc),
+            "multimask_output_in_sam": bool(tracker.multimask_output_in_sam),
+            "multimask_output_for_tracking": bool(tracker.multimask_output_for_tracking),
+            "multimask_min_pt_num": int(tracker.multimask_min_pt_num),
+            "multimask_max_pt_num": int(tracker.multimask_max_pt_num),
+            "use_memory_selection": bool(tracker.use_memory_selection),
+            "mf_threshold": float(tracker.mf_threshold),
+            "input_mask_binarize_threshold": 0.0,
+            "video_mask_binarize_threshold": 0.5,
+            "mask_as_output_out_scale": 20.0,
+            "mask_as_output_out_bias": -10.0,
+            "memory_prompt_mask_threshold": 0.0,
+        }
+
+    def push_context(self, **context):
+        self._context_stack.append(context)
+
+    def pop_context(self):
+        if self._context_stack:
+            self._context_stack.pop()
+
+    def current_context(self):
+        return self._context_stack[-1] if self._context_stack else {}
+
+    def add_record(self, stage, frame_idx, metadata=None, tensors=None):
+        frame_idx = int(frame_idx)
+        if not self.should_capture(frame_idx):
+            return
+
+        record_idx = len(self.records)
+        tensor_keys = {}
+        tensor_stats = {}
+        for name, tensor in (tensors or {}).items():
+            if tensor is None or not torch.is_tensor(tensor):
+                continue
+            tensor_key = f"record_{record_idx:04d}.{name}"
+            stored = clone_tensor_for_fixture(tensor)
+            self.tensor_store[tensor_key] = stored
+            tensor_keys[name] = tensor_key
+            tensor_stats[name] = build_tensor_stats(stored)
+
+        self.records.append(
+            {
+                "record_index": record_idx,
+                "stage": stage,
+                "frame_idx": frame_idx,
+                "metadata": metadata or {},
+                "tensor_keys": tensor_keys,
+                "tensor_stats": tensor_stats,
+            }
+        )
+
+    def finalize(self):
+        from safetensors.torch import save_file
+
+        fixtures_path = self.output_dir / "internal_fixtures.safetensors"
+        manifest_path = self.output_dir / "internal_manifest.json"
+        if self.tensor_store:
+            save_file(self.tensor_store, fixtures_path)
+
+        manifest = {
+            "bundle_version": 1,
+            "mode": "video_internal_fixtures",
+            "source": "upstream",
+            "session_id": self.session_id,
+            "capture_frame_indices": list(self.capture_frame_indices),
+            "tensor_file": fixtures_path.name if self.tensor_store else None,
+            "tracker_config": self.tracker_config,
+            "records": self.records,
+        }
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        return manifest_path, fixtures_path if self.tensor_store else None
+
+
+def compute_memory_selection_debug(tracker, frame_idx, output_dict, num_frames, track_in_reverse, use_prev_mem_frame):
+    from sam3.model.sam3_tracker_utils import select_closest_cond_frames
+
+    selected_cond_outputs, unselected_cond_outputs = select_closest_cond_frames(
+        frame_idx,
+        output_dict["cond_frame_outputs"],
+        tracker.max_cond_frames_in_attn,
+        keep_first_cond_frame=tracker.keep_first_cond_frame,
+    )
+    metadata = {
+        "selected_conditioning_frame_indices": sorted(int(idx) for idx in selected_cond_outputs.keys()),
+        "unselected_conditioning_frame_indices": sorted(int(idx) for idx in unselected_cond_outputs.keys()),
+        "selected_memory_frame_indices": [],
+        "selected_memory_sources": [],
+        "selected_object_pointer_frame_indices": [],
+        "selected_object_pointer_is_conditioning": [],
+        "selected_object_pointer_temporal_offsets": [],
+        "memory_temporal_stride": int(1 if tracker.training else tracker.memory_temporal_stride_for_eval),
+        "use_prev_mem_frame": bool(use_prev_mem_frame),
+        "track_in_reverse": bool(track_in_reverse),
+        "max_obj_ptrs_in_encoder": int(min(num_frames, tracker.max_obj_ptrs_in_encoder)),
+    }
+    tensor_map = {}
+    if not use_prev_mem_frame:
+        return metadata, tensor_map
+
+    r = metadata["memory_temporal_stride"]
+    valid_indices = None
+    if tracker.use_memory_selection:
+        valid_indices = tracker.frame_filter(output_dict, track_in_reverse, frame_idx, num_frames, r)
+        metadata["memory_selection_valid_indices"] = [int(idx) for idx in valid_indices]
+
+    for t_pos in range(1, tracker.num_maskmem):
+        t_rel = tracker.num_maskmem - t_pos
+        if tracker.use_memory_selection:
+            if t_rel > len(valid_indices):
+                continue
+            prev_frame_idx = int(valid_indices[-t_rel])
+        else:
+            if t_rel == 1:
+                prev_frame_idx = int(frame_idx + t_rel if track_in_reverse else frame_idx - t_rel)
+            else:
+                if not track_in_reverse:
+                    prev_frame_idx = ((frame_idx - 2) // r) * r
+                    prev_frame_idx = prev_frame_idx - (t_rel - 2) * r
+                else:
+                    prev_frame_idx = -(-(frame_idx + 2) // r) * r
+                    prev_frame_idx = prev_frame_idx + (t_rel - 2) * r
+                prev_frame_idx = int(prev_frame_idx)
+        source = "non_cond"
+        out = output_dict["non_cond_frame_outputs"].get(prev_frame_idx)
+        if out is None:
+            out = unselected_cond_outputs.get(prev_frame_idx)
+            if out is not None:
+                source = "unselected_cond"
+        if out is None:
+            continue
+        metadata["selected_memory_frame_indices"].append(prev_frame_idx)
+        metadata["selected_memory_sources"].append(source)
+        add_tracker_output_tensors(tensor_map, f"selected_memory_frames.{prev_frame_idx}", out)
+
+    if not tracker.training:
+        ptr_cond_outputs = {
+            t: out
+            for t, out in selected_cond_outputs.items()
+            if (t >= frame_idx if track_in_reverse else t <= frame_idx)
+        }
+    else:
+        ptr_cond_outputs = selected_cond_outputs
+    pos_and_ptrs = [
+        (
+            int((frame_idx - t) * (-1 if track_in_reverse else 1)),
+            int(t),
+            out["obj_ptr"],
+            True,
+        )
+        for t, out in ptr_cond_outputs.items()
+    ]
+    max_obj_ptrs_in_encoder = min(num_frames, tracker.max_obj_ptrs_in_encoder)
+    for t_diff in range(1, max_obj_ptrs_in_encoder):
+        if not tracker.use_memory_selection:
+            frame_t = frame_idx + t_diff if track_in_reverse else frame_idx - t_diff
+            if frame_t < 0 or (num_frames is not None and frame_t >= num_frames):
+                break
+        else:
+            if -t_diff <= -len(valid_indices):
+                break
+            frame_t = int(valid_indices[-t_diff])
+        out = output_dict["non_cond_frame_outputs"].get(frame_t, unselected_cond_outputs.get(frame_t))
+        if out is not None:
+            pos_and_ptrs.append((int(t_diff), int(frame_t), out["obj_ptr"], False))
+
+    if pos_and_ptrs:
+        pos_list = [item[0] for item in pos_and_ptrs]
+        metadata["selected_object_pointer_frame_indices"] = [item[1] for item in pos_and_ptrs]
+        metadata["selected_object_pointer_is_conditioning"] = [bool(item[3]) for item in pos_and_ptrs]
+        metadata["selected_object_pointer_temporal_offsets"] = list(pos_list)
+        tensor_map["object_pointer_temporal_pos_enc"] = tracker._get_tpos_enc(
+            pos_list,
+            max_abs_pos=max_obj_ptrs_in_encoder,
+            device=pos_and_ptrs[0][2].device,
+        )
+        for _, ptr_frame_idx, obj_ptr, _ in pos_and_ptrs:
+            tensor_map[f"selected_object_pointer_frames.{ptr_frame_idx}.obj_ptr"] = obj_ptr
+
+    for cond_frame_idx, cond_output in selected_cond_outputs.items():
+        add_tracker_output_tensors(
+            tensor_map,
+            f"selected_conditioning_frames.{int(cond_frame_idx)}",
+            cond_output,
+        )
+
+    return metadata, tensor_map
+
+
+def install_video_internal_fixture_recorder(predictor, debug_dir: Path, capture_frame_indices):
+    recorder = VideoInternalFixtureRecorder(debug_dir, capture_frame_indices)
+    model = predictor.model
+    tracker = model.tracker
+    recorder.set_tracker_config(tracker)
+
+    original_tracker_add_new_objects = model._tracker_add_new_objects
+    original_run_memory_encoder = tracker._run_memory_encoder
+    original_prepare_memory_conditioned_features = tracker._prepare_memory_conditioned_features
+    original_track_step = tracker.track_step
+    original_encode_new_memory = tracker._encode_new_memory
+
+    def wrapped_tracker_add_new_objects(self, *args, **kwargs):
+        frame_idx = kwargs["frame_idx"]
+        if recorder.should_capture(frame_idx):
+            recorder.add_record(
+                stage="tracker_add_new_objects_input",
+                frame_idx=frame_idx,
+                metadata={
+                    "num_frames": int(kwargs["num_frames"]),
+                    "new_obj_ids": [int(obj_id) for obj_id in kwargs["new_obj_ids"]],
+                    "orig_video_height": int(kwargs["orig_vid_height"]),
+                    "orig_video_width": int(kwargs["orig_vid_width"]),
+                    "input_mask_size": int(self.tracker.input_mask_size),
+                    "input_mask_binarize_threshold": 0.0,
+                },
+                tensors={"new_object_masks_before_resize": kwargs["new_obj_masks"]},
+            )
+        result = original_tracker_add_new_objects(*args, **kwargs)
+        if recorder.should_capture(frame_idx) and result:
+            tracker_state = result[-1]
+            cond_output = tracker_state["output_dict"]["cond_frame_outputs"].get(frame_idx)
+            tensor_map = {}
+            add_tracker_output_tensors(tensor_map, "post_preflight_cond_output", cond_output)
+            recorder.add_record(
+                stage="tracker_add_new_objects_post_preflight",
+                frame_idx=frame_idx,
+                metadata={
+                    "num_tracker_states_local": len(result),
+                    "tracked_obj_ids": [int(obj_id) for obj_id in tracker_state.get("obj_ids", [])],
+                    "frames_already_tracked": sorted(int(idx) for idx in tracker_state.get("frames_already_tracked", {}).keys()),
+                },
+                tensors=tensor_map,
+            )
+        return result
+
+    def wrapped_run_memory_encoder(self, *args, **kwargs):
+        frame_idx = kwargs["frame_idx"]
+        recorder.push_context(stage="run_memory_encoder", frame_idx=int(frame_idx))
+        try:
+            result = original_run_memory_encoder(*args, **kwargs)
+        finally:
+            recorder.pop_context()
+        if recorder.should_capture(frame_idx):
+            maskmem_features, maskmem_pos_enc = result
+            tensor_map = {
+                "high_res_masks": kwargs["high_res_masks"],
+                "object_score_logits": kwargs["object_score_logits"],
+                "maskmem_features": maskmem_features,
+            }
+            for idx, pos_enc in enumerate(maskmem_pos_enc):
+                tensor_map[f"maskmem_pos_enc.{idx}"] = pos_enc
+            recorder.add_record(
+                stage="run_memory_encoder",
+                frame_idx=frame_idx,
+                metadata={
+                    "batch_size": int(kwargs["batch_size"]),
+                    "is_mask_from_pts": bool(kwargs["is_mask_from_pts"]),
+                    "sigmoid_scale_for_mem_enc": float(self.sigmoid_scale_for_mem_enc),
+                    "sigmoid_bias_for_mem_enc": float(self.sigmoid_bias_for_mem_enc),
+                    "mask_for_mem_threshold": 0.0 if kwargs["is_mask_from_pts"] and not self.training else None,
+                    "mask_for_mem_mode": "binary_gt_0" if kwargs["is_mask_from_pts"] and not self.training else "sigmoid_logits",
+                },
+                tensors=tensor_map,
+            )
+        return result
+
+    def wrapped_prepare_memory_conditioned_features(self, *args, **kwargs):
+        frame_idx = kwargs["frame_idx"]
+        metadata = None
+        tensor_map = None
+        if recorder.should_capture(frame_idx):
+            metadata, tensor_map = compute_memory_selection_debug(
+                tracker=self,
+                frame_idx=frame_idx,
+                output_dict=kwargs["output_dict"],
+                num_frames=kwargs["num_frames"],
+                track_in_reverse=kwargs.get("track_in_reverse", False),
+                use_prev_mem_frame=kwargs.get("use_prev_mem_frame", True),
+            )
+        result = original_prepare_memory_conditioned_features(*args, **kwargs)
+        if recorder.should_capture(frame_idx):
+            capture_tensors = dict(tensor_map or {})
+            capture_tensors["pix_feat_with_mem"] = result
+            recorder.add_record(
+                stage="prepare_memory_conditioned_features",
+                frame_idx=frame_idx,
+                metadata=metadata,
+                tensors=capture_tensors,
+            )
+        return result
+
+    def wrapped_track_step(self, *args, **kwargs):
+        frame_idx = kwargs["frame_idx"]
+        recorder.push_context(
+            stage="track_step",
+            frame_idx=int(frame_idx),
+            is_init_cond_frame=bool(kwargs["is_init_cond_frame"]),
+            run_mem_encoder=bool(kwargs.get("run_mem_encoder", True)),
+        )
+        try:
+            result = original_track_step(*args, **kwargs)
+        finally:
+            recorder.pop_context()
+        if recorder.should_capture(frame_idx):
+            point_inputs = kwargs.get("point_inputs")
+            mask_inputs = kwargs.get("mask_inputs")
+            tensor_map = {
+                "current_vision_feats": kwargs["current_vision_feats"][-1],
+                "current_vision_pos_embeds": kwargs["current_vision_pos_embeds"][-1],
+            }
+            if mask_inputs is not None:
+                tensor_map["mask_inputs"] = mask_inputs
+            if point_inputs is not None:
+                tensor_map["point_coords"] = point_inputs["point_coords"]
+                tensor_map["point_labels"] = point_inputs["point_labels"]
+            add_tracker_output_tensors(tensor_map, "track_step_output", result)
+            recorder.add_record(
+                stage="track_step",
+                frame_idx=frame_idx,
+                metadata={
+                    "is_init_cond_frame": bool(kwargs["is_init_cond_frame"]),
+                    "track_in_reverse": bool(kwargs.get("track_in_reverse", False)),
+                    "run_mem_encoder": bool(kwargs.get("run_mem_encoder", True)),
+                    "use_prev_mem_frame": bool(kwargs.get("use_prev_mem_frame", True)),
+                    "num_frames": int(kwargs["num_frames"]),
+                    "point_input_count": int(point_inputs["point_labels"].numel()) if point_inputs is not None else 0,
+                    "has_mask_inputs": mask_inputs is not None,
+                },
+                tensors=tensor_map,
+            )
+        return result
+
+    def wrapped_encode_new_memory(self, *args, **kwargs):
+        context = recorder.current_context()
+        result = original_encode_new_memory(*args, **kwargs)
+        frame_idx = context.get("frame_idx")
+        if frame_idx is not None and recorder.should_capture(frame_idx):
+            maskmem_features, maskmem_pos_enc = result
+            tensor_map = {
+                "pred_masks_high_res": kwargs["pred_masks_high_res"],
+                "object_score_logits": kwargs["object_score_logits"],
+                "maskmem_features": maskmem_features,
+            }
+            for idx, pos_enc in enumerate(maskmem_pos_enc):
+                tensor_map[f"maskmem_pos_enc.{idx}"] = pos_enc
+            recorder.add_record(
+                stage="encode_new_memory",
+                frame_idx=frame_idx,
+                metadata={
+                    "context_stage": context.get("stage"),
+                    "is_mask_from_pts": bool(kwargs["is_mask_from_pts"]),
+                    "is_init_cond_frame": bool(kwargs.get("is_init_cond_frame", False)),
+                    "sigmoid_scale_for_mem_enc": float(self.sigmoid_scale_for_mem_enc),
+                    "sigmoid_bias_for_mem_enc": float(self.sigmoid_bias_for_mem_enc),
+                    "mask_for_mem_threshold": 0.0 if kwargs["is_mask_from_pts"] and not self.training else None,
+                    "mask_for_mem_mode": "binary_gt_0" if kwargs["is_mask_from_pts"] and not self.training else "sigmoid_logits",
+                },
+                tensors=tensor_map,
+            )
+        return result
+
+    model._tracker_add_new_objects = types.MethodType(wrapped_tracker_add_new_objects, model)
+    tracker._run_memory_encoder = types.MethodType(wrapped_run_memory_encoder, tracker)
+    tracker._prepare_memory_conditioned_features = types.MethodType(
+        wrapped_prepare_memory_conditioned_features, tracker
+    )
+    tracker.track_step = types.MethodType(wrapped_track_step, tracker)
+    tracker._encode_new_memory = types.MethodType(wrapped_encode_new_memory, tracker)
+    return recorder
+
+
 def main():
     args = parse_args()
     if (args.image is None) == (args.video is None):
@@ -872,10 +1321,27 @@ def main():
             async_loading_frames=False,
             apply_temporal_disambiguation=args.video_apply_temporal_disambiguation,
         )
+        internal_recorder = None
+        if args.video_debug_bundle:
+            internal_capture_frame_indices = sorted(
+                {
+                    frame_idx
+                    for frame_idx in (
+                        list(range(min(4, len(frame_paths))))
+                        + [int(frame_idx) for frame_idx in args.video_debug_frame]
+                    )
+                    if 0 <= frame_idx < len(frame_paths)
+                }
+            )
+            internal_recorder = install_video_internal_fixture_recorder(
+                predictor, debug_dir, internal_capture_frame_indices
+            )
         response = predictor.handle_request(
             {"type": "start_session", "resource_path": str(frames_dir)}
         )
         session_id = response["session_id"]
+        if internal_recorder is not None:
+            internal_recorder.set_session_id(session_id)
         frame_outputs = {}
         debug_records = []
 
@@ -1043,15 +1509,23 @@ def main():
         with open(output_dir / "reference.json", "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)
         if args.video_debug_bundle:
+            internal_manifest_path, internal_tensors_path = internal_recorder.finalize()
             debug_manifest = {
                 "bundle_version": 1,
                 "mode": "video_debug_bundle",
                 "source": "upstream",
                 "session_id": session_id,
-                "internal_tracker_state_available": False,
+                "internal_tracker_state_available": True,
                 "capture_obj_ids": [int(obj_id) for obj_id in args.video_debug_obj_id],
                 "capture_frame_indices": [int(frame_idx) for frame_idx in args.video_debug_frame],
+                "internal_capture_frame_indices": list(internal_recorder.capture_frame_indices),
                 "capture_first_propagated_only": True,
+                "internal_manifest_path": str(internal_manifest_path.relative_to(debug_dir)),
+                "internal_tensor_file": (
+                    str(internal_tensors_path.relative_to(debug_dir))
+                    if internal_tensors_path is not None
+                    else None
+                ),
                 "records": debug_records,
             }
             with open(debug_dir / "debug_manifest.json", "w", encoding="utf-8") as f:
