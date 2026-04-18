@@ -252,6 +252,7 @@ def apply_attr_overrides(target, overrides, label):
 
 def capture_tracker_runtime_config(tracker):
     config = {
+        "with_backbone": getattr(tracker, "backbone", None) is not None,
         "image_size": int(tracker.image_size),
         "backbone_stride": int(tracker.backbone_stride),
         "low_res_mask_size": int(tracker.low_res_mask_size),
@@ -305,6 +306,7 @@ def capture_tracker_runtime_config(tracker):
 
 def capture_predictor_runtime_config(model, tracker):
     return {
+        "compile_model": bool(getattr(model, "compile_model", False)),
         "fill_hole_area": int(getattr(model, "fill_hole_area", 0)),
         "hotstart_delay": int(getattr(model, "hotstart_delay", 0)),
         "hotstart_unmatch_thresh": int(getattr(model, "hotstart_unmatch_thresh", 0)),
@@ -2219,24 +2221,25 @@ def execute_video_scenario_action_tracker(
     frame_idx = int(action.get("frame_idx", 0))
     if action_type == "add_prompt":
         obj_id = int(action["obj_id"])
-        ensure_tracker_frame_features(tracker, inference_state, frame_idx)
-        points = action.get("points_xy_normalized")
-        point_labels = action.get(
-            "point_labels",
-            [default_positive_label() for _ in points] if points is not None else None,
-        )
-        box = action.get("box_xyxy")
-        frame_idx_out, obj_ids, _, video_res_masks = tracker.add_new_points_or_box(
-            inference_state,
-            frame_idx=frame_idx,
-            obj_id=obj_id,
-            points=(torch.tensor(points, dtype=torch.float32) if points is not None else None),
-            labels=(torch.tensor(point_labels, dtype=torch.int32) if point_labels is not None else None),
-            clear_old_points=bool(action.get("clear_old_points", True)),
-            rel_coordinates=bool(action.get("rel_coordinates", True)),
-            use_prev_mem_frame=bool(action.get("use_prev_mem_frame", False)),
-            box=(torch.tensor(box, dtype=torch.float32) if box is not None else None),
-        )
+        with torch.inference_mode():
+            ensure_tracker_frame_features(tracker, inference_state, frame_idx)
+            points = action.get("points_xy_normalized")
+            point_labels = action.get(
+                "point_labels",
+                [default_positive_label() for _ in points] if points is not None else None,
+            )
+            box = action.get("box_xyxy")
+            frame_idx_out, obj_ids, _, video_res_masks = tracker.add_new_points_or_box(
+                inference_state,
+                frame_idx=frame_idx,
+                obj_id=obj_id,
+                points=(torch.tensor(points, dtype=torch.float32) if points is not None else None),
+                labels=(torch.tensor(point_labels, dtype=torch.int32) if point_labels is not None else None),
+                clear_old_points=bool(action.get("clear_old_points", True)),
+                rel_coordinates=bool(action.get("rel_coordinates", True)),
+                use_prev_mem_frame=bool(action.get("use_prev_mem_frame", False)),
+                box=(torch.tensor(box, dtype=torch.float32) if box is not None else None),
+            )
         outputs = normalize_tracker_outputs(
             inference_state, int(frame_idx_out), obj_ids, video_res_masks
         )
@@ -2274,15 +2277,16 @@ def execute_video_scenario_action_tracker(
 
     if action_type == "add_mask":
         obj_id = int(action["obj_id"])
-        ensure_tracker_frame_features(tracker, inference_state, frame_idx)
-        mask = mask_spec_to_tensor(action["mask"], frame_paths[frame_idx])
-        frame_idx_out, obj_ids, _, video_res_masks = tracker.add_new_mask(
-            inference_state,
-            frame_idx=frame_idx,
-            obj_id=obj_id,
-            mask=mask,
-            add_mask_to_memory=bool(action.get("add_mask_to_memory", False)),
-        )
+        with torch.inference_mode():
+            ensure_tracker_frame_features(tracker, inference_state, frame_idx)
+            mask = mask_spec_to_tensor(action["mask"], frame_paths[frame_idx])
+            frame_idx_out, obj_ids, _, video_res_masks = tracker.add_new_mask(
+                inference_state,
+                frame_idx=frame_idx,
+                obj_id=obj_id,
+                mask=mask,
+                add_mask_to_memory=bool(action.get("add_mask_to_memory", False)),
+            )
         outputs = normalize_tracker_outputs(
             inference_state, int(frame_idx_out), obj_ids, video_res_masks
         )
@@ -2322,15 +2326,18 @@ def execute_video_scenario_action_tracker(
         direction = action.get("direction", "forward")
         reverse_values = [False, True] if direction == "both" else [direction == "backward"]
         for reverse in reverse_values:
-            for frame_idx_out, obj_ids, _, video_res_masks in tracker.propagate_in_video(
-                inference_state,
-                start_frame_idx=action.get("start_frame_idx", None),
-                max_frame_num_to_track=action.get("max_frame_num_to_track", None),
-                reverse=reverse,
-            ):
-                outputs = normalize_tracker_outputs(
-                    inference_state, int(frame_idx_out), obj_ids, video_res_masks
+            with torch.inference_mode():
+                propagation = tracker.propagate_in_video(
+                    inference_state,
+                    start_frame_idx=action.get("start_frame_idx", None),
+                    max_frame_num_to_track=action.get("max_frame_num_to_track", None),
+                    reverse=reverse,
+                    propagate_preflight=True,
                 )
+                for frame_idx_out, obj_ids, _, video_res_masks, *_ in propagation:
+                    outputs = normalize_tracker_outputs(
+                        inference_state, int(frame_idx_out), obj_ids, video_res_masks
+                    )
                 merge_frame_outputs(frame_outputs, int(frame_idx_out), outputs)
                 if not args.video_debug_bundle or not should_capture_video_debug(
                     args, int(frame_idx_out), action.get("start_frame_idx", None)
@@ -2519,7 +2526,7 @@ def main():
 
         from PIL import Image
 
-        from sam3.model_builder import build_sam3_predictor, build_tracker
+        from sam3.model_builder import build_sam3_predictor
 
         source_video_path = Path(args.video).expanduser().resolve()
         frames_dir = output_dir / "frames"
@@ -2605,17 +2612,20 @@ def main():
             active_tracker = predictor.model.tracker
             engine_metadata = {"engine": "video_inference", "session_id": session_id}
         elif scenario["engine"] == "tracker":
-            tracker = build_tracker(
+            predictor = build_upstream_video_predictor_for_export(
+                build_sam3_predictor=build_sam3_predictor,
+                checkpoint_path=checkpoint_path,
+                bpe_path=bpe_path,
                 apply_temporal_disambiguation=scenario["apply_temporal_disambiguation"],
-                with_backbone=True,
+                tracker_overrides=scenario["tracker_overrides"],
+                predictor_overrides=scenario["predictor_overrides"],
             )
-            apply_attr_overrides(tracker, scenario["tracker_overrides"], "tracker_overrides")
-            apply_attr_overrides(
-                tracker, scenario["predictor_overrides"], "predictor_overrides"
-            )
+            tracker = predictor.model.tracker
+            if getattr(tracker, "backbone", None) is None:
+                tracker.backbone = predictor.model.detector.backbone
             if args.video_debug_bundle:
                 internal_recorder = install_video_internal_fixture_recorder(
-                    tracker,
+                    predictor,
                     debug_dir,
                     internal_capture_frame_indices,
                     scenario=scenario["raw"] or scenario,
@@ -2641,7 +2651,7 @@ def main():
                     debug_dir,
                     args,
                 )
-            active_model = None
+            active_model = predictor.model
             active_tracker = tracker
             engine_metadata = {"engine": "tracker", "session_id": session_id}
         else:

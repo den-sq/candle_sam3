@@ -2781,11 +2781,7 @@ mod tests {
 
     fn tiny_tracker(device: &Device) -> Result<Sam3TrackerModel> {
         let config = tiny_segmentation_config();
-        let mut tracker_config = Sam3TrackerConfig::from_sam3_config(&config);
-        tracker_config.memory_dim = tracker_config.hidden_dim;
-        tracker_config.tracker_feedforward_dim = tracker_config.hidden_dim * 2;
-        tracker_config.maskmem_interpol_size =
-            (tracker_config.image_size / tracker_config.backbone_stride) * 16;
+        let tracker_config = Sam3TrackerConfig::from_sam3_config(&config);
         Sam3TrackerModel::new(&tracker_config, VarBuilder::zeros(DType::F32, device))
     }
 
