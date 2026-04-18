@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import inspect
 import json
 import shutil
 import subprocess
@@ -48,6 +49,11 @@ def parse_args():
         "--video",
         default=None,
         help="Optional input video path or extracted-frame directory for video reference export.",
+    )
+    parser.add_argument(
+        "--video-scenario",
+        default=None,
+        help="Optional JSON scenario manifest describing the upstream video export engine, runtime overrides, and action sequence. When provided, it drives video export instead of the legacy one-prompt default flow.",
     )
     parser.add_argument("--prompt", default=None, help="Optional text prompt to encode.")
     parser.add_argument(
@@ -149,6 +155,228 @@ def resolve_sam3_package_dir(path: Path) -> Path:
     raise FileNotFoundError(
         f"could not find sam3/model_builder.py under {path}; pass either the repo root or the inner sam3 package directory"
     )
+
+
+def load_video_scenario(path: Path):
+    scenario = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(scenario, dict):
+        raise ValueError(f"video scenario {path} must be a JSON object")
+    actions = scenario.get("actions")
+    if not isinstance(actions, list) or not actions:
+        raise ValueError(f"video scenario {path} must contain a non-empty `actions` list")
+    engine = scenario.get("engine", "video_inference")
+    if engine not in {"video_inference", "tracker"}:
+        raise ValueError(
+            f"video scenario {path} has unsupported engine {engine!r}; expected `video_inference` or `tracker`"
+        )
+    return {
+        "engine": engine,
+        "apply_temporal_disambiguation": bool(
+            scenario.get("apply_temporal_disambiguation", False)
+        ),
+        "tracker_overrides": dict(scenario.get("tracker_overrides", {})),
+        "predictor_overrides": dict(scenario.get("predictor_overrides", {})),
+        "session_overrides": dict(scenario.get("session_overrides", {})),
+        "debug_capture_frame_indices": [
+            int(frame_idx)
+            for frame_idx in scenario.get("debug_capture_frame_indices", [])
+        ],
+        "debug_capture_obj_ids": [
+            int(obj_id) for obj_id in scenario.get("debug_capture_obj_ids", [])
+        ],
+        "actions": actions,
+        "raw": scenario,
+    }
+
+
+def build_default_video_scenario(args, resolved_box_labels):
+    action = {
+        "type": "add_prompt",
+        "frame_idx": 0,
+        "text": args.prompt,
+    }
+    if args.box:
+        action["boxes_xywh"] = [box_cxcywh_to_xywh(box) for box in args.box]
+        action["box_labels"] = [int(label) for label in resolved_box_labels]
+    return {
+        "engine": "video_inference",
+        "apply_temporal_disambiguation": bool(args.video_apply_temporal_disambiguation),
+        "tracker_overrides": {},
+        "predictor_overrides": {},
+        "session_overrides": {},
+        "debug_capture_frame_indices": [],
+        "debug_capture_obj_ids": [],
+        "actions": [
+            action,
+            {
+                "type": "propagate",
+                "direction": "forward",
+                "start_frame_idx": 0,
+                "max_frame_num_to_track": int(args.video_frame_count),
+            },
+        ],
+        "raw": None,
+    }
+
+
+def ensure_mapping(value, label):
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return dict(value)
+
+
+def apply_attr_overrides(target, overrides, label):
+    for key, value in ensure_mapping(overrides, label).items():
+        if "." in key:
+            current = target
+            segments = key.split(".")
+            for segment in segments[:-1]:
+                if not hasattr(current, segment):
+                    raise ValueError(
+                        f"{label} override {key!r} refers to missing attribute {segment!r}"
+                    )
+                current = getattr(current, segment)
+            leaf = segments[-1]
+            if not hasattr(current, leaf):
+                raise ValueError(
+                    f"{label} override {key!r} refers to missing attribute {leaf!r}"
+                )
+            setattr(current, leaf, value)
+        else:
+            if not hasattr(target, key):
+                raise ValueError(f"{label} override {key!r} refers to a missing attribute")
+            setattr(target, key, value)
+
+
+def capture_tracker_runtime_config(tracker):
+    config = {
+        "image_size": int(tracker.image_size),
+        "backbone_stride": int(tracker.backbone_stride),
+        "low_res_mask_size": int(tracker.low_res_mask_size),
+        "input_mask_size": int(tracker.input_mask_size),
+        "num_maskmem": int(tracker.num_maskmem),
+        "max_cond_frames_in_attn": int(tracker.max_cond_frames_in_attn),
+        "keep_first_cond_frame": bool(getattr(tracker, "keep_first_cond_frame", False)),
+        "memory_temporal_stride_for_eval": int(
+            getattr(tracker, "memory_temporal_stride_for_eval", 1)
+        ),
+        "max_obj_ptrs_in_encoder": int(tracker.max_obj_ptrs_in_encoder),
+        "sigmoid_scale_for_mem_enc": float(tracker.sigmoid_scale_for_mem_enc),
+        "sigmoid_bias_for_mem_enc": float(tracker.sigmoid_bias_for_mem_enc),
+        "multimask_output_in_sam": bool(tracker.multimask_output_in_sam),
+        "multimask_output_for_tracking": bool(tracker.multimask_output_for_tracking),
+        "multimask_min_pt_num": int(tracker.multimask_min_pt_num),
+        "multimask_max_pt_num": int(tracker.multimask_max_pt_num),
+        "use_memory_selection": bool(tracker.use_memory_selection),
+        "mf_threshold": float(tracker.mf_threshold),
+        "forward_backbone_per_frame_for_eval": bool(
+            getattr(tracker, "forward_backbone_per_frame_for_eval", False)
+        ),
+        "offload_output_to_cpu_for_eval": bool(
+            getattr(tracker, "offload_output_to_cpu_for_eval", False)
+        ),
+        "trim_past_non_cond_mem_for_eval": bool(
+            getattr(tracker, "trim_past_non_cond_mem_for_eval", False)
+        ),
+        "non_overlap_masks_for_mem_enc": bool(
+            getattr(tracker, "non_overlap_masks_for_mem_enc", False)
+        ),
+        "sam_mask_decoder_extra_args": {
+            "dynamic_multimask_via_stability": bool(
+                getattr(tracker.sam_mask_decoder, "dynamic_multimask_via_stability", False)
+            ),
+            "dynamic_multimask_stability_delta": float(
+                getattr(tracker.sam_mask_decoder, "dynamic_multimask_stability_delta", 0.0)
+            ),
+            "dynamic_multimask_stability_thresh": float(
+                getattr(tracker.sam_mask_decoder, "dynamic_multimask_stability_thresh", 0.0)
+            ),
+        },
+        "input_mask_binarize_threshold": 0.0,
+        "video_mask_binarize_threshold": 0.5,
+        "mask_as_output_out_scale": 20.0,
+        "mask_as_output_out_bias": -10.0,
+        "memory_prompt_mask_threshold": 0.0,
+    }
+    return config
+
+
+def capture_predictor_runtime_config(model, tracker):
+    return {
+        "fill_hole_area": int(getattr(model, "fill_hole_area", 0)),
+        "hotstart_delay": int(getattr(model, "hotstart_delay", 0)),
+        "hotstart_unmatch_thresh": int(getattr(model, "hotstart_unmatch_thresh", 0)),
+        "hotstart_dup_thresh": int(getattr(model, "hotstart_dup_thresh", 0)),
+        "masklet_confirmation_enable": bool(
+            getattr(model, "masklet_confirmation_enable", False)
+        ),
+        "masklet_confirmation_consecutive_det_thresh": int(
+            getattr(model, "masklet_confirmation_consecutive_det_thresh", 0)
+        ),
+        "use_prev_mem_frame": bool(getattr(model, "use_prev_mem_frame", False)),
+        "use_stateless_refinement": bool(
+            getattr(model, "use_stateless_refinement", False)
+        ),
+        "refinement_detector_cond_frame_removal_window": int(
+            getattr(model, "refinement_detector_cond_frame_removal_window", 0)
+        ),
+        "clear_non_cond_mem_around_input": bool(
+            getattr(tracker, "clear_non_cond_mem_around_input", False)
+        ),
+        "clear_non_cond_mem_for_multi_obj": bool(
+            getattr(tracker, "clear_non_cond_mem_for_multi_obj", False)
+        ),
+        "always_start_from_first_ann_frame": bool(
+            getattr(tracker, "always_start_from_first_ann_frame", False)
+        ),
+        "max_point_num_in_prompt_enc": int(
+            getattr(tracker, "max_point_num_in_prompt_enc", 0)
+        ),
+        "non_overlap_masks_for_output": bool(
+            getattr(tracker, "non_overlap_masks_for_output", False)
+        ),
+        "iter_use_prev_mask_pred": bool(
+            getattr(tracker, "iter_use_prev_mask_pred", False)
+        ),
+        "add_all_frames_to_correct_as_cond": bool(
+            getattr(tracker, "add_all_frames_to_correct_as_cond", False)
+        ),
+    }
+
+
+def build_upstream_video_predictor_for_export(
+    build_sam3_predictor,
+    checkpoint_path,
+    bpe_path,
+    apply_temporal_disambiguation,
+    tracker_overrides,
+    predictor_overrides,
+):
+    predictor = build_sam3_predictor(
+        version="sam3",
+        checkpoint_path=str(checkpoint_path),
+        bpe_path=str(bpe_path),
+        compile=False,
+        async_loading_frames=False,
+        apply_temporal_disambiguation=apply_temporal_disambiguation,
+    )
+    model = predictor.model
+    tracker = model.tracker
+    apply_attr_overrides(tracker, tracker_overrides, "tracker_overrides")
+    apply_attr_overrides(model, predictor_overrides, "predictor_overrides")
+    return predictor
+
+
+def scenario_uses_explicit_geometry(scenario):
+    for action in scenario.get("actions", []):
+        if any(
+            action.get(key) is not None
+            for key in ("boxes_xywh", "box_xyxy", "points_xy_normalized", "mask")
+        ):
+            return True
+    return False
 
 
 def to_cpu_contiguous(tensor):
@@ -519,6 +747,27 @@ def prepare_video_frames(video_path: Path, frames_dir: Path, max_frames: int):
     return frame_paths
 
 
+def prepare_tracker_input_frames(frame_paths, tracker_frames_dir: Path):
+    from PIL import Image
+
+    if tracker_frames_dir.exists():
+        shutil.rmtree(tracker_frames_dir)
+    tracker_frames_dir.mkdir(parents=True, exist_ok=True)
+    for frame_idx, source_path in enumerate(frame_paths):
+        frame = Image.open(source_path).convert("RGB")
+        frame.save(
+            tracker_frames_dir / f"{frame_idx:06d}.jpg",
+            format="JPEG",
+            quality=95,
+        )
+    tracker_frame_paths = sorted_frame_paths(tracker_frames_dir)
+    if not tracker_frame_paths:
+        raise RuntimeError(
+            f"failed to prepare tracker input frames in {tracker_frames_dir}"
+        )
+    return tracker_frame_paths
+
+
 def box_cxcywh_to_xyxy(box):
     cx, cy, w, h = box
     return [cx - w * 0.5, cy - h * 0.5, cx + w * 0.5, cy + h * 0.5]
@@ -527,6 +776,36 @@ def box_cxcywh_to_xyxy(box):
 def box_cxcywh_to_xywh(box):
     x0, y0, x1, y1 = box_cxcywh_to_xyxy(box)
     return [x0, y0, x1 - x0, y1 - y0]
+
+
+def binary_mask_to_box_xywh(mask):
+    import numpy as np
+
+    mask = np.asarray(mask).astype(bool)
+    if mask.ndim == 3:
+        mask = mask[0]
+    ys, xs = np.nonzero(mask)
+    if xs.size == 0 or ys.size == 0:
+        return [0.0, 0.0, 0.0, 0.0]
+    height, width = mask.shape
+    denom_x = max(width - 1, 1)
+    denom_y = max(height - 1, 1)
+    x0 = float(xs.min() / denom_x)
+    y0 = float(ys.min() / denom_y)
+    x1 = float(xs.max() / denom_x)
+    y1 = float(ys.max() / denom_y)
+    return [x0, y0, max(0.0, x1 - x0), max(0.0, y1 - y0)]
+
+
+def normalized_box_xyxy_to_mask(box_xyxy, width, height):
+    import numpy as np
+
+    x0, y0, x1, y1 = normalized_box_to_pixels(box_xyxy, width, height)
+    mask = np.zeros((height, width), dtype="uint8")
+    x0, x1 = sorted((x0, x1))
+    y0, y1 = sorted((y0, y1))
+    mask[y0 : y1 + 1, x0 : x1 + 1] = 1
+    return mask
 
 
 def write_binary_mask(mask, path):
@@ -578,7 +857,7 @@ def render_video_reference_frame(
         if not mask_array.any():
             continue
         obj_id = int(obj_id)
-        score = float(score)
+        score = None if score is None else float(score)
         box_xywh = [float(value) for value in box_xywh]
         box_xyxy = [
             box_xywh[0],
@@ -597,7 +876,7 @@ def render_video_reference_frame(
         objects.append(
             {
                 "obj_id": obj_id,
-                "scores": [score],
+                "scores": ([] if score is None else [score]),
                 "presence_scores": None,
                 "boxes_xyxy": [box_xyxy],
                 "mask_path": str(mask_path.relative_to(bundle_root)),
@@ -631,19 +910,25 @@ def should_capture_video_debug_obj(args, obj_id):
     return not args.video_debug_obj_id or int(obj_id) in args.video_debug_obj_id
 
 
-def build_video_debug_prompt_metadata(args):
+def build_video_debug_prompt_metadata_from_action(action, default_text_prompt=None):
+    boxes_xywh = action.get("boxes_xywh", [])
+    box_labels = action.get("box_labels", [1 for _ in boxes_xywh])
+    points = action.get("points_xy_normalized", [])
+    point_labels = action.get("point_labels", [])
     return {
-        "text_prompt": args.prompt,
-        "used_visual_text_prompt": args.prompt is None and len(args.box) == 1,
-        "normalized_points_xy": [],
-        "point_labels": [],
-        "normalized_boxes_cxcywh": [list(box) for box in args.box],
-        "box_labels": [
-            int(label)
-            for label in (
-                args.box_label if args.box_label else [True for _ in args.box]
-            )
-        ],
+        "text_prompt": action.get("text", default_text_prompt),
+        "used_visual_text_prompt": action.get("text", default_text_prompt) is None
+        and len(boxes_xywh) == 1,
+        "normalized_points_xy": [list(point) for point in points],
+        "point_labels": [int(label) for label in point_labels],
+        "normalized_boxes_xywh": [list(box) for box in boxes_xywh],
+        "normalized_box_xyxy": (
+            [list(action["box_xyxy"])]
+            if action.get("box_xyxy") is not None
+            else []
+        ),
+        "box_labels": [int(label) for label in box_labels],
+        "mask_prompt": action.get("mask"),
     }
 
 
@@ -681,7 +966,7 @@ def build_video_debug_observable(
             float(box_xywh[0] + box_xywh[2]),
             float(box_xywh[1] + box_xywh[3]),
         ]],
-        "scores": [float(score)],
+        "scores": ([] if score is None else [float(score)]),
         "presence_scores": None,
         "mask_logits_stats": {
             "shape": list(mask_array.shape),
@@ -731,26 +1016,33 @@ def clone_tensor_for_fixture(tensor):
     return tensor.detach().to("cpu").contiguous()
 
 
+def add_tensor_tree(target, prefix, value):
+    import numpy as np
+
+    if value is None:
+        return
+    if torch.is_tensor(value):
+        target[prefix] = value
+        return
+    if isinstance(value, np.ndarray):
+        target[prefix] = torch.from_numpy(np.ascontiguousarray(value))
+        return
+    if hasattr(value, "_asdict"):
+        add_tensor_tree(target, prefix, value._asdict())
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            add_tensor_tree(target, f"{prefix}.{key}", item)
+        return
+    if isinstance(value, (list, tuple)):
+        for idx, item in enumerate(value):
+            add_tensor_tree(target, f"{prefix}.{idx}", item)
+
+
 def add_tracker_output_tensors(target, prefix, frame_output):
     if frame_output is None:
         return
-    for key in [
-        "pred_masks",
-        "pred_masks_high_res",
-        "obj_ptr",
-        "object_score_logits",
-        "maskmem_features",
-        "iou_score",
-        "eff_iou_score",
-    ]:
-        value = frame_output.get(key)
-        if torch.is_tensor(value):
-            target[f"{prefix}.{key}"] = value
-    maskmem_pos_enc = frame_output.get("maskmem_pos_enc")
-    if maskmem_pos_enc is not None:
-        for idx, pos_enc in enumerate(maskmem_pos_enc):
-            if torch.is_tensor(pos_enc):
-                target[f"{prefix}.maskmem_pos_enc.{idx}"] = pos_enc
+    add_tensor_tree(target, prefix, frame_output)
 
 
 class VideoInternalFixtureRecorder:
@@ -761,6 +1053,9 @@ class VideoInternalFixtureRecorder:
         self.records = []
         self.session_id = None
         self.tracker_config = None
+        self.predictor_config = None
+        self.engine = None
+        self.scenario = None
         self._context_stack = []
 
     def should_capture(self, frame_idx):
@@ -770,30 +1065,16 @@ class VideoInternalFixtureRecorder:
         self.session_id = session_id
 
     def set_tracker_config(self, tracker):
-        self.tracker_config = {
-            "image_size": int(tracker.image_size),
-            "backbone_stride": int(tracker.backbone_stride),
-            "low_res_mask_size": int(tracker.low_res_mask_size),
-            "input_mask_size": int(tracker.input_mask_size),
-            "num_maskmem": int(tracker.num_maskmem),
-            "max_cond_frames_in_attn": int(tracker.max_cond_frames_in_attn),
-            "keep_first_cond_frame": bool(tracker.keep_first_cond_frame),
-            "memory_temporal_stride_for_eval": int(tracker.memory_temporal_stride_for_eval),
-            "max_obj_ptrs_in_encoder": int(tracker.max_obj_ptrs_in_encoder),
-            "sigmoid_scale_for_mem_enc": float(tracker.sigmoid_scale_for_mem_enc),
-            "sigmoid_bias_for_mem_enc": float(tracker.sigmoid_bias_for_mem_enc),
-            "multimask_output_in_sam": bool(tracker.multimask_output_in_sam),
-            "multimask_output_for_tracking": bool(tracker.multimask_output_for_tracking),
-            "multimask_min_pt_num": int(tracker.multimask_min_pt_num),
-            "multimask_max_pt_num": int(tracker.multimask_max_pt_num),
-            "use_memory_selection": bool(tracker.use_memory_selection),
-            "mf_threshold": float(tracker.mf_threshold),
-            "input_mask_binarize_threshold": 0.0,
-            "video_mask_binarize_threshold": 0.5,
-            "mask_as_output_out_scale": 20.0,
-            "mask_as_output_out_bias": -10.0,
-            "memory_prompt_mask_threshold": 0.0,
-        }
+        self.tracker_config = capture_tracker_runtime_config(tracker)
+
+    def set_predictor_config(self, model, tracker):
+        self.predictor_config = capture_predictor_runtime_config(model, tracker)
+
+    def set_engine(self, engine):
+        self.engine = engine
+
+    def set_scenario(self, scenario):
+        self.scenario = scenario
 
     def push_context(self, **context):
         self._context_stack.append(context)
@@ -845,10 +1126,13 @@ class VideoInternalFixtureRecorder:
             "bundle_version": 1,
             "mode": "video_internal_fixtures",
             "source": "upstream",
+            "engine": self.engine,
             "session_id": self.session_id,
             "capture_frame_indices": list(self.capture_frame_indices),
             "tensor_file": fixtures_path.name if self.tensor_store else None,
             "tracker_config": self.tracker_config,
+            "predictor_config": self.predictor_config,
+            "scenario": self.scenario,
             "records": self.records,
         }
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -970,33 +1254,357 @@ def compute_memory_selection_debug(tracker, frame_idx, output_dict, num_frames, 
     return metadata, tensor_map
 
 
-def install_video_internal_fixture_recorder(predictor, debug_dir: Path, capture_frame_indices):
+def install_video_internal_fixture_recorder(target, debug_dir: Path, capture_frame_indices, scenario=None):
     recorder = VideoInternalFixtureRecorder(debug_dir, capture_frame_indices)
-    model = predictor.model
-    tracker = model.tracker
+    if hasattr(target, "model") and hasattr(target.model, "tracker"):
+        predictor = target
+        model = target.model
+        predictor_impl = model
+        tracker = model.tracker
+        engine = "video_inference"
+    else:
+        predictor = target
+        model = None
+        predictor_impl = target
+        tracker = target
+        engine = "tracker"
+    recorder.set_engine(engine)
+    if scenario is not None:
+        recorder.set_scenario(scenario)
     recorder.set_tracker_config(tracker)
+    if model is not None:
+        recorder.set_predictor_config(model, tracker)
 
-    original_tracker_add_new_objects = model._tracker_add_new_objects
+    original_get_visual_prompt = getattr(predictor_impl, "_get_visual_prompt", None)
+    original_predictor_run_single_frame_inference = getattr(
+        predictor_impl, "_run_single_frame_inference", None
+    )
+    original_build_tracker_output = getattr(predictor_impl, "_build_tracker_output", None)
+    original_postprocess_output = getattr(predictor_impl, "_postprocess_output", None)
+    original_preflight = getattr(predictor_impl, "propagate_in_video_preflight", None)
+    original_clear_non_cond_mem = getattr(
+        predictor_impl, "_clear_non_cond_mem_around_input", None
+    )
+    original_tracker_add_new_objects = getattr(model, "_tracker_add_new_objects", None)
+    original_det_track_one_frame = getattr(model, "_det_track_one_frame", None)
     original_run_memory_encoder = tracker._run_memory_encoder
     original_prepare_memory_conditioned_features = tracker._prepare_memory_conditioned_features
     original_track_step = tracker.track_step
     original_encode_new_memory = tracker._encode_new_memory
+    original_forward_sam_heads = getattr(tracker, "_forward_sam_heads", None)
+    original_use_mask_as_output = getattr(tracker, "_use_mask_as_output", None)
+    original_add_new_points_or_box = getattr(tracker, "add_new_points_or_box", None)
+    original_add_new_mask = getattr(tracker, "add_new_mask", None)
+    original_prompt_encoder_forward = getattr(
+        getattr(tracker, "sam_prompt_encoder", None), "forward", None
+    )
+    original_mask_decoder_forward = getattr(
+        getattr(tracker, "sam_mask_decoder", None), "forward", None
+    )
+
+    def bind_call_arguments(method, bound_self, args, kwargs):
+        target = method.__func__ if hasattr(method, "__func__") else method
+        signature = inspect.signature(target)
+        return signature.bind_partial(bound_self, *args, **kwargs).arguments
+
+    def sanitize_sequence(values):
+        if values is None:
+            return None
+        return [int(value) for value in values]
+
+    def add_result_tree(tensor_map, prefix, value):
+        add_tensor_tree(tensor_map, prefix, value)
+
+    def output_frame_keys(output_dict):
+        if output_dict is None:
+            return {"cond_frame_outputs": [], "non_cond_frame_outputs": []}
+        return {
+            "cond_frame_outputs": sorted(
+                int(frame_idx) for frame_idx in output_dict.get("cond_frame_outputs", {}).keys()
+            ),
+            "non_cond_frame_outputs": sorted(
+                int(frame_idx) for frame_idx in output_dict.get("non_cond_frame_outputs", {}).keys()
+            ),
+        }
+
+    def object_level_output_frame_keys(output_dict_per_obj):
+        frame_keys = {}
+        if output_dict_per_obj is None:
+            return frame_keys
+        for obj_idx, obj_output_dict in output_dict_per_obj.items():
+            frame_keys[str(int(obj_idx))] = output_frame_keys(obj_output_dict)
+        return frame_keys
+
+    def record_for_context(stage, metadata=None, tensors=None):
+        frame_idx = recorder.current_context().get("frame_idx")
+        if frame_idx is None or not recorder.should_capture(frame_idx):
+            return
+        recorder.add_record(
+            stage=stage,
+            frame_idx=frame_idx,
+            metadata=metadata,
+            tensors=tensors,
+        )
+
+    def wrapped_get_visual_prompt(self, *args, **kwargs):
+        call_args = bind_call_arguments(original_get_visual_prompt, self, args, kwargs)
+        frame_idx = int(call_args["frame_idx"])
+        result = original_get_visual_prompt(*args, **kwargs)
+        if recorder.should_capture(frame_idx):
+            tensor_map = {}
+            tensor_map["boxes_cxcywh_in"] = call_args["boxes_cxcywh"]
+            tensor_map["box_labels_in"] = call_args["box_labels"]
+            add_result_tree(
+                tensor_map,
+                "visual_prompt_result",
+                {
+                    "boxes_cxcywh_out": result[0],
+                    "box_labels_out": result[1],
+                    "new_visual_prompt": result[2],
+                },
+            )
+            recorder.add_record(
+                stage="get_visual_prompt",
+                frame_idx=frame_idx,
+                metadata={
+                    "had_previous_outputs": call_args["inference_state"]["previous_stages_out"][frame_idx]
+                    is not None,
+                    "had_existing_visual_prompt": call_args["inference_state"]["per_frame_visual_prompt"][frame_idx]
+                    is not None,
+                    "input_box_count": int(call_args["boxes_cxcywh"].shape[0]),
+                    "returned_box_count": int(result[0].shape[0]),
+                    "created_visual_prompt": result[2] is not None,
+                },
+                tensors=tensor_map,
+            )
+        return result
+
+    def wrapped_predictor_run_single_frame_inference(self, *args, **kwargs):
+        call_args = bind_call_arguments(
+            original_predictor_run_single_frame_inference, self, args, kwargs
+        )
+        frame_idx = int(call_args["frame_idx"])
+        call_args["inference_state"]["_strict_port_debug_last_frame_idx"] = frame_idx
+        recorder.push_context(stage="run_single_frame_inference", frame_idx=frame_idx)
+        try:
+            result = original_predictor_run_single_frame_inference(*args, **kwargs)
+        finally:
+            recorder.pop_context()
+        if recorder.should_capture(frame_idx):
+            inference_state = call_args["inference_state"]
+            tensor_map = {}
+            add_result_tree(tensor_map, "run_single_frame_inference_output", result)
+            recorder.add_record(
+                stage="run_single_frame_inference",
+                frame_idx=frame_idx,
+                metadata={
+                    "reverse": bool(call_args.get("reverse", False)),
+                    "tracking_has_started": bool(
+                        inference_state.get("tracking_has_started", False)
+                    ),
+                    "first_ann_frame_idx": (
+                        None
+                        if inference_state.get("first_ann_frame_idx") is None
+                        else int(inference_state["first_ann_frame_idx"])
+                    ),
+                    "cached_frame_output_indices": sorted(
+                        int(idx)
+                        for idx in inference_state.get("cached_frame_outputs", {}).keys()
+                    ),
+                },
+                tensors=tensor_map,
+            )
+        return result
+
+    def wrapped_build_tracker_output(self, *args, **kwargs):
+        call_args = bind_call_arguments(original_build_tracker_output, self, args, kwargs)
+        frame_idx = int(call_args["frame_idx"])
+        result = original_build_tracker_output(*args, **kwargs)
+        if recorder.should_capture(frame_idx):
+            tensor_map = {}
+            if call_args.get("refined_obj_id_to_mask") is not None:
+                add_result_tree(
+                    tensor_map,
+                    "refined_obj_id_to_mask",
+                    call_args["refined_obj_id_to_mask"],
+                )
+            add_result_tree(tensor_map, "build_tracker_output", result)
+            recorder.add_record(
+                stage="build_tracker_output",
+                frame_idx=frame_idx,
+                metadata={
+                    "cached_frame_output_indices": sorted(
+                        int(idx)
+                        for idx in call_args["inference_state"].get(
+                            "cached_frame_outputs", {}
+                        ).keys()
+                    ),
+                    "has_refined_masks": call_args.get("refined_obj_id_to_mask") is not None,
+                },
+                tensors=tensor_map,
+            )
+        return result
+
+    def wrapped_postprocess_output(self, *args, **kwargs):
+        call_args = bind_call_arguments(original_postprocess_output, self, args, kwargs)
+        inference_state = call_args["inference_state"]
+        out = call_args["out"]
+        result = original_postprocess_output(*args, **kwargs)
+        frame_stats = out.get("frame_stats", None)
+        frame_idx = None
+        if frame_stats is not None and isinstance(frame_stats, dict):
+            raw_frame_idx = frame_stats.get("frame_idx")
+            if raw_frame_idx is not None:
+                frame_idx = int(raw_frame_idx)
+        if frame_idx is None:
+            frame_idx = inference_state.get("_strict_port_debug_last_frame_idx")
+        if frame_idx is None:
+            frame_idx = recorder.current_context().get("frame_idx")
+        if frame_idx is not None and recorder.should_capture(frame_idx):
+            tensor_map = {}
+            add_result_tree(tensor_map, "postprocess_input", out)
+            add_result_tree(tensor_map, "postprocess_output", result)
+            recorder.add_record(
+                stage="postprocess_output",
+                frame_idx=frame_idx,
+                metadata={
+                    "removed_obj_ids": sanitize_sequence(call_args.get("removed_obj_ids")),
+                    "suppressed_obj_ids": sanitize_sequence(call_args.get("suppressed_obj_ids")),
+                    "unconfirmed_obj_ids": sanitize_sequence(call_args.get("unconfirmed_obj_ids")),
+                    "fill_hole_area": int(getattr(self, "fill_hole_area", 0)),
+                    "non_overlap_masks_for_output": bool(
+                        getattr(self, "non_overlap_masks_for_output", False)
+                    ),
+                    "orig_video_height": int(inference_state["orig_height"]),
+                    "orig_video_width": int(inference_state["orig_width"]),
+                },
+                tensors=tensor_map,
+            )
+        return result
+
+    def wrapped_preflight(self, *args, **kwargs):
+        call_args = bind_call_arguments(original_preflight, self, args, kwargs)
+        inference_state = call_args["inference_state"]
+        before_output_keys = output_frame_keys(inference_state.get("output_dict"))
+        before_per_obj_keys = object_level_output_frame_keys(
+            inference_state.get("output_dict_per_obj")
+        )
+        before_tracking_has_started = bool(inference_state.get("tracking_has_started", False))
+        result = original_preflight(*args, **kwargs)
+        after_output_dict = inference_state.get("output_dict", {})
+        after_output_keys = output_frame_keys(after_output_dict)
+        consolidated = inference_state.get("consolidated_frame_inds", {})
+        for storage_key in ("cond_frame_outputs", "non_cond_frame_outputs"):
+            for frame_idx, frame_output in after_output_dict.get(storage_key, {}).items():
+                if not recorder.should_capture(frame_idx):
+                    continue
+                tensor_map = {}
+                add_tracker_output_tensors(
+                    tensor_map,
+                    f"preflight_output.{storage_key}.{int(frame_idx)}",
+                    frame_output,
+                )
+                recorder.add_record(
+                    stage="propagate_in_video_preflight",
+                    frame_idx=int(frame_idx),
+                    metadata={
+                        "run_mem_encoder": bool(call_args.get("run_mem_encoder", True)),
+                        "before_output_frame_keys": before_output_keys,
+                        "after_output_frame_keys": after_output_keys,
+                        "before_per_obj_output_frame_keys": before_per_obj_keys,
+                        "after_per_obj_output_frame_keys": object_level_output_frame_keys(
+                            inference_state.get("output_dict_per_obj")
+                        ),
+                        "consolidated_cond_frame_indices": sorted(
+                            int(idx)
+                            for idx in consolidated.get("cond_frame_outputs", set())
+                        ),
+                        "consolidated_non_cond_frame_indices": sorted(
+                            int(idx)
+                            for idx in consolidated.get("non_cond_frame_outputs", set())
+                        ),
+                        "tracking_has_started_before": before_tracking_has_started,
+                        "tracking_has_started_after": bool(
+                            inference_state.get("tracking_has_started", False)
+                        ),
+                        "first_ann_frame_idx": (
+                            None
+                            if inference_state.get("first_ann_frame_idx") is None
+                            else int(inference_state["first_ann_frame_idx"])
+                        ),
+                    },
+                    tensors=tensor_map,
+                )
+        return result
+
+    def wrapped_clear_non_cond_mem(self, *args, **kwargs):
+        call_args = bind_call_arguments(original_clear_non_cond_mem, self, args, kwargs)
+        inference_state = call_args["inference_state"]
+        frame_idx = int(call_args["frame_idx"])
+        before_non_cond = object_level_output_frame_keys(
+            inference_state.get("output_dict_per_obj")
+        )
+        result = original_clear_non_cond_mem(*args, **kwargs)
+        if recorder.should_capture(frame_idx):
+            recorder.add_record(
+                stage="clear_non_cond_mem_around_input",
+                frame_idx=frame_idx,
+                metadata={
+                    "memory_temporal_stride_for_eval": int(
+                        getattr(self, "memory_temporal_stride_for_eval", 1)
+                    ),
+                    "num_maskmem": int(getattr(self, "num_maskmem", 0)),
+                    "before_per_obj_output_frame_keys": before_non_cond,
+                    "after_per_obj_output_frame_keys": object_level_output_frame_keys(
+                        inference_state.get("output_dict_per_obj")
+                    ),
+                },
+                tensors={},
+            )
+        return result
+
+    def wrapped_det_track_one_frame(self, *args, **kwargs):
+        call_args = bind_call_arguments(original_det_track_one_frame, self, args, kwargs)
+        frame_idx = int(call_args["frame_idx"])
+        recorder.push_context(stage="det_track_one_frame", frame_idx=frame_idx)
+        try:
+            result = original_det_track_one_frame(*args, **kwargs)
+        finally:
+            recorder.pop_context()
+        if recorder.should_capture(frame_idx):
+            tensor_map = {}
+            add_result_tree(tensor_map, "det_track_one_frame_output", result)
+            recorder.add_record(
+                stage="det_track_one_frame",
+                frame_idx=frame_idx,
+                metadata={
+                    "num_frames": int(call_args["num_frames"]),
+                    "reverse": bool(call_args["reverse"]),
+                    "allow_new_detections": bool(
+                        call_args.get("allow_new_detections", True)
+                    ),
+                    "is_image_only": bool(call_args.get("is_image_only", False)),
+                },
+                tensors=tensor_map,
+            )
+        return result
 
     def wrapped_tracker_add_new_objects(self, *args, **kwargs):
-        frame_idx = kwargs["frame_idx"]
+        call_args = bind_call_arguments(original_tracker_add_new_objects, self, args, kwargs)
+        frame_idx = int(call_args["frame_idx"])
         if recorder.should_capture(frame_idx):
             recorder.add_record(
                 stage="tracker_add_new_objects_input",
                 frame_idx=frame_idx,
                 metadata={
-                    "num_frames": int(kwargs["num_frames"]),
-                    "new_obj_ids": [int(obj_id) for obj_id in kwargs["new_obj_ids"]],
-                    "orig_video_height": int(kwargs["orig_vid_height"]),
-                    "orig_video_width": int(kwargs["orig_vid_width"]),
+                    "num_frames": int(call_args["num_frames"]),
+                    "new_obj_ids": [int(obj_id) for obj_id in call_args["new_obj_ids"]],
+                    "orig_video_height": int(call_args["orig_vid_height"]),
+                    "orig_video_width": int(call_args["orig_vid_width"]),
                     "input_mask_size": int(self.tracker.input_mask_size),
                     "input_mask_binarize_threshold": 0.0,
                 },
-                tensors={"new_object_masks_before_resize": kwargs["new_obj_masks"]},
+                tensors={"new_object_masks_before_resize": call_args["new_obj_masks"]},
             )
         result = original_tracker_add_new_objects(*args, **kwargs)
         if recorder.should_capture(frame_idx) and result:
@@ -1016,9 +1624,49 @@ def install_video_internal_fixture_recorder(predictor, debug_dir: Path, capture_
             )
         return result
 
+    def wrapped_add_new_points_or_box(self, *args, **kwargs):
+        call_args = bind_call_arguments(original_add_new_points_or_box, self, args, kwargs)
+        frame_idx = int(call_args["frame_idx"])
+        if recorder.should_capture(frame_idx):
+            tensors = {}
+            if call_args.get("points") is not None:
+                tensors["points"] = call_args["points"]
+            if call_args.get("labels") is not None:
+                tensors["labels"] = call_args["labels"]
+            if call_args.get("box") is not None:
+                tensors["box"] = call_args["box"]
+            recorder.add_record(
+                stage="add_new_points_or_box_input",
+                frame_idx=frame_idx,
+                metadata={
+                    "obj_id": int(call_args["obj_id"]),
+                    "clear_old_points": bool(call_args.get("clear_old_points", True)),
+                    "rel_coordinates": bool(call_args.get("rel_coordinates", True)),
+                    "use_prev_mem_frame": bool(call_args.get("use_prev_mem_frame", False)),
+                },
+                tensors=tensors,
+            )
+        return original_add_new_points_or_box(*args, **kwargs)
+
+    def wrapped_add_new_mask(self, *args, **kwargs):
+        call_args = bind_call_arguments(original_add_new_mask, self, args, kwargs)
+        frame_idx = int(call_args["frame_idx"])
+        if recorder.should_capture(frame_idx):
+            recorder.add_record(
+                stage="add_new_mask_input",
+                frame_idx=frame_idx,
+                metadata={
+                    "obj_id": int(call_args["obj_id"]),
+                    "add_mask_to_memory": bool(call_args.get("add_mask_to_memory", False)),
+                },
+                tensors={"mask": call_args["mask"]},
+            )
+        return original_add_new_mask(*args, **kwargs)
+
     def wrapped_run_memory_encoder(self, *args, **kwargs):
-        frame_idx = kwargs["frame_idx"]
-        recorder.push_context(stage="run_memory_encoder", frame_idx=int(frame_idx))
+        call_args = bind_call_arguments(original_run_memory_encoder, self, args, kwargs)
+        frame_idx = int(call_args["frame_idx"])
+        recorder.push_context(stage="run_memory_encoder", frame_idx=frame_idx)
         try:
             result = original_run_memory_encoder(*args, **kwargs)
         finally:
@@ -1026,8 +1674,8 @@ def install_video_internal_fixture_recorder(predictor, debug_dir: Path, capture_
         if recorder.should_capture(frame_idx):
             maskmem_features, maskmem_pos_enc = result
             tensor_map = {
-                "high_res_masks": kwargs["high_res_masks"],
-                "object_score_logits": kwargs["object_score_logits"],
+                "high_res_masks": call_args["high_res_masks"],
+                "object_score_logits": call_args["object_score_logits"],
                 "maskmem_features": maskmem_features,
             }
             for idx, pos_enc in enumerate(maskmem_pos_enc):
@@ -1036,29 +1684,32 @@ def install_video_internal_fixture_recorder(predictor, debug_dir: Path, capture_
                 stage="run_memory_encoder",
                 frame_idx=frame_idx,
                 metadata={
-                    "batch_size": int(kwargs["batch_size"]),
-                    "is_mask_from_pts": bool(kwargs["is_mask_from_pts"]),
+                    "batch_size": int(call_args["batch_size"]),
+                    "is_mask_from_pts": bool(call_args["is_mask_from_pts"]),
                     "sigmoid_scale_for_mem_enc": float(self.sigmoid_scale_for_mem_enc),
                     "sigmoid_bias_for_mem_enc": float(self.sigmoid_bias_for_mem_enc),
-                    "mask_for_mem_threshold": 0.0 if kwargs["is_mask_from_pts"] and not self.training else None,
-                    "mask_for_mem_mode": "binary_gt_0" if kwargs["is_mask_from_pts"] and not self.training else "sigmoid_logits",
+                    "mask_for_mem_threshold": 0.0 if call_args["is_mask_from_pts"] and not self.training else None,
+                    "mask_for_mem_mode": "binary_gt_0" if call_args["is_mask_from_pts"] and not self.training else "sigmoid_logits",
                 },
                 tensors=tensor_map,
             )
         return result
 
     def wrapped_prepare_memory_conditioned_features(self, *args, **kwargs):
-        frame_idx = kwargs["frame_idx"]
+        call_args = bind_call_arguments(
+            original_prepare_memory_conditioned_features, self, args, kwargs
+        )
+        frame_idx = int(call_args["frame_idx"])
         metadata = None
         tensor_map = None
         if recorder.should_capture(frame_idx):
             metadata, tensor_map = compute_memory_selection_debug(
                 tracker=self,
                 frame_idx=frame_idx,
-                output_dict=kwargs["output_dict"],
-                num_frames=kwargs["num_frames"],
-                track_in_reverse=kwargs.get("track_in_reverse", False),
-                use_prev_mem_frame=kwargs.get("use_prev_mem_frame", True),
+                output_dict=call_args["output_dict"],
+                num_frames=call_args["num_frames"],
+                track_in_reverse=call_args.get("track_in_reverse", False),
+                use_prev_mem_frame=call_args.get("use_prev_mem_frame", True),
             )
         result = original_prepare_memory_conditioned_features(*args, **kwargs)
         if recorder.should_capture(frame_idx):
@@ -1073,23 +1724,24 @@ def install_video_internal_fixture_recorder(predictor, debug_dir: Path, capture_
         return result
 
     def wrapped_track_step(self, *args, **kwargs):
-        frame_idx = kwargs["frame_idx"]
+        call_args = bind_call_arguments(original_track_step, self, args, kwargs)
+        frame_idx = int(call_args["frame_idx"])
         recorder.push_context(
             stage="track_step",
-            frame_idx=int(frame_idx),
-            is_init_cond_frame=bool(kwargs["is_init_cond_frame"]),
-            run_mem_encoder=bool(kwargs.get("run_mem_encoder", True)),
+            frame_idx=frame_idx,
+            is_init_cond_frame=bool(call_args["is_init_cond_frame"]),
+            run_mem_encoder=bool(call_args.get("run_mem_encoder", True)),
         )
         try:
             result = original_track_step(*args, **kwargs)
         finally:
             recorder.pop_context()
         if recorder.should_capture(frame_idx):
-            point_inputs = kwargs.get("point_inputs")
-            mask_inputs = kwargs.get("mask_inputs")
+            point_inputs = call_args.get("point_inputs")
+            mask_inputs = call_args.get("mask_inputs")
             tensor_map = {
-                "current_vision_feats": kwargs["current_vision_feats"][-1],
-                "current_vision_pos_embeds": kwargs["current_vision_pos_embeds"][-1],
+                "current_vision_feats": call_args["current_vision_feats"][-1],
+                "current_vision_pos_embeds": call_args["current_vision_pos_embeds"][-1],
             }
             if mask_inputs is not None:
                 tensor_map["mask_inputs"] = mask_inputs
@@ -1101,11 +1753,11 @@ def install_video_internal_fixture_recorder(predictor, debug_dir: Path, capture_
                 stage="track_step",
                 frame_idx=frame_idx,
                 metadata={
-                    "is_init_cond_frame": bool(kwargs["is_init_cond_frame"]),
-                    "track_in_reverse": bool(kwargs.get("track_in_reverse", False)),
-                    "run_mem_encoder": bool(kwargs.get("run_mem_encoder", True)),
-                    "use_prev_mem_frame": bool(kwargs.get("use_prev_mem_frame", True)),
-                    "num_frames": int(kwargs["num_frames"]),
+                    "is_init_cond_frame": bool(call_args["is_init_cond_frame"]),
+                    "track_in_reverse": bool(call_args.get("track_in_reverse", False)),
+                    "run_mem_encoder": bool(call_args.get("run_mem_encoder", True)),
+                    "use_prev_mem_frame": bool(call_args.get("use_prev_mem_frame", True)),
+                    "num_frames": int(call_args["num_frames"]),
                     "point_input_count": int(point_inputs["point_labels"].numel()) if point_inputs is not None else 0,
                     "has_mask_inputs": mask_inputs is not None,
                 },
@@ -1113,15 +1765,172 @@ def install_video_internal_fixture_recorder(predictor, debug_dir: Path, capture_
             )
         return result
 
+    def wrapped_forward_sam_heads(self, *args, **kwargs):
+        call_args = bind_call_arguments(original_forward_sam_heads, self, args, kwargs)
+        frame_idx = recorder.current_context().get("frame_idx")
+        if frame_idx is not None:
+            recorder.push_context(stage="forward_sam_heads", frame_idx=frame_idx)
+        try:
+            result = original_forward_sam_heads(*args, **kwargs)
+        finally:
+            if frame_idx is not None:
+                recorder.pop_context()
+        if frame_idx is not None and recorder.should_capture(frame_idx):
+            tensor_map = {
+                "backbone_features": call_args["backbone_features"],
+                "image_pe": self.sam_prompt_encoder.get_dense_pe(),
+            }
+            if call_args.get("point_inputs") is not None:
+                add_result_tree(tensor_map, "point_inputs", call_args["point_inputs"])
+            if call_args.get("mask_inputs") is not None:
+                tensor_map["mask_inputs"] = call_args["mask_inputs"]
+            if call_args.get("high_res_features") is not None:
+                add_result_tree(
+                    tensor_map, "high_res_features", call_args["high_res_features"]
+                )
+            add_result_tree(
+                tensor_map,
+                "forward_sam_heads_output",
+                {
+                    "low_res_multimasks": result[0],
+                    "high_res_multimasks": result[1],
+                    "ious": result[2],
+                    "low_res_masks": result[3],
+                    "high_res_masks": result[4],
+                    "obj_ptr": result[5],
+                    "object_score_logits": result[6],
+                },
+            )
+            recorder.add_record(
+                stage="forward_sam_heads",
+                frame_idx=frame_idx,
+                metadata={
+                    "multimask_output": bool(call_args.get("multimask_output", False)),
+                    "has_point_inputs": call_args.get("point_inputs") is not None,
+                    "has_mask_inputs": call_args.get("mask_inputs") is not None,
+                    "has_gt_masks": call_args.get("gt_masks") is not None,
+                },
+                tensors=tensor_map,
+            )
+        return result
+
+    def wrapped_use_mask_as_output(self, *args, **kwargs):
+        call_args = bind_call_arguments(original_use_mask_as_output, self, args, kwargs)
+        frame_idx = recorder.current_context().get("frame_idx")
+        result = original_use_mask_as_output(*args, **kwargs)
+        if frame_idx is not None and recorder.should_capture(frame_idx):
+            tensor_map = {
+                "backbone_features": call_args["backbone_features"],
+                "mask_inputs": call_args["mask_inputs"],
+            }
+            if call_args.get("high_res_features") is not None:
+                add_result_tree(
+                    tensor_map, "high_res_features", call_args["high_res_features"]
+                )
+            add_result_tree(
+                tensor_map,
+                "use_mask_as_output",
+                {
+                    "low_res_multimasks": result[0],
+                    "high_res_multimasks": result[1],
+                    "ious": result[2],
+                    "low_res_masks": result[3],
+                    "high_res_masks": result[4],
+                    "obj_ptr": result[5],
+                    "object_score_logits": result[6],
+                },
+            )
+            recorder.add_record(
+                stage="use_mask_as_output",
+                frame_idx=frame_idx,
+                metadata={},
+                tensors=tensor_map,
+            )
+        return result
+
+    def wrapped_prompt_encoder_forward(self, *args, **kwargs):
+        call_args = bind_call_arguments(original_prompt_encoder_forward, self, args, kwargs)
+        frame_idx = recorder.current_context().get("frame_idx")
+        result = original_prompt_encoder_forward(*args, **kwargs)
+        if frame_idx is not None and recorder.should_capture(frame_idx):
+            tensor_map = {}
+            add_result_tree(
+                tensor_map,
+                "prompt_encoder_inputs",
+                {
+                    "points": call_args.get("points"),
+                    "boxes": call_args.get("boxes"),
+                    "masks": call_args.get("masks"),
+                },
+            )
+            add_result_tree(
+                tensor_map,
+                "prompt_encoder_output",
+                {
+                    "sparse_embeddings": result[0],
+                    "dense_embeddings": result[1],
+                },
+            )
+            recorder.add_record(
+                stage="sam_prompt_encoder",
+                frame_idx=frame_idx,
+                metadata={
+                    "has_points": call_args.get("points") is not None,
+                    "has_boxes": call_args.get("boxes") is not None,
+                    "has_masks": call_args.get("masks") is not None,
+                },
+                tensors=tensor_map,
+            )
+        return result
+
+    def wrapped_mask_decoder_forward(self, *args, **kwargs):
+        call_args = bind_call_arguments(original_mask_decoder_forward, self, args, kwargs)
+        frame_idx = recorder.current_context().get("frame_idx")
+        result = original_mask_decoder_forward(*args, **kwargs)
+        if frame_idx is not None and recorder.should_capture(frame_idx):
+            tensor_map = {}
+            add_result_tree(
+                tensor_map,
+                "mask_decoder_inputs",
+                {
+                    "image_embeddings": call_args["image_embeddings"],
+                    "image_pe": call_args["image_pe"],
+                    "sparse_prompt_embeddings": call_args["sparse_prompt_embeddings"],
+                    "dense_prompt_embeddings": call_args["dense_prompt_embeddings"],
+                    "high_res_features": call_args.get("high_res_features"),
+                },
+            )
+            add_result_tree(
+                tensor_map,
+                "mask_decoder_output",
+                {
+                    "low_res_multimasks": result[0],
+                    "ious": result[1],
+                    "sam_output_tokens": result[2],
+                    "object_score_logits": result[3],
+                },
+            )
+            recorder.add_record(
+                stage="sam_mask_decoder",
+                frame_idx=frame_idx,
+                metadata={
+                    "multimask_output": bool(call_args.get("multimask_output", False)),
+                    "repeat_image": bool(call_args.get("repeat_image", False)),
+                },
+                tensors=tensor_map,
+            )
+        return result
+
     def wrapped_encode_new_memory(self, *args, **kwargs):
         context = recorder.current_context()
+        call_args = bind_call_arguments(original_encode_new_memory, self, args, kwargs)
         result = original_encode_new_memory(*args, **kwargs)
         frame_idx = context.get("frame_idx")
         if frame_idx is not None and recorder.should_capture(frame_idx):
             maskmem_features, maskmem_pos_enc = result
             tensor_map = {
-                "pred_masks_high_res": kwargs["pred_masks_high_res"],
-                "object_score_logits": kwargs["object_score_logits"],
+                "pred_masks_high_res": call_args["pred_masks_high_res"],
+                "object_score_logits": call_args["object_score_logits"],
                 "maskmem_features": maskmem_features,
             }
             for idx, pos_enc in enumerate(maskmem_pos_enc):
@@ -1131,25 +1940,433 @@ def install_video_internal_fixture_recorder(predictor, debug_dir: Path, capture_
                 frame_idx=frame_idx,
                 metadata={
                     "context_stage": context.get("stage"),
-                    "is_mask_from_pts": bool(kwargs["is_mask_from_pts"]),
-                    "is_init_cond_frame": bool(kwargs.get("is_init_cond_frame", False)),
+                    "is_mask_from_pts": bool(call_args["is_mask_from_pts"]),
+                    "is_init_cond_frame": bool(call_args.get("is_init_cond_frame", False)),
                     "sigmoid_scale_for_mem_enc": float(self.sigmoid_scale_for_mem_enc),
                     "sigmoid_bias_for_mem_enc": float(self.sigmoid_bias_for_mem_enc),
-                    "mask_for_mem_threshold": 0.0 if kwargs["is_mask_from_pts"] and not self.training else None,
-                    "mask_for_mem_mode": "binary_gt_0" if kwargs["is_mask_from_pts"] and not self.training else "sigmoid_logits",
+                    "mask_for_mem_threshold": 0.0 if call_args["is_mask_from_pts"] and not self.training else None,
+                    "mask_for_mem_mode": "binary_gt_0" if call_args["is_mask_from_pts"] and not self.training else "sigmoid_logits",
                 },
                 tensors=tensor_map,
             )
         return result
 
-    model._tracker_add_new_objects = types.MethodType(wrapped_tracker_add_new_objects, model)
+    if original_get_visual_prompt is not None:
+        predictor_impl._get_visual_prompt = types.MethodType(
+            wrapped_get_visual_prompt, predictor_impl
+        )
+    if original_predictor_run_single_frame_inference is not None:
+        predictor_impl._run_single_frame_inference = types.MethodType(
+            wrapped_predictor_run_single_frame_inference, predictor_impl
+        )
+    if original_build_tracker_output is not None:
+        predictor_impl._build_tracker_output = types.MethodType(
+            wrapped_build_tracker_output, predictor_impl
+        )
+    if original_postprocess_output is not None:
+        predictor_impl._postprocess_output = types.MethodType(
+            wrapped_postprocess_output, predictor_impl
+        )
+    if original_preflight is not None:
+        predictor_impl.propagate_in_video_preflight = types.MethodType(
+            wrapped_preflight, predictor_impl
+        )
+    if original_clear_non_cond_mem is not None:
+        predictor_impl._clear_non_cond_mem_around_input = types.MethodType(
+            wrapped_clear_non_cond_mem, predictor_impl
+        )
+    if model is not None and original_tracker_add_new_objects is not None:
+        model._tracker_add_new_objects = types.MethodType(wrapped_tracker_add_new_objects, model)
+    if model is not None and original_det_track_one_frame is not None:
+        model._det_track_one_frame = types.MethodType(
+            wrapped_det_track_one_frame, model
+        )
     tracker._run_memory_encoder = types.MethodType(wrapped_run_memory_encoder, tracker)
     tracker._prepare_memory_conditioned_features = types.MethodType(
         wrapped_prepare_memory_conditioned_features, tracker
     )
     tracker.track_step = types.MethodType(wrapped_track_step, tracker)
     tracker._encode_new_memory = types.MethodType(wrapped_encode_new_memory, tracker)
+    if original_forward_sam_heads is not None:
+        tracker._forward_sam_heads = types.MethodType(
+            wrapped_forward_sam_heads, tracker
+        )
+    if original_use_mask_as_output is not None:
+        tracker._use_mask_as_output = types.MethodType(
+            wrapped_use_mask_as_output, tracker
+        )
+    if original_prompt_encoder_forward is not None:
+        tracker.sam_prompt_encoder.forward = types.MethodType(
+            wrapped_prompt_encoder_forward, tracker.sam_prompt_encoder
+        )
+    if original_mask_decoder_forward is not None:
+        tracker.sam_mask_decoder.forward = types.MethodType(
+            wrapped_mask_decoder_forward, tracker.sam_mask_decoder
+        )
+    if original_add_new_points_or_box is not None:
+        tracker.add_new_points_or_box = types.MethodType(
+            wrapped_add_new_points_or_box, tracker
+        )
+    if original_add_new_mask is not None:
+        tracker.add_new_mask = types.MethodType(wrapped_add_new_mask, tracker)
     return recorder
+
+
+def mask_spec_to_tensor(mask_spec, frame_path: Path):
+    from PIL import Image
+    import numpy as np
+
+    if not isinstance(mask_spec, dict):
+        raise ValueError("mask prompt action requires a `mask` object")
+    frame = Image.open(frame_path).convert("RGB")
+    width, height = frame.size
+    mask_type = mask_spec.get("type", "box_xyxy")
+    if mask_type == "box_xyxy":
+        box_xyxy = mask_spec.get("box_xyxy")
+        if box_xyxy is None:
+            raise ValueError("mask spec of type `box_xyxy` requires `box_xyxy`")
+        mask = normalized_box_xyxy_to_mask(box_xyxy, width, height)
+    elif mask_type == "image":
+        mask_path = Path(mask_spec["path"]).expanduser().resolve()
+        mask = np.array(Image.open(mask_path).convert("L"), dtype=np.float32) / 255.0
+        if mask.shape != (height, width):
+            mask = np.array(
+                Image.fromarray((mask * 255.0).round().astype("uint8"), mode="L").resize(
+                    (width, height), Image.Resampling.BILINEAR
+                ),
+                dtype=np.float32,
+            ) / 255.0
+        threshold = float(mask_spec.get("threshold", 0.5))
+        mask = (mask >= threshold).astype("uint8")
+    else:
+        raise ValueError(f"unsupported mask spec type {mask_type!r}")
+    return torch.from_numpy(mask.astype("float32"))
+
+
+def tracker_frame_object_score(inference_state, frame_idx, obj_id):
+    obj_idx = inference_state["obj_id_to_idx"].get(int(obj_id))
+    if obj_idx is None:
+        return None
+    candidate_maps = [
+        inference_state.get("temp_output_dict_per_obj", {}).get(obj_idx, {}),
+        inference_state.get("output_dict_per_obj", {}).get(obj_idx, {}),
+    ]
+    for mapping in candidate_maps:
+        for storage_key in ("cond_frame_outputs", "non_cond_frame_outputs"):
+            frame_output = mapping.get(storage_key, {}).get(frame_idx)
+            if frame_output is None:
+                continue
+            logits = frame_output.get("object_score_logits")
+            if torch.is_tensor(logits):
+                return float(torch.sigmoid(logits.reshape(-1)[0]).item())
+    return None
+
+
+def normalize_tracker_outputs(inference_state, frame_idx, obj_ids, video_res_masks):
+    import numpy as np
+
+    if torch.is_tensor(video_res_masks):
+        masks = video_res_masks.detach().cpu().numpy()
+    else:
+        masks = np.asarray(video_res_masks)
+    if masks.ndim == 4:
+        masks = masks[:, 0]
+    binary_masks = masks > 0
+    out_obj_ids = [int(obj_id) for obj_id in obj_ids]
+    out_binary_masks = [mask.astype("uint8") for mask in binary_masks]
+    out_boxes_xywh = [binary_mask_to_box_xywh(mask) for mask in binary_masks]
+    out_probs = [tracker_frame_object_score(inference_state, frame_idx, obj_id) for obj_id in out_obj_ids]
+    return {
+        "out_obj_ids": out_obj_ids,
+        "out_probs": out_probs,
+        "out_boxes_xywh": out_boxes_xywh,
+        "out_binary_masks": out_binary_masks,
+    }
+
+
+def ensure_tracker_frame_features(tracker, inference_state, frame_idx, batch_size=1):
+    get_image_feature = getattr(tracker, "_get_image_feature", None)
+    if get_image_feature is None:
+        return
+    get_image_feature(inference_state, frame_idx, batch_size)
+
+
+def execute_video_scenario_action_video_inference(
+    predictor, session_id, action, frame_outputs, debug_records, debug_dir, args, default_prompt_text
+):
+    action_type = action["type"]
+    if action_type == "add_prompt":
+        request = {
+            "type": "add_prompt",
+            "session_id": session_id,
+            "frame_index": int(action["frame_idx"]),
+        }
+        if action.get("clear_old_points") is not None:
+            request["clear_old_points"] = bool(action["clear_old_points"])
+        if action.get("clear_old_boxes") is not None:
+            request["clear_old_boxes"] = bool(action["clear_old_boxes"])
+        if action.get("output_prob_thresh") is not None:
+            request["output_prob_thresh"] = float(action["output_prob_thresh"])
+        if action.get("text") is not None:
+            request["text"] = action.get("text")
+        if action.get("boxes_xywh") is not None:
+            request["bounding_boxes"] = action["boxes_xywh"]
+            request["bounding_box_labels"] = [
+                int(label) for label in action.get("box_labels", [1 for _ in action["boxes_xywh"]])
+            ]
+        if action.get("points_xy_normalized") is not None:
+            request["points"] = action["points_xy_normalized"]
+            point_labels = action.get(
+                "point_labels",
+                [default_positive_label() for _ in action["points_xy_normalized"]],
+            )
+            request["point_labels"] = [int(label) for label in point_labels]
+        if action.get("obj_id") is not None:
+            request["obj_id"] = int(action["obj_id"])
+        response = predictor.handle_request(request)
+        merge_frame_outputs(
+            frame_outputs,
+            int(response["frame_index"]),
+            response["outputs"],
+        )
+        if args.video_debug_bundle and should_capture_video_debug(args, int(response["frame_index"]), int(action["frame_idx"])):
+            outputs = response.get("outputs", {})
+            for obj_id, score, box_xywh, mask in zip(
+                outputs.get("out_obj_ids", []),
+                outputs.get("out_probs", []),
+                outputs.get("out_boxes_xywh", []),
+                outputs.get("out_binary_masks", []),
+            ):
+                if not should_capture_video_debug_obj(args, obj_id):
+                    continue
+                debug_records.append(
+                    {
+                        "stage": "prompt_frame_output",
+                        "obj_id": int(obj_id),
+                        "frame_idx": int(response["frame_index"]),
+                        "prompt_frame_idx": int(action["frame_idx"]),
+                        "prompt_metadata": build_video_debug_prompt_metadata_from_action(
+                            action, default_prompt_text
+                        ),
+                        "observable": build_video_debug_observable(
+                            debug_dir,
+                            int(response["frame_index"]),
+                            obj_id,
+                            "prompt_frame_output_mask",
+                            mask,
+                            score,
+                            box_xywh,
+                        ),
+                        "tracker_state": None,
+                        "propagation_input": None,
+                    }
+                )
+        return
+
+    if action_type == "propagate":
+        request = {
+            "type": "propagate_in_video",
+            "session_id": session_id,
+            "propagation_direction": action.get("direction", "forward"),
+            "start_frame_index": action.get("start_frame_idx", None),
+            "max_frame_num_to_track": action.get("max_frame_num_to_track", None),
+        }
+        for response in predictor.handle_stream_request(request):
+            frame_idx = int(response["frame_index"])
+            merge_frame_outputs(frame_outputs, frame_idx, response["outputs"])
+            if not args.video_debug_bundle or not should_capture_video_debug(
+                args, frame_idx, action.get("start_frame_idx", None)
+            ):
+                continue
+            outputs = response.get("outputs", {})
+            for obj_id, score, box_xywh, mask in zip(
+                outputs.get("out_obj_ids", []),
+                outputs.get("out_probs", []),
+                outputs.get("out_boxes_xywh", []),
+                outputs.get("out_binary_masks", []),
+            ):
+                if not should_capture_video_debug_obj(args, obj_id):
+                    continue
+                debug_records.append(
+                    {
+                        "stage": "propagated_output",
+                        "obj_id": int(obj_id),
+                        "frame_idx": frame_idx,
+                        "prompt_frame_idx": int(action.get("start_frame_idx", 0) or 0),
+                        "prompt_metadata": None,
+                        "observable": build_video_debug_observable(
+                            debug_dir,
+                            frame_idx,
+                            obj_id,
+                            "propagated_mask",
+                            mask,
+                            score,
+                            box_xywh,
+                        ),
+                        "tracker_state": None,
+                        "propagation_input": None,
+                    }
+                )
+        return
+
+    raise ValueError(f"unsupported video-inference scenario action {action_type!r}")
+
+
+def execute_video_scenario_action_tracker(
+    tracker, inference_state, frame_paths, action, frame_outputs, debug_records, debug_dir, args
+):
+    action_type = action["type"]
+    frame_idx = int(action.get("frame_idx", 0))
+    if action_type == "add_prompt":
+        obj_id = int(action["obj_id"])
+        ensure_tracker_frame_features(tracker, inference_state, frame_idx)
+        points = action.get("points_xy_normalized")
+        point_labels = action.get(
+            "point_labels",
+            [default_positive_label() for _ in points] if points is not None else None,
+        )
+        box = action.get("box_xyxy")
+        frame_idx_out, obj_ids, _, video_res_masks = tracker.add_new_points_or_box(
+            inference_state,
+            frame_idx=frame_idx,
+            obj_id=obj_id,
+            points=(torch.tensor(points, dtype=torch.float32) if points is not None else None),
+            labels=(torch.tensor(point_labels, dtype=torch.int32) if point_labels is not None else None),
+            clear_old_points=bool(action.get("clear_old_points", True)),
+            rel_coordinates=bool(action.get("rel_coordinates", True)),
+            use_prev_mem_frame=bool(action.get("use_prev_mem_frame", False)),
+            box=(torch.tensor(box, dtype=torch.float32) if box is not None else None),
+        )
+        outputs = normalize_tracker_outputs(
+            inference_state, int(frame_idx_out), obj_ids, video_res_masks
+        )
+        merge_frame_outputs(frame_outputs, int(frame_idx_out), outputs)
+        if args.video_debug_bundle and should_capture_video_debug(args, int(frame_idx_out), frame_idx):
+            for obj_id_out, score, box_xywh, mask in zip(
+                outputs.get("out_obj_ids", []),
+                outputs.get("out_probs", []),
+                outputs.get("out_boxes_xywh", []),
+                outputs.get("out_binary_masks", []),
+            ):
+                if not should_capture_video_debug_obj(args, obj_id_out):
+                    continue
+                debug_records.append(
+                    {
+                        "stage": "prompt_frame_output",
+                        "obj_id": int(obj_id_out),
+                        "frame_idx": int(frame_idx_out),
+                        "prompt_frame_idx": frame_idx,
+                        "prompt_metadata": build_video_debug_prompt_metadata_from_action(action, None),
+                        "observable": build_video_debug_observable(
+                            debug_dir,
+                            int(frame_idx_out),
+                            obj_id_out,
+                            "prompt_frame_output_mask",
+                            mask,
+                            score,
+                            box_xywh,
+                        ),
+                        "tracker_state": None,
+                        "propagation_input": None,
+                    }
+                )
+        return
+
+    if action_type == "add_mask":
+        obj_id = int(action["obj_id"])
+        ensure_tracker_frame_features(tracker, inference_state, frame_idx)
+        mask = mask_spec_to_tensor(action["mask"], frame_paths[frame_idx])
+        frame_idx_out, obj_ids, _, video_res_masks = tracker.add_new_mask(
+            inference_state,
+            frame_idx=frame_idx,
+            obj_id=obj_id,
+            mask=mask,
+            add_mask_to_memory=bool(action.get("add_mask_to_memory", False)),
+        )
+        outputs = normalize_tracker_outputs(
+            inference_state, int(frame_idx_out), obj_ids, video_res_masks
+        )
+        merge_frame_outputs(frame_outputs, int(frame_idx_out), outputs)
+        if args.video_debug_bundle and should_capture_video_debug(args, int(frame_idx_out), frame_idx):
+            for obj_id_out, score, box_xywh, mask in zip(
+                outputs.get("out_obj_ids", []),
+                outputs.get("out_probs", []),
+                outputs.get("out_boxes_xywh", []),
+                outputs.get("out_binary_masks", []),
+            ):
+                if not should_capture_video_debug_obj(args, obj_id_out):
+                    continue
+                debug_records.append(
+                    {
+                        "stage": "prompt_frame_output",
+                        "obj_id": int(obj_id_out),
+                        "frame_idx": int(frame_idx_out),
+                        "prompt_frame_idx": frame_idx,
+                        "prompt_metadata": build_video_debug_prompt_metadata_from_action(action, None),
+                        "observable": build_video_debug_observable(
+                            debug_dir,
+                            int(frame_idx_out),
+                            obj_id_out,
+                            "prompt_frame_output_mask",
+                            mask,
+                            score,
+                            box_xywh,
+                        ),
+                        "tracker_state": None,
+                        "propagation_input": None,
+                    }
+                )
+        return
+
+    if action_type == "propagate":
+        direction = action.get("direction", "forward")
+        reverse_values = [False, True] if direction == "both" else [direction == "backward"]
+        for reverse in reverse_values:
+            for frame_idx_out, obj_ids, _, video_res_masks in tracker.propagate_in_video(
+                inference_state,
+                start_frame_idx=action.get("start_frame_idx", None),
+                max_frame_num_to_track=action.get("max_frame_num_to_track", None),
+                reverse=reverse,
+            ):
+                outputs = normalize_tracker_outputs(
+                    inference_state, int(frame_idx_out), obj_ids, video_res_masks
+                )
+                merge_frame_outputs(frame_outputs, int(frame_idx_out), outputs)
+                if not args.video_debug_bundle or not should_capture_video_debug(
+                    args, int(frame_idx_out), action.get("start_frame_idx", None)
+                ):
+                    continue
+                for obj_id_out, score, box_xywh, mask in zip(
+                    outputs.get("out_obj_ids", []),
+                    outputs.get("out_probs", []),
+                    outputs.get("out_boxes_xywh", []),
+                    outputs.get("out_binary_masks", []),
+                ):
+                    if not should_capture_video_debug_obj(args, obj_id_out):
+                        continue
+                    debug_records.append(
+                        {
+                            "stage": "propagated_output",
+                            "obj_id": int(obj_id_out),
+                            "frame_idx": int(frame_idx_out),
+                            "prompt_frame_idx": int(action.get("start_frame_idx", 0) or 0),
+                            "prompt_metadata": None,
+                            "observable": build_video_debug_observable(
+                                debug_dir,
+                                int(frame_idx_out),
+                                obj_id_out,
+                                "propagated_mask",
+                                mask,
+                                score,
+                                box_xywh,
+                            ),
+                            "tracker_state": None,
+                            "propagation_input": None,
+                        }
+                    )
+        return
+
+    raise ValueError(f"unsupported tracker scenario action {action_type!r}")
 
 
 def main():
@@ -1167,7 +2384,13 @@ def main():
     if args.video is not None and args.debug_block:
         raise ValueError("`--video` cannot be combined with `--debug-block`")
     if args.video is not None:
-        if args.prompt is None and not args.box:
+        if args.video_scenario is not None and (
+            args.prompt is not None or args.box or args.box_label
+        ):
+            raise ValueError(
+                "`--video-scenario` drives video prompts internally; do not combine it with `--prompt`, `--box`, or `--box-label`"
+            )
+        if args.video_scenario is None and args.prompt is None and not args.box:
             raise ValueError("video export requires --prompt, --box, or both")
         effective_prompt = args.prompt
     elif args.interactive_script is None:
@@ -1296,7 +2519,7 @@ def main():
 
         from PIL import Image
 
-        from sam3.model_builder import build_sam3_predictor
+        from sam3.model_builder import build_sam3_predictor, build_tracker
 
         source_video_path = Path(args.video).expanduser().resolve()
         frames_dir = output_dir / "frames"
@@ -1312,144 +2535,120 @@ def main():
         frame_paths = prepare_video_frames(
             source_video_path, frames_dir, max_frames=args.video_frame_count
         )
-
-        predictor = build_sam3_predictor(
-            version="sam3",
-            checkpoint_path=str(checkpoint_path),
-            bpe_path=str(bpe_path),
-            compile=False,
-            async_loading_frames=False,
-            apply_temporal_disambiguation=args.video_apply_temporal_disambiguation,
+        resolved_box_labels = [
+            int(label)
+            for label in (args.box_label if args.box_label else [True for _ in args.box])
+        ]
+        scenario = (
+            load_video_scenario(Path(args.video_scenario).expanduser().resolve())
+            if args.video_scenario is not None
+            else build_default_video_scenario(args, resolved_box_labels)
         )
+        if args.video_debug_frame == [] and scenario.get("debug_capture_frame_indices"):
+            args.video_debug_frame = list(scenario["debug_capture_frame_indices"])
+        if args.video_debug_obj_id == [] and scenario.get("debug_capture_obj_ids"):
+            args.video_debug_obj_id = list(scenario["debug_capture_obj_ids"])
         internal_recorder = None
         if args.video_debug_bundle:
             internal_capture_frame_indices = sorted(
                 {
                     frame_idx
                     for frame_idx in (
-                        list(range(min(4, len(frame_paths))))
+                        scenario.get("debug_capture_frame_indices", [])
+                        + list(range(min(4, len(frame_paths))))
                         + [int(frame_idx) for frame_idx in args.video_debug_frame]
                     )
                     if 0 <= frame_idx < len(frame_paths)
                 }
             )
-            internal_recorder = install_video_internal_fixture_recorder(
-                predictor, debug_dir, internal_capture_frame_indices
-            )
-        response = predictor.handle_request(
-            {"type": "start_session", "resource_path": str(frames_dir)}
-        )
-        session_id = response["session_id"]
-        if internal_recorder is not None:
-            internal_recorder.set_session_id(session_id)
         frame_outputs = {}
         debug_records = []
 
-        request = {
-            "type": "add_prompt",
-            "session_id": session_id,
-            "frame_index": 0,
-        }
-        if args.prompt is not None:
-            request["text"] = args.prompt
-        if args.box:
-            resolved_box_labels = [
-                int(label)
-                for label in (args.box_label if args.box_label else [True for _ in args.box])
-            ]
-            request["bounding_boxes"] = [box_cxcywh_to_xywh(box) for box in args.box]
-            request["bounding_box_labels"] = resolved_box_labels
-        prompt_response = predictor.handle_request(request)
-        merge_frame_outputs(
-            frame_outputs,
-            int(prompt_response["frame_index"]),
-            prompt_response["outputs"],
-        )
-        if args.video_debug_bundle:
-            prompt_outputs = prompt_response.get("outputs", {})
-            for obj_id, score, box_xywh, mask in zip(
-                prompt_outputs.get("out_obj_ids", []),
-                prompt_outputs.get("out_probs", []),
-                prompt_outputs.get("out_boxes_xywh", []),
-                prompt_outputs.get("out_binary_masks", []),
-            ):
-                if not should_capture_video_debug(args, 0, 0):
-                    continue
-                if not should_capture_video_debug_obj(args, obj_id):
-                    continue
-                debug_records.append(
-                    {
-                        "stage": "prompt_frame_output",
-                        "obj_id": int(obj_id),
-                        "frame_idx": 0,
-                        "prompt_frame_idx": 0,
-                        "prompt_metadata": build_video_debug_prompt_metadata(args),
-                        "observable": build_video_debug_observable(
-                            debug_dir,
-                            0,
-                            obj_id,
-                            "prompt_frame_output_mask",
-                            mask,
-                            score,
-                            box_xywh,
-                        ),
-                        "tracker_state": None,
-                        "propagation_input": None,
-                    }
-                )
-
-        for response in predictor.handle_stream_request(
-            {
-                "type": "propagate_in_video",
-                "session_id": session_id,
-                "start_frame_index": 0,
-                "max_frame_num_to_track": len(frame_paths),
-            }
-        ):
-            merge_frame_outputs(
-                frame_outputs, int(response["frame_index"]), response["outputs"]
+        if scenario["engine"] == "video_inference":
+            predictor = build_upstream_video_predictor_for_export(
+                build_sam3_predictor=build_sam3_predictor,
+                checkpoint_path=checkpoint_path,
+                bpe_path=bpe_path,
+                apply_temporal_disambiguation=scenario["apply_temporal_disambiguation"],
+                tracker_overrides=scenario["tracker_overrides"],
+                predictor_overrides=scenario["predictor_overrides"],
             )
             if args.video_debug_bundle:
-                frame_index = int(response["frame_index"])
-                if frame_index == 0:
-                    continue
-                if not should_capture_video_debug(args, frame_index, 0):
-                    continue
-                outputs = response.get("outputs", {})
-                for obj_id, score, box_xywh, mask in zip(
-                    outputs.get("out_obj_ids", []),
-                    outputs.get("out_probs", []),
-                    outputs.get("out_boxes_xywh", []),
-                    outputs.get("out_binary_masks", []),
-                ):
-                    if not should_capture_video_debug_obj(args, obj_id):
-                        continue
-                    if any(
-                        record["stage"] == "first_propagated_output"
-                        and record["obj_id"] == int(obj_id)
-                        for record in debug_records
-                    ):
-                        continue
-                    debug_records.append(
-                        {
-                            "stage": "first_propagated_output",
-                            "obj_id": int(obj_id),
-                            "frame_idx": frame_index,
-                            "prompt_frame_idx": 0,
-                            "prompt_metadata": None,
-                            "observable": build_video_debug_observable(
-                                debug_dir,
-                                frame_index,
-                                obj_id,
-                                "first_propagated_mask",
-                                mask,
-                                score,
-                                box_xywh,
-                            ),
-                            "tracker_state": None,
-                            "propagation_input": None,
-                        }
-                    )
+                internal_recorder = install_video_internal_fixture_recorder(
+                    predictor,
+                    debug_dir,
+                    internal_capture_frame_indices,
+                    scenario=scenario["raw"] or scenario,
+                )
+            response = predictor.handle_request(
+                {
+                    "type": "start_session",
+                    "resource_path": str(frames_dir),
+                    **scenario.get("session_overrides", {}),
+                }
+            )
+            session_id = response["session_id"]
+            if internal_recorder is not None:
+                internal_recorder.set_session_id(session_id)
+            for action in scenario["actions"]:
+                execute_video_scenario_action_video_inference(
+                    predictor,
+                    session_id,
+                    action,
+                    frame_outputs,
+                    debug_records,
+                    debug_dir,
+                    args,
+                    default_prompt_text=effective_prompt,
+                )
+            active_model = predictor.model
+            active_tracker = predictor.model.tracker
+            engine_metadata = {"engine": "video_inference", "session_id": session_id}
+        elif scenario["engine"] == "tracker":
+            tracker = build_tracker(
+                apply_temporal_disambiguation=scenario["apply_temporal_disambiguation"],
+                with_backbone=True,
+            )
+            apply_attr_overrides(tracker, scenario["tracker_overrides"], "tracker_overrides")
+            apply_attr_overrides(
+                tracker, scenario["predictor_overrides"], "predictor_overrides"
+            )
+            if args.video_debug_bundle:
+                internal_recorder = install_video_internal_fixture_recorder(
+                    tracker,
+                    debug_dir,
+                    internal_capture_frame_indices,
+                    scenario=scenario["raw"] or scenario,
+                )
+            tracker_frames_dir = output_dir / "tracker_input_frames"
+            prepare_tracker_input_frames(frame_paths, tracker_frames_dir)
+            inference_state = tracker.init_state(
+                video_path=str(tracker_frames_dir),
+                async_loading_frames=False,
+                **scenario.get("session_overrides", {}),
+            )
+            session_id = "tracker_direct"
+            if internal_recorder is not None:
+                internal_recorder.set_session_id(session_id)
+            for action in scenario["actions"]:
+                execute_video_scenario_action_tracker(
+                    tracker,
+                    inference_state,
+                    frame_paths,
+                    action,
+                    frame_outputs,
+                    debug_records,
+                    debug_dir,
+                    args,
+                )
+            active_model = None
+            active_tracker = tracker
+            engine_metadata = {"engine": "tracker", "session_id": session_id}
+        else:
+            raise ValueError(f"unsupported video scenario engine {scenario['engine']!r}")
+
+        if internal_recorder is not None and active_model is None:
+            internal_recorder.set_predictor_config(active_tracker, active_tracker)
 
         results = []
         for frame_idx, frame_path in enumerate(frame_paths):
@@ -1472,14 +2671,19 @@ def main():
                     masks_dir=masks_dir,
                     masked_frames_dir=masked_frames_dir,
                     bundle_root=output_dir,
-                    prompt_text=args.prompt,
-                    used_explicit_geometry=bool(args.box),
+                    prompt_text=args.prompt if args.video_scenario is None else None,
+                    used_explicit_geometry=(
+                        bool(args.box)
+                        if args.video_scenario is None
+                        else scenario_uses_explicit_geometry(scenario)
+                    ),
                 )
             )
 
         metadata = {
             "bundle_version": 1,
             "mode": "video_reference",
+            "engine": scenario["engine"],
             "source_path": str(source_video_path),
             "source_kind": "video_file" if source_video_path.is_file() else "image_folder",
             "session_frame_count": len(frame_paths),
@@ -1490,7 +2694,7 @@ def main():
                 if resolve_tokenizer_path(checkpoint_path) is not None
                 else None
             ),
-            "prompt_text": args.prompt,
+            "prompt_text": args.prompt if args.video_scenario is None else None,
             "points_xy_normalized": [],
             "point_labels": [],
             "boxes_cxcywh_normalized": [list(box) for box in args.box],
@@ -1500,9 +2704,17 @@ def main():
             "masked_frames_dir": "masked_frames",
             "results_path": "video_results.json",
             "debug_dir": "debug" if args.video_debug_bundle else None,
-            "video_apply_temporal_disambiguation": args.video_apply_temporal_disambiguation,
+            "video_apply_temporal_disambiguation": scenario["apply_temporal_disambiguation"],
+            "scenario": scenario["raw"] or scenario,
+            "tracker_config": capture_tracker_runtime_config(active_tracker),
+            "predictor_config": (
+                capture_predictor_runtime_config(active_model, active_tracker)
+                if active_model is not None
+                else capture_predictor_runtime_config(active_tracker, active_tracker)
+            ),
             "checkpoint_path": str(checkpoint_path),
             "bpe_path": str(bpe_path),
+            **engine_metadata,
         }
         with open(output_dir / "video_results.json", "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2)
@@ -1516,16 +2728,19 @@ def main():
                 "source": "upstream",
                 "session_id": session_id,
                 "internal_tracker_state_available": True,
-                "capture_obj_ids": [int(obj_id) for obj_id in args.video_debug_obj_id],
-                "capture_frame_indices": [int(frame_idx) for frame_idx in args.video_debug_frame],
+                "capture_obj_ids": [int(obj_id) for obj_id in args.video_debug_obj_id]
+                or scenario.get("debug_capture_obj_ids", []),
+                "capture_frame_indices": [int(frame_idx) for frame_idx in args.video_debug_frame]
+                or scenario.get("debug_capture_frame_indices", []),
                 "internal_capture_frame_indices": list(internal_recorder.capture_frame_indices),
-                "capture_first_propagated_only": True,
+                "capture_first_propagated_only": False,
                 "internal_manifest_path": str(internal_manifest_path.relative_to(debug_dir)),
                 "internal_tensor_file": (
                     str(internal_tensors_path.relative_to(debug_dir))
                     if internal_tensors_path is not None
                     else None
                 ),
+                "scenario": scenario["raw"] or scenario,
                 "records": debug_records,
             }
             with open(debug_dir / "debug_manifest.json", "w", encoding="utf-8") as f:
