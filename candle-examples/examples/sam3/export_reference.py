@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import contextlib
 import inspect
 import json
 import shutil
@@ -1278,6 +1279,7 @@ def install_video_internal_fixture_recorder(target, debug_dir: Path, capture_fra
         recorder.set_predictor_config(model, tracker)
 
     original_get_visual_prompt = getattr(predictor_impl, "_get_visual_prompt", None)
+    original_get_image_feature = getattr(predictor_impl, "_get_image_feature", None)
     original_predictor_run_single_frame_inference = getattr(
         predictor_impl, "_run_single_frame_inference", None
     )
@@ -1295,6 +1297,7 @@ def install_video_internal_fixture_recorder(target, debug_dir: Path, capture_fra
     original_encode_new_memory = tracker._encode_new_memory
     original_forward_sam_heads = getattr(tracker, "_forward_sam_heads", None)
     original_use_mask_as_output = getattr(tracker, "_use_mask_as_output", None)
+    original_tracker_forward_image = getattr(tracker, "forward_image", None)
     original_add_new_points_or_box = getattr(tracker, "add_new_points_or_box", None)
     original_add_new_mask = getattr(tracker, "add_new_mask", None)
     original_prompt_encoder_forward = getattr(
@@ -1413,6 +1416,42 @@ def install_video_internal_fixture_recorder(target, debug_dir: Path, capture_fra
                         int(idx)
                         for idx in inference_state.get("cached_frame_outputs", {}).keys()
                     ),
+                },
+                tensors=tensor_map,
+            )
+        return result
+
+    def wrapped_get_image_feature(self, *args, **kwargs):
+        call_args = bind_call_arguments(original_get_image_feature, self, args, kwargs)
+        frame_idx = int(call_args["frame_idx"])
+        inference_state = call_args["inference_state"]
+        cache_hit = inference_state["cached_features"].get(frame_idx, (None, None))[1] is not None
+        recorder.push_context(
+            stage="get_image_feature",
+            frame_idx=frame_idx,
+            batch_size=int(call_args["batch_size"]),
+        )
+        try:
+            result = original_get_image_feature(*args, **kwargs)
+        finally:
+            recorder.pop_context()
+        if recorder.should_capture(frame_idx):
+            image, backbone_out, current_vision_feats, current_vision_pos_embeds, feat_sizes = result
+            tensor_map = {"image": image}
+            add_result_tree(tensor_map, "backbone_out", backbone_out)
+            add_result_tree(tensor_map, "current_vision_feats", current_vision_feats)
+            add_result_tree(
+                tensor_map,
+                "current_vision_pos_embeds",
+                current_vision_pos_embeds,
+            )
+            recorder.add_record(
+                stage="get_image_feature",
+                frame_idx=frame_idx,
+                metadata={
+                    "batch_size": int(call_args["batch_size"]),
+                    "cache_hit": bool(cache_hit),
+                    "feat_sizes": [[int(h), int(w)] for h, w in feat_sizes],
                 },
                 tensors=tensor_map,
             )
@@ -1850,6 +1889,24 @@ def install_video_internal_fixture_recorder(target, debug_dir: Path, capture_fra
             )
         return result
 
+    def wrapped_tracker_forward_image(self, *args, **kwargs):
+        call_args = bind_call_arguments(original_tracker_forward_image, self, args, kwargs)
+        context = recorder.current_context()
+        frame_idx = context.get("frame_idx")
+        result = original_tracker_forward_image(*args, **kwargs)
+        if frame_idx is not None and recorder.should_capture(frame_idx):
+            tensor_map = {"image": call_args["img_batch"]}
+            add_result_tree(tensor_map, "forward_image_output", result)
+            recorder.add_record(
+                stage="tracker_forward_image",
+                frame_idx=frame_idx,
+                metadata={
+                    "context_stage": context.get("stage"),
+                },
+                tensors=tensor_map,
+            )
+        return result
+
     def wrapped_prompt_encoder_forward(self, *args, **kwargs):
         call_args = bind_call_arguments(original_prompt_encoder_forward, self, args, kwargs)
         frame_idx = recorder.current_context().get("frame_idx")
@@ -1957,6 +2014,10 @@ def install_video_internal_fixture_recorder(target, debug_dir: Path, capture_fra
         predictor_impl._get_visual_prompt = types.MethodType(
             wrapped_get_visual_prompt, predictor_impl
         )
+    if original_get_image_feature is not None:
+        predictor_impl._get_image_feature = types.MethodType(
+            wrapped_get_image_feature, predictor_impl
+        )
     if original_predictor_run_single_frame_inference is not None:
         predictor_impl._run_single_frame_inference = types.MethodType(
             wrapped_predictor_run_single_frame_inference, predictor_impl
@@ -1996,6 +2057,10 @@ def install_video_internal_fixture_recorder(target, debug_dir: Path, capture_fra
     if original_use_mask_as_output is not None:
         tracker._use_mask_as_output = types.MethodType(
             wrapped_use_mask_as_output, tracker
+        )
+    if original_tracker_forward_image is not None:
+        tracker.forward_image = types.MethodType(
+            wrapped_tracker_forward_image, tracker
         )
     if original_prompt_encoder_forward is not None:
         tracker.sam_prompt_encoder.forward = types.MethodType(
@@ -2625,11 +2690,12 @@ def main():
                 tracker.backbone = predictor.model.detector.backbone
             if args.video_debug_bundle:
                 internal_recorder = install_video_internal_fixture_recorder(
-                    predictor,
+                    tracker,
                     debug_dir,
                     internal_capture_frame_indices,
                     scenario=scenario["raw"] or scenario,
                 )
+                internal_recorder.set_predictor_config(predictor.model, tracker)
             tracker_frames_dir = output_dir / "tracker_input_frames"
             prepare_tracker_input_frames(frame_paths, tracker_frames_dir)
             inference_state = tracker.init_state(
@@ -2767,6 +2833,7 @@ def main():
     def run_trunk_with_debug(trunk, image_tensor, debug_blocks):
         debug_blocks = set(debug_blocks)
         x = trunk.patch_embed(image_tensor)
+        debug_tensors = {"vision.pre_block.patch_embed": to_cpu_nchw(x)}
         h, w = x.shape[1], x.shape[2]
 
         if trunk.pos_embed is not None:
@@ -2777,14 +2844,15 @@ def main():
                 trunk.retain_cls_token,
                 tiling=trunk.tile_abs_pos,
             )
+        debug_tensors["vision.pre_block.pos_embed_added"] = to_cpu_nchw(x)
 
         x = trunk.ln_pre(x)
+        debug_tensors["vision.pre_block.ln_pre"] = to_cpu_nchw(x)
 
         if trunk.retain_cls_token:
             raise NotImplementedError("debug export does not support retained cls token")
 
         block_outputs = []
-        debug_tensors = {}
         for block_idx, block in enumerate(trunk.blocks):
             if block_idx in debug_blocks:
                 debug_tensors[f"vision.block_debug.{block_idx}.input"] = to_cpu_nchw(x)
@@ -2988,20 +3056,26 @@ def main():
         print(f"  rendered steps: {len(rendered_steps)}")
         return
 
+    autocast_ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if device.type == "cuda"
+        else contextlib.nullcontext()
+    )
     with torch.inference_mode():
-        image_tensor = v2.functional.to_image(image).to(device)
-        preprocessed_image = build_preprocessed_image(v2, image_tensor, args.image_size)
-        trunk_outputs, block_outputs, debug_tensors = run_trunk_with_debug(
-            model.backbone.vision_backbone.trunk,
-            preprocessed_image,
-            args.debug_block,
-        )
+        with autocast_ctx:
+            image_tensor = v2.functional.to_image(image).to(device)
+            preprocessed_image = build_preprocessed_image(v2, image_tensor, args.image_size)
+            trunk_outputs, block_outputs, debug_tensors = run_trunk_with_debug(
+                model.backbone.vision_backbone.trunk,
+                preprocessed_image,
+                args.debug_block,
+            )
 
-        state = {
-            "original_height": image.height,
-            "original_width": image.width,
-            "backbone_out": model.backbone.forward_image(preprocessed_image),
-        }
+            state = {
+                "original_height": image.height,
+                "original_width": image.width,
+                "backbone_out": model.backbone.forward_image(preprocessed_image),
+            }
         find_input = processor.find_stage
 
         tokenizer = model.backbone.language_backbone.tokenizer
@@ -3009,56 +3083,57 @@ def main():
         input_ids = tokenizer([effective_prompt], context_length=context_length).to(device)
         attention_mask = (input_ids != 0).to(torch.uint8)
 
-        text_outputs = model.backbone.forward_text([effective_prompt], device=device)
-        state["backbone_out"].update(text_outputs)
-        backbone_out = state["backbone_out"]
-        if not args.vision_only:
-            if "geometric_prompt" not in state:
-                state["geometric_prompt"] = model._get_dummy_prompt()
-            if args.box:
-                box_labels = (
-                    args.box_label if args.box_label else [True for _ in args.box]
-                )
-                for model_box, label in zip(args.box, box_labels):
-                    boxes = torch.tensor(
-                        model_box, device=device, dtype=torch.float32
-                    ).view(1, 1, 4)
-                    labels = torch.tensor([label], device=device, dtype=torch.bool).view(
-                        1, 1
+        with autocast_ctx:
+            text_outputs = model.backbone.forward_text([effective_prompt], device=device)
+            state["backbone_out"].update(text_outputs)
+            backbone_out = state["backbone_out"]
+            if not args.vision_only:
+                if "geometric_prompt" not in state:
+                    state["geometric_prompt"] = model._get_dummy_prompt()
+                if args.box:
+                    box_labels = (
+                        args.box_label if args.box_label else [True for _ in args.box]
                     )
-                    state["geometric_prompt"].append_boxes(boxes, labels)
+                    for model_box, label in zip(args.box, box_labels):
+                        boxes = torch.tensor(
+                            model_box, device=device, dtype=torch.float32
+                        ).view(1, 1, 4)
+                        labels = torch.tensor([label], device=device, dtype=torch.bool).view(
+                            1, 1
+                        )
+                        state["geometric_prompt"].append_boxes(boxes, labels)
 
-            prompt, prompt_mask, backbone_out = model._encode_prompt(
-                backbone_out=backbone_out,
-                find_input=find_input,
-                geometric_prompt=state["geometric_prompt"],
-            )
-            backbone_out, encoder_out, _ = model._run_encoder(
-                backbone_out=backbone_out,
-                find_input=find_input,
-                prompt=prompt,
-                prompt_mask=prompt_mask,
-            )
-            out = {"encoder_hidden_states": encoder_out["encoder_hidden_states"]}
-            out, hs = model._run_decoder(
-                pos_embed=encoder_out["pos_embed"],
-                memory=out["encoder_hidden_states"],
-                src_mask=encoder_out["padding_mask"],
-                out=out,
-                prompt=prompt,
-                prompt_mask=prompt_mask,
-                encoder_out=encoder_out,
-            )
-            model._run_segmentation_heads(
-                out=out,
-                backbone_out=backbone_out,
-                img_ids=find_input.img_ids,
-                vis_feat_sizes=encoder_out["vis_feat_sizes"],
-                encoder_hidden_states=out["encoder_hidden_states"],
-                prompt=prompt,
-                prompt_mask=prompt_mask,
-                hs=hs,
-            )
+                prompt, prompt_mask, backbone_out = model._encode_prompt(
+                    backbone_out=backbone_out,
+                    find_input=find_input,
+                    geometric_prompt=state["geometric_prompt"],
+                )
+                backbone_out, encoder_out, _ = model._run_encoder(
+                    backbone_out=backbone_out,
+                    find_input=find_input,
+                    prompt=prompt,
+                    prompt_mask=prompt_mask,
+                )
+                out = {"encoder_hidden_states": encoder_out["encoder_hidden_states"]}
+                out, hs = model._run_decoder(
+                    pos_embed=encoder_out["pos_embed"],
+                    memory=out["encoder_hidden_states"],
+                    src_mask=encoder_out["padding_mask"],
+                    out=out,
+                    prompt=prompt,
+                    prompt_mask=prompt_mask,
+                    encoder_out=encoder_out,
+                )
+                model._run_segmentation_heads(
+                    out=out,
+                    backbone_out=backbone_out,
+                    img_ids=find_input.img_ids,
+                    vis_feat_sizes=encoder_out["vis_feat_sizes"],
+                    encoder_hidden_states=out["encoder_hidden_states"],
+                    prompt=prompt,
+                    prompt_mask=prompt_mask,
+                    hs=hs,
+                )
 
     tensors = {
         "inputs.image": to_cpu_contiguous(preprocessed_image),
@@ -3066,7 +3141,26 @@ def main():
         "inputs.attention_mask": to_cpu_contiguous(attention_mask),
         "text.input_embeddings": to_cpu_contiguous(text_outputs["language_embeds"]),
         "text.memory": to_cpu_contiguous(text_outputs["language_features"]),
+        "vision.weights.patch_embed.proj.weight": to_cpu_contiguous(
+            model.backbone.vision_backbone.trunk.patch_embed.proj.weight
+        ),
     }
+    if model.backbone.vision_backbone.trunk.patch_embed.proj.bias is not None:
+        tensors["vision.weights.patch_embed.proj.bias"] = to_cpu_contiguous(
+            model.backbone.vision_backbone.trunk.patch_embed.proj.bias
+        )
+    if model.backbone.vision_backbone.trunk.pos_embed is not None:
+        tensors["vision.weights.pos_embed"] = to_cpu_contiguous(
+            model.backbone.vision_backbone.trunk.pos_embed
+        )
+    if hasattr(model.backbone.vision_backbone.trunk.ln_pre, "weight"):
+        tensors["vision.weights.ln_pre.weight"] = to_cpu_contiguous(
+            model.backbone.vision_backbone.trunk.ln_pre.weight
+        )
+    if hasattr(model.backbone.vision_backbone.trunk.ln_pre, "bias"):
+        tensors["vision.weights.ln_pre.bias"] = to_cpu_contiguous(
+            model.backbone.vision_backbone.trunk.ln_pre.bias
+        )
     if args.box:
         box_label_tensor = torch.tensor(
             args.box_label if args.box_label else [True for _ in args.box],

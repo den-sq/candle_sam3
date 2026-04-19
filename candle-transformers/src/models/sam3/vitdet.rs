@@ -567,17 +567,32 @@ impl Sam3ViTDetTrunk {
         }
         let patch_height = image_height / self.config.patch_size;
         let patch_width = image_width / self.config.patch_size;
+        let mut debug_tensors = BTreeMap::new();
         let mut hidden_states = self.patch_embed.forward(images)?;
+        if !debug_blocks.is_empty() {
+            debug_tensors.insert(
+                "vision.pre_block.patch_embed".to_owned(),
+                hidden_states.clone(),
+            );
+        }
         if let Some(pos_embed) = &self.pos_embed {
             let pos_embed = tile_position_embeddings(pos_embed, patch_height, patch_width)?;
             hidden_states = hidden_states.broadcast_add(&pos_embed)?;
         }
+        if !debug_blocks.is_empty() {
+            debug_tensors.insert(
+                "vision.pre_block.pos_embed_added".to_owned(),
+                hidden_states.clone(),
+            );
+        }
         if let Some(pre_layer_norm) = &self.pre_layer_norm {
             hidden_states = pre_layer_norm.forward(&hidden_states)?;
         }
+        if !debug_blocks.is_empty() {
+            debug_tensors.insert("vision.pre_block.ln_pre".to_owned(), hidden_states.clone());
+        }
         let mut block_outputs =
             collect_block_outputs.then(|| Vec::with_capacity(self.blocks.len()));
-        let mut debug_tensors = BTreeMap::new();
         for (block_index, block) in self.blocks.iter().enumerate() {
             if debug_blocks.contains(&block_index) {
                 let (next_hidden_states, block_debug) =
@@ -609,7 +624,7 @@ mod tests {
     use std::collections::HashMap;
 
     use candle::{DType, Device, IndexOp, Result, Tensor};
-    use candle_nn::VarBuilder;
+    use candle_nn::{Conv2d, Conv2dConfig, Module, VarBuilder};
 
     use super::Sam3ViTDetTrunk;
     use crate::models::sam3::VisionConfig;
@@ -779,6 +794,156 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn interactive_visual_fixture_block0_substages_match_external_reference() -> Result<()> {
+        let fixture_path = std::env::var("SAM3_BLOCK0_DEBUG_FIXTURE").map_err(|_| {
+            candle::Error::Msg(
+                "set SAM3_BLOCK0_DEBUG_FIXTURE to a reference.safetensors block-debug export"
+                    .to_owned(),
+            )
+        })?;
+        let device = test_device()?;
+        let fixture = candle::safetensors::load(PathBuf::from(&fixture_path), &device).map_err(
+            |err| {
+                candle::Error::Msg(format!(
+                    "failed to load block0 debug fixture {}: {err}",
+                    fixture_path
+                ))
+            },
+        )?;
+        let mut weights =
+            load_interactive_visual_fixture_tensors("vision_backbone_weights.safetensors", &device)?;
+        if let Some(exported_weights) = fixture_trunk_weights(&fixture)? {
+            weights.extend(exported_weights);
+        }
+        let vb = VarBuilder::from_tensors(weights, DType::F32, &device);
+        let trunk = Sam3ViTDetTrunk::new(&VisionConfig::default(), vb.pp("trunk"))?;
+        let image = fixture_tensor(&fixture, "inputs.image")?.clone();
+        let (_, _, debug_tensors) = trunk.forward_with_debug_blocks(&image, &[0])?;
+
+        let mut failures = Vec::new();
+        for name in [
+            "vision.pre_block.patch_embed",
+            "vision.pre_block.pos_embed_added",
+            "vision.pre_block.ln_pre",
+            "vision.block_debug.0.input",
+            "vision.block_debug.0.norm1",
+            "vision.block_debug.0.attn_output",
+            "vision.block_debug.0.post_attn",
+            "vision.block_debug.0.norm2",
+            "vision.block_debug.0.mlp_fc1",
+            "vision.block_debug.0.mlp_gelu",
+            "vision.block_debug.0.mlp_output",
+            "vision.block_debug.0.output",
+        ] {
+            let actual = debug_tensors.get(name).ok_or_else(|| {
+                candle::Error::Msg(format!("missing debug tensor `{name}` from Candle trunk"))
+            })?;
+            let actual = actual.permute((0, 3, 1, 2))?;
+            let expected = fixture_tensor(&fixture, name)?;
+            let max_abs_diff = tensor_max_abs_diff(&actual, expected)?;
+            println!("{name}: max_abs_diff={max_abs_diff:.8}");
+            if max_abs_diff > 1e-5 {
+                failures.push((name, max_abs_diff));
+            }
+        }
+        if let Some((name, max_abs_diff)) = failures.first() {
+            candle::bail!(
+                "{name}: max_abs_diff={max_abs_diff:.8} exceeded atol=0.00001000"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "fixture-driven parity investigation"]
+    fn interactive_visual_fixture_patch_embed_manual_diagnostic() -> Result<()> {
+        let fixture_path = std::env::var("SAM3_BLOCK0_DEBUG_FIXTURE").map_err(|_| {
+            candle::Error::Msg(
+                "set SAM3_BLOCK0_DEBUG_FIXTURE to a reference.safetensors block-debug export"
+                    .to_owned(),
+            )
+        })?;
+        let device = test_device()?;
+        let fixture = candle::safetensors::load(PathBuf::from(&fixture_path), &device).map_err(
+            |err| {
+                candle::Error::Msg(format!(
+                    "failed to load block0 debug fixture {}: {err}",
+                    fixture_path
+                ))
+            },
+        )?;
+        let mut weights =
+            load_interactive_visual_fixture_tensors("vision_backbone_weights.safetensors", &device)?;
+        if let Some(exported_weights) = fixture_trunk_weights(&fixture)? {
+            weights.extend(exported_weights);
+        }
+        let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &device);
+        let trunk = Sam3ViTDetTrunk::new(&VisionConfig::default(), vb.pp("trunk"))?;
+        let image = fixture_tensor(&fixture, "inputs.image")?.clone();
+        let (_, _, debug_tensors) = trunk.forward_with_debug_blocks(&image, &[0])?;
+        let conv_patch = debug_tensors
+            .get("vision.pre_block.patch_embed")
+            .ok_or_else(|| {
+                candle::Error::Msg("missing Candle patch_embed debug tensor".to_owned())
+            })?
+            .permute((0, 3, 1, 2))?;
+        let expected_patch = fixture_tensor(&fixture, "vision.pre_block.patch_embed")?;
+
+        let patch_weight = weights
+            .get("trunk.patch_embed.proj.weight")
+            .ok_or_else(|| {
+                candle::Error::Msg(
+                    "interactive visual weights missing trunk.patch_embed.proj.weight".to_owned(),
+                )
+            })?
+            .clone();
+        let manual_patch = manual_patch_embed_no_bias(&image, &patch_weight, 14)?;
+
+        let conv_diff = tensor_max_abs_diff(&conv_patch, expected_patch)?;
+        let manual_diff = tensor_max_abs_diff(&manual_patch, expected_patch)?;
+        let conv_vs_manual = tensor_max_abs_diff(&conv_patch, &manual_patch)?;
+        println!("patch_embed conv vs upstream: {conv_diff:.8}");
+        println!("patch_embed manual vs upstream: {manual_diff:.8}");
+        println!("patch_embed conv vs manual: {conv_vs_manual:.8}");
+        if matches!(device, Device::Cuda(_)) {
+            let image_bf16 = image.to_dtype(DType::BF16)?;
+            let weight_bf16 = patch_weight.to_dtype(DType::BF16)?;
+            match manual_patch_embed_no_bias(&image_bf16, &weight_bf16, 14) {
+                Ok(manual_bf16) => {
+                    let manual_bf16_diff = tensor_max_abs_diff(&manual_bf16, expected_patch)?;
+                    let manual_bf16_vs_manual = tensor_max_abs_diff(&manual_bf16, &manual_patch)?;
+                    println!("patch_embed manual_bf16 vs upstream: {manual_bf16_diff:.8}");
+                    println!("patch_embed manual_bf16 vs manual_f32: {manual_bf16_vs_manual:.8}");
+                }
+                Err(err) => {
+                    println!("patch_embed manual_bf16 unavailable: {err}");
+                }
+            }
+            let conv_bf16 = Conv2d::new(
+                weight_bf16,
+                None,
+                Conv2dConfig {
+                    stride: 14,
+                    ..Default::default()
+                },
+            );
+            match conv_bf16.forward(&image_bf16) {
+                Ok(conv_bf16_out) => {
+                    let conv_bf16_diff = tensor_max_abs_diff(&conv_bf16_out, expected_patch)?;
+                    let conv_bf16_vs_f32 = tensor_max_abs_diff(&conv_bf16_out, &conv_patch)?;
+                    println!("patch_embed conv_bf16 vs upstream: {conv_bf16_diff:.8}");
+                    println!("patch_embed conv_bf16 vs conv_f32: {conv_bf16_vs_f32:.8}");
+                }
+                Err(err) => {
+                    println!("patch_embed conv_bf16 unavailable: {err}");
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn interactive_visual_fixture_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/sam3_interactive_visual_seed")
     }
@@ -818,6 +983,62 @@ mod tests {
             }
         }
         Ok(None)
+    }
+
+    fn fixture_trunk_weights(
+        fixture: &HashMap<String, Tensor>,
+    ) -> Result<Option<HashMap<String, Tensor>>> {
+        let mut weights = HashMap::new();
+        for (fixture_key, tensor) in fixture.iter() {
+            let Some(weight_key) = fixture_key.strip_prefix("vision.weights.") else {
+                continue;
+            };
+            weights.insert(format!("trunk.{weight_key}"), tensor.clone());
+        }
+        if weights.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(weights))
+        }
+    }
+
+    fn manual_patch_embed_no_bias(
+        image: &Tensor,
+        weight: &Tensor,
+        patch_size: usize,
+    ) -> Result<Tensor> {
+        let (batch, channels, height, width) = image.dims4()?;
+        let (out_channels, in_channels, kernel_h, kernel_w) = weight.dims4()?;
+        if in_channels != channels || kernel_h != patch_size || kernel_w != patch_size {
+            candle::bail!(
+                "manual patch embed shape mismatch image={:?} weight={:?} patch_size={patch_size}",
+                image.dims(),
+                weight.dims()
+            );
+        }
+        if height % patch_size != 0 || width % patch_size != 0 {
+            candle::bail!(
+                "manual patch embed expects image divisible by patch size {patch_size}, got {height}x{width}"
+            );
+        }
+        let patch_h = height / patch_size;
+        let patch_w = width / patch_size;
+        let image = image.reshape((
+            batch,
+            channels,
+            patch_h,
+            patch_size,
+            patch_w,
+            patch_size,
+        ))?;
+        let image = image
+            .permute((0, 2, 4, 1, 3, 5))?
+            .reshape((batch * patch_h * patch_w, channels * patch_size * patch_size))?;
+        let weight = weight.reshape((out_channels, in_channels * patch_size * patch_size))?;
+        let output = image.matmul(&weight.transpose(0, 1)?)?;
+        output
+            .reshape((batch, patch_h, patch_w, out_channels))?
+            .permute((0, 3, 1, 2))
     }
 
     fn assert_tensor_close(
