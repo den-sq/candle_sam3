@@ -17,8 +17,9 @@ use super::{
     geometry::{EncodedPrompt, GeometryPrompt},
     image::{GroundingOutput, ImageSize},
     neck::VisualBackboneOutput,
+    tracker::resize_bilinear2d_antialias,
     text::TextEncoding,
-    Config, Sam3ImageModel, Sam3TrackerModel, TrackerFrameState,
+    Config, Sam3ImageModel, Sam3TrackerConfig, Sam3TrackerModel, TrackerFrameState,
 };
 
 const CLIP_EOT_TOKEN: &str = "<|endoftext|>";
@@ -157,6 +158,9 @@ pub struct VideoConfig {
     pub memory_frame_count: usize,
     pub max_memory_boxes: usize,
     pub derive_mask_centroid_points: bool,
+    pub fill_hole_area: usize,
+    pub max_point_num_in_prompt_enc: usize,
+    pub non_overlap_masks_for_output: bool,
 }
 
 impl Default for VideoConfig {
@@ -168,6 +172,25 @@ impl Default for VideoConfig {
             memory_frame_count: 6,
             max_memory_boxes: 2,
             derive_mask_centroid_points: true,
+            fill_hole_area: 16,
+            max_point_num_in_prompt_enc: 16,
+            non_overlap_masks_for_output: false,
+        }
+    }
+}
+
+impl VideoConfig {
+    fn from_tracker_config(config: &Sam3TrackerConfig) -> Self {
+        Self {
+            score_threshold: 0.5,
+            hotstart_delay: config.predictor.hotstart_delay,
+            max_objects: usize::MAX,
+            memory_frame_count: config.num_maskmem.saturating_sub(1),
+            max_memory_boxes: 2,
+            derive_mask_centroid_points: true,
+            fill_hole_area: config.predictor.fill_hole_area,
+            max_point_num_in_prompt_enc: config.predictor.max_point_num_in_prompt_enc,
+            non_overlap_masks_for_output: config.predictor.non_overlap_masks_for_output,
         }
     }
 }
@@ -371,7 +394,7 @@ impl VideoDebugRecorder {
             return false;
         }
         match stage {
-            "detector_grounding" | "tracker_seed" => object.prompt_frames.contains_key(&frame_idx),
+            "detector_grounding" | "tracker_seed" => object.has_prompt_on_frame(frame_idx),
             "propagation_input" | "first_propagated_output" => {
                 if !self.config.capture_first_propagated_only {
                     return true;
@@ -759,6 +782,7 @@ pub struct TrackedObject {
     pub display_score: Option<f32>,
     pub has_inference_history: bool,
     pub prompt_frames: BTreeMap<usize, SessionPrompt>,
+    pub mask_prompt_frames: BTreeMap<usize, Tensor>,
     pub frame_outputs: BTreeMap<usize, ObjectFrameOutput>,
     pub tracker_states: BTreeMap<usize, TrackerFrameState>,
 }
@@ -772,6 +796,7 @@ impl TrackedObject {
             display_score: None,
             has_inference_history: false,
             prompt_frames: BTreeMap::new(),
+            mask_prompt_frames: BTreeMap::new(),
             frame_outputs: BTreeMap::new(),
             tracker_states: BTreeMap::new(),
         }
@@ -789,9 +814,22 @@ impl TrackedObject {
         } else {
             self.prompt_frames.insert(frame_idx, prompt);
         }
+        self.mask_prompt_frames.remove(&frame_idx);
         self.last_updated_frame = frame_idx;
         self.frame_outputs.clear();
         self.tracker_states.clear();
+    }
+
+    fn add_mask_prompt(&mut self, frame_idx: usize, mask: Tensor) {
+        self.mask_prompt_frames.insert(frame_idx, mask);
+        self.prompt_frames.remove(&frame_idx);
+        self.last_updated_frame = frame_idx;
+        self.frame_outputs.clear();
+        self.tracker_states.clear();
+    }
+
+    fn has_prompt_on_frame(&self, frame_idx: usize) -> bool {
+        self.prompt_frames.contains_key(&frame_idx) || self.mask_prompt_frames.contains_key(&frame_idx)
     }
 
     fn nearest_prompt(
@@ -861,9 +899,11 @@ impl TrackedObject {
         match direction {
             PropagationDirection::Forward | PropagationDirection::Both => {
                 self.prompt_frames.range(..=frame_idx).next_back().is_some()
+                    || self.mask_prompt_frames.range(..=frame_idx).next_back().is_some()
             }
             PropagationDirection::Backward => {
                 self.prompt_frames.range(frame_idx..).next().is_some()
+                    || self.mask_prompt_frames.range(frame_idx..).next().is_some()
             }
         }
     }
@@ -1025,7 +1065,14 @@ impl Sam3VideoSession {
     fn prompt_frames(&self) -> BTreeSet<usize> {
         self.tracked_objects
             .values()
-            .flat_map(|object| object.prompt_frames.keys().copied())
+            .flat_map(|object| {
+                object
+                    .prompt_frames
+                    .keys()
+                    .chain(object.mask_prompt_frames.keys())
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
             .collect()
     }
 
@@ -1086,6 +1133,43 @@ impl Sam3VideoSession {
             .get_mut(&obj_id)
             .ok_or_else(|| candle::Error::Msg(format!("unknown obj_id {}", obj_id)))?;
         tracked.add_prompt(frame_idx, prompt, clear_old_points, clear_old_boxes);
+        self.invalidate_object_outputs(obj_id);
+        Ok(obj_id)
+    }
+
+    fn add_mask_prompt(
+        &mut self,
+        frame_idx: usize,
+        mask: Tensor,
+        obj_id: Option<u32>,
+        max_objects: usize,
+    ) -> Result<u32> {
+        if frame_idx >= self.num_frames() {
+            candle::bail!(
+                "frame_idx {} exceeds video length {}",
+                frame_idx,
+                self.num_frames()
+            );
+        }
+        let obj_id = match obj_id {
+            Some(obj_id) => obj_id,
+            None => {
+                if self.tracked_objects.len() >= max_objects {
+                    candle::bail!(
+                        "cannot allocate another tracked object because max_objects={} was reached",
+                        max_objects
+                    )
+                }
+                self.allocate_object(frame_idx)
+            }
+        };
+        let storage_device = self.storage_device().clone();
+        let tracked = self
+            .tracked_objects
+            .get_mut(&obj_id)
+            .ok_or_else(|| candle::Error::Msg(format!("unknown obj_id {}", obj_id)))?;
+        let mask = normalize_video_mask_prompt(&mask, &storage_device)?;
+        tracked.add_mask_prompt(frame_idx, mask);
         self.invalidate_object_outputs(obj_id);
         Ok(obj_id)
     }
@@ -1263,7 +1347,7 @@ impl<'a> Sam3VideoPredictor<'a> {
             model,
             tracker_core: Sam3VideoTrackerCore::new(tracker),
             device,
-            video_config: VideoConfig::default(),
+            video_config: VideoConfig::from_tracker_config(tracker.config()),
             debug_config: VideoDebugConfig::default(),
             sessions: HashMap::new(),
             next_session_id: 0,
@@ -1330,6 +1414,20 @@ impl<'a> Sam3VideoPredictor<'a> {
             clear_old_boxes,
             self.video_config.max_objects,
         )
+    }
+
+    pub fn add_mask_prompt(
+        &mut self,
+        session_id: &str,
+        frame_idx: usize,
+        mask: Tensor,
+        obj_id: Option<u32>,
+    ) -> Result<u32> {
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| candle::Error::Msg(format!("unknown session {}", session_id)))?;
+        session.add_mask_prompt(frame_idx, mask, obj_id, self.video_config.max_objects)
     }
 
     pub fn remove_object(&mut self, session_id: &str, obj_id: u32) -> Result<()> {
@@ -1468,26 +1566,396 @@ impl<'a> Sam3VideoTrackerCore<'a> {
 }
 
 impl Sam3VideoTrackerCore<'_> {
+    fn get_visual_prompt(
+        &self,
+        object: &TrackedObject,
+        frame_idx: usize,
+        prompt: &SessionPrompt,
+    ) -> Result<(SessionPrompt, bool)> {
+        let box_count = prompt.boxes.as_ref().map(Vec::len).unwrap_or(0);
+        let is_new_visual_prompt =
+            box_count > 0 && !object.has_inference_history && !object.frame_outputs.contains_key(&frame_idx);
+        if !is_new_visual_prompt {
+            return Ok((prompt.clone(), false));
+        }
+        if box_count != 1 {
+            candle::bail!(
+                "visual prompts (box as an initial prompt) should only have one box, but got {box_count}"
+            );
+        }
+        let mut visual_prompt = prompt.clone();
+        visual_prompt.points = None;
+        visual_prompt.point_labels = None;
+        visual_prompt.boxes = prompt.boxes.as_ref().map(|boxes| vec![boxes[0]]);
+        visual_prompt.box_labels = prompt.box_labels.as_ref().map(|labels| vec![labels[0]]);
+        Ok((visual_prompt, true))
+    }
+
+    fn run_visual_prompt_seed_frame(
+        &self,
+        config: &VideoConfig,
+        model: &Sam3ImageModel,
+        compute_device: &Device,
+        session: &mut Sam3VideoSession,
+        frame_idx: usize,
+        object: &TrackedObject,
+        prompt: &SessionPrompt,
+        direction: PropagationDirection,
+    ) -> Result<(ObjectFrameOutput, TrackerFrameState, Option<f32>)> {
+        let visual_features = session.get_visual_features(model, compute_device, frame_idx)?;
+        let tracker_visual_features = tracker_visual_output(&visual_features);
+        let (visual_prompt, used_visual_prompt) = self.get_visual_prompt(object, frame_idx, prompt)?;
+        let used_visual_text_prompt = used_visual_prompt && prompt.text.is_none();
+        let geometry_prompt = session_prompt_to_geometry(&visual_prompt, compute_device)?;
+        let geometry_encoding = if geometry_prompt.is_empty() {
+            None
+        } else {
+            Some(model.encode_geometry_prompt(&geometry_prompt, &visual_features)?)
+        };
+        let text_encoding = match prompt.text.as_ref() {
+            Some(text) => Some(session.cached_text_encoding(model, text, compute_device)?),
+            None if used_visual_prompt => Some(session.cached_text_encoding(model, "visual", compute_device)?),
+            None => None,
+        };
+        let encoded_prompt = combine_encoded_prompts(text_encoding.as_ref(), geometry_encoding.as_ref())?
+            .ok_or_else(|| candle::Error::Msg("visual prompt path produced no encoded prompt".to_owned()))?;
+        let grounding = ground_from_encoded_prompt(model, &visual_features, &encoded_prompt)?;
+        let detector_output = grounding_to_object_output(
+            object.obj_id,
+            &grounding,
+            Some(frame_idx),
+            Vec::new(),
+            prompt.text.clone(),
+            true,
+            false,
+            session.video_size(),
+        )?;
+        if let Some(recorder) = session.debug_recorder_mut() {
+            recorder.record_detector_grounding(
+                object,
+                frame_idx,
+                direction,
+                debug_prompt_metadata(prompt, used_visual_text_prompt)?,
+                &detector_output,
+            )?;
+        }
+        let mut tracker_mask_input = normalize_video_mask_prompt(&grounding.mask_logits, compute_device)?;
+        let (_, _, height, width) = tracker_mask_input.dims4()?;
+        let tracker_input_size = self.tracker.input_mask_size();
+        if height != tracker_input_size || width != tracker_input_size {
+            tracker_mask_input = tracker_mask_input.upsample_bilinear2d(
+                tracker_input_size,
+                tracker_input_size,
+                false,
+            )?;
+        }
+        let tracker_mask_input = tracker_mask_input.gt(0f64)?.to_dtype(DType::F32)?;
+        let tracker_state = self.tracker.track_frame(
+            &tracker_visual_features,
+            frame_idx,
+            session.num_frames(),
+            None,
+            None,
+            None,
+            Some(&tracker_mask_input),
+            &BTreeMap::new(),
+            true,
+            false,
+            true,
+            false,
+        )?.state;
+        let detector_score = detector_output.score_value()?;
+        let mut seed_output = tracker_state_to_object_output(
+            object.obj_id,
+            &tracker_state,
+            Some(detector_score),
+            Some(frame_idx),
+            Vec::new(),
+            prompt.text.clone(),
+            true,
+            false,
+            session.video_size(),
+        )?;
+        seed_output.presence_scores = None;
+        apply_prompt_frame_output_postprocess(&mut seed_output, config)?;
+        if let Some(recorder) = session.debug_recorder_mut() {
+            recorder.record_tracker_seed(
+                object,
+                frame_idx,
+                direction,
+                debug_prompt_metadata(prompt, used_visual_text_prompt)?,
+                &seed_output,
+                &tracker_state,
+            )?;
+        }
+        Ok((seed_output, tracker_state, Some(detector_score)))
+    }
+
+    fn run_direct_tracker_prompt_seed_frame(
+        &self,
+        config: &VideoConfig,
+        model: &Sam3ImageModel,
+        compute_device: &Device,
+        session: &mut Sam3VideoSession,
+        frame_idx: usize,
+        object: &TrackedObject,
+        prompt: &SessionPrompt,
+        direction: PropagationDirection,
+    ) -> Result<(ObjectFrameOutput, TrackerFrameState, Option<f32>)> {
+        let visual_features =
+            tracker_visual_output(&session.get_visual_features(model, compute_device, frame_idx)?);
+        let prompt = truncate_prompt_for_encoder(prompt, config.max_point_num_in_prompt_enc);
+        let tracker_input_extent = self.tracker.config().image_size as f64;
+        let point_coords = match prompt.points.as_ref() {
+            Some(points) => {
+                let mut data = Vec::with_capacity(points.len() * 2);
+                for (x, y) in points {
+                    data.push(*x);
+                    data.push(*y);
+                }
+                Some(
+                    Tensor::from_vec(data, (1, points.len(), 2), compute_device)?
+                        .affine(tracker_input_extent, 0.0)?,
+                )
+            }
+            None => None,
+        };
+        let point_labels = prompt
+            .point_labels
+            .as_ref()
+            .map(|labels| Tensor::from_vec(labels.iter().map(|label| *label as f32).collect(), (1, labels.len()), compute_device))
+            .transpose()?;
+        let boxes_xyxy = match prompt.boxes.as_ref() {
+            Some(boxes) if !boxes.is_empty() => Some(
+                boxes_cxcywh_to_xyxy_tensor(boxes, compute_device)?
+                    .affine(tracker_input_extent, 0.0)?,
+            ),
+            _ => None,
+        };
+        let tracker_state = self.tracker.track_frame(
+            &visual_features,
+            frame_idx,
+            session.num_frames(),
+            point_coords.as_ref(),
+            point_labels.as_ref(),
+            boxes_xyxy.as_ref(),
+            None,
+            &BTreeMap::new(),
+            true,
+            false,
+            false,
+            false,
+        )?.state;
+        let mut output = tracker_state_to_object_output(
+            object.obj_id,
+            &tracker_state,
+            Some(1.0),
+            Some(frame_idx),
+            Vec::new(),
+            prompt.text.clone(),
+            prompt.has_geometry(),
+            false,
+            session.video_size(),
+        )?;
+        output.presence_scores = None;
+        apply_prompt_frame_output_postprocess(&mut output, config)?;
+        if let Some(recorder) = session.debug_recorder_mut() {
+            recorder.record_tracker_seed(
+                object,
+                frame_idx,
+                direction,
+                debug_prompt_metadata(&prompt, false)?,
+                &output,
+                &tracker_state,
+            )?;
+        }
+        Ok((output, tracker_state, Some(1.0)))
+    }
+
+    fn run_mask_prompt_seed_frame(
+        &self,
+        config: &VideoConfig,
+        model: &Sam3ImageModel,
+        compute_device: &Device,
+        session: &mut Sam3VideoSession,
+        frame_idx: usize,
+        object: &TrackedObject,
+        mask_prompt: &Tensor,
+        direction: PropagationDirection,
+    ) -> Result<(ObjectFrameOutput, TrackerFrameState, Option<f32>)> {
+        let visual_features =
+            tracker_visual_output(&session.get_visual_features(model, compute_device, frame_idx)?);
+        let video_mask = resize_mask_prompt_to_video(mask_prompt, session.video_size(), compute_device)?
+            .ge(0.5f32)?
+            .to_dtype(DType::F32)?;
+        let tracker_mask = resize_mask_prompt_to_tracker_input(
+            mask_prompt,
+            self.tracker.input_mask_size(),
+            compute_device,
+        )?
+        .ge(0.5f32)?
+        .to_dtype(DType::F32)?;
+        let tracker_state = self.tracker.track_frame(
+            &visual_features,
+            frame_idx,
+            session.num_frames(),
+            None,
+            None,
+            None,
+            Some(&tracker_mask),
+            &BTreeMap::new(),
+            true,
+            false,
+            true,
+            false,
+        )?.state;
+        let mut output = mask_prompt_to_object_output(
+            object.obj_id,
+            &video_mask,
+            &tracker_state,
+            Some(frame_idx),
+            session.video_size(),
+        )?;
+        apply_prompt_frame_output_postprocess(&mut output, config)?;
+        let display_score = output.score_value().ok();
+        if let Some(recorder) = session.debug_recorder_mut() {
+            recorder.record_tracker_seed(
+                object,
+                frame_idx,
+                direction,
+                debug_prompt_metadata(
+                    &SessionPrompt {
+                        text: None,
+                        points: None,
+                        point_labels: None,
+                        boxes: None,
+                        box_labels: None,
+                    },
+                    false,
+                )?,
+                &output,
+                &tracker_state,
+            )?;
+        }
+        Ok((output, tracker_state, display_score))
+    }
+
     fn process_frame(
         &self,
         model: &Sam3ImageModel,
         compute_device: &Device,
-        config: &VideoConfig,
+        _config: &VideoConfig,
         session: &mut Sam3VideoSession,
         frame_idx: usize,
         direction: PropagationDirection,
         _output_threshold: f32,
     ) -> Result<VideoFrameOutput> {
-        let _ = model;
-        let _ = compute_device;
-        let _ = config;
-        let _ = session;
-        let _ = frame_idx;
-        let _ = direction;
-        let _ = self.tracker;
-        candle::bail!(
-            "SAM3 video tracker strict port in progress; legacy tracker orchestration was removed. See candle-transformers/src/models/sam3/VIDEO_TRACKER_STRICT_PORT.md."
-        )
+        let obj_ids: Vec<u32> = session.tracked_objects.keys().copied().collect();
+        let mut frame_objects = Vec::new();
+        for obj_id in obj_ids {
+            if let Some(cached) = session
+                .frame_outputs
+                .get(&frame_idx)
+                .and_then(|frame_outputs| frame_outputs.get(&obj_id))
+                .cloned()
+            {
+                frame_objects.push(cached.to_storage_device(compute_device)?);
+                continue;
+            }
+            let (prompt, mask_prompt, has_history, is_active) = {
+                let object = session
+                    .tracked_objects
+                    .get(&obj_id)
+                    .ok_or_else(|| candle::Error::Msg(format!("unknown obj_id {}", obj_id)))?;
+                (
+                    object.prompt_frames.get(&frame_idx).cloned(),
+                    object.mask_prompt_frames.get(&frame_idx).cloned(),
+                    object.has_inference_history || !object.frame_outputs.is_empty() || !object.tracker_states.is_empty(),
+                    object.is_active_for_frame(frame_idx, direction),
+                )
+            };
+            let Some(object_snapshot) = session.tracked_objects.get(&obj_id).cloned() else {
+                continue;
+            };
+            let seed_result = if let Some(mask_prompt) = mask_prompt {
+                if has_history {
+                    candle::bail!(
+                        "SAM3 video tracker strict port currently supports initial mask prompts only; refinement/correction lands in a later step."
+                    );
+                }
+                Some(self.run_mask_prompt_seed_frame(
+                    _config,
+                    model,
+                    compute_device,
+                    session,
+                    frame_idx,
+                    &object_snapshot,
+                    &mask_prompt,
+                    direction,
+                )?)
+            } else if let Some(prompt) = prompt {
+                if has_history {
+                    candle::bail!(
+                        "SAM3 video tracker strict port currently supports prompt-frame seeding only; refinement/correction lands in a later step."
+                    );
+                }
+                if prompt.text.is_some() || prompt.boxes.as_ref().map(|boxes| !boxes.is_empty()).unwrap_or(false) {
+                    Some(self.run_visual_prompt_seed_frame(
+                        _config,
+                        model,
+                        compute_device,
+                        session,
+                        frame_idx,
+                        &object_snapshot,
+                        &prompt,
+                        direction,
+                    )?)
+                } else {
+                    Some(self.run_direct_tracker_prompt_seed_frame(
+                        _config,
+                        model,
+                        compute_device,
+                        session,
+                        frame_idx,
+                        &object_snapshot,
+                        &prompt,
+                        direction,
+                    )?)
+                }
+            } else {
+                if is_active {
+                    candle::bail!(
+                        "SAM3 video tracker strict port currently supports prompt frames only; memory-conditioned propagation lands in a later step."
+                    );
+                }
+                None
+            };
+            let Some((output, tracker_state, display_score)) = seed_result else {
+                continue;
+            };
+
+            let output_storage = output.to_storage_device(session.storage_device())?;
+            let tracker_storage = move_tracker_state(&tracker_state, session.storage_device())?;
+            session
+                .frame_outputs
+                .entry(frame_idx)
+                .or_default()
+                .insert(obj_id, output_storage.clone());
+            if let Some(object) = session.tracked_objects.get_mut(&obj_id) {
+                object.frame_outputs.insert(frame_idx, output_storage);
+                object.tracker_states.insert(frame_idx, tracker_storage);
+                object.has_inference_history = true;
+                object.last_updated_frame = frame_idx;
+                if let Some(display_score) = display_score {
+                    object.display_score = Some(display_score);
+                }
+            }
+            frame_objects.push(output);
+        }
+        Ok(VideoFrameOutput {
+            frame_idx,
+            objects: frame_objects,
+        })
     }
 }
 
@@ -1784,6 +2252,24 @@ fn load_frame_blob(
     image_std: [f32; 3],
     expected_video_size: ImageSize,
 ) -> Result<FrameBlob> {
+    if matches!(
+        image_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("jpg" | "jpeg")
+    ) {
+        if let Ok(blob) = load_jpeg_frame_blob_via_pillow(
+            image_path,
+            image_size,
+            image_mean,
+            image_std,
+            expected_video_size,
+        ) {
+            return Ok(blob);
+        }
+    }
     let image = ImageReader::open(image_path)?
         .decode()
         .map_err(candle::Error::wrap)?
@@ -1798,6 +2284,99 @@ fn load_frame_blob(
     )
 }
 
+fn load_jpeg_frame_blob_via_pillow(
+    image_path: &Path,
+    image_size: usize,
+    image_mean: [f32; 3],
+    image_std: [f32; 3],
+    expected_video_size: ImageSize,
+) -> Result<FrameBlob> {
+    let python = find_pillow_python()
+        .ok_or_else(|| candle::Error::Msg("no Pillow-capable python interpreter found".to_owned()))?;
+    let script = r#"
+import struct
+import sys
+from PIL import Image
+
+image_path = sys.argv[1]
+image_size = int(sys.argv[2])
+
+image = Image.open(image_path).convert("RGB")
+orig_w, orig_h = image.size
+if image.size != (image_size, image_size):
+    image = image.resize((image_size, image_size), Image.Resampling.BICUBIC)
+raw = image.tobytes()
+sys.stdout.buffer.write(struct.pack("<II", orig_w, orig_h))
+sys.stdout.buffer.write(raw)
+"#;
+    let output = Command::new(&python)
+        .arg("-c")
+        .arg(script)
+        .arg(image_path)
+        .arg(image_size.to_string())
+        .output()
+        .map_err(candle::Error::wrap)?;
+    if !output.status.success() {
+        candle::bail!(
+            "Pillow frame load failed for {} via {}: {}",
+            image_path.display(),
+            python.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if output.stdout.len() < 8 {
+        candle::bail!(
+            "Pillow frame load returned truncated output for {}",
+            image_path.display()
+        );
+    }
+    let width = u32::from_le_bytes(output.stdout[0..4].try_into().unwrap()) as usize;
+    let height = u32::from_le_bytes(output.stdout[4..8].try_into().unwrap()) as usize;
+    let current_size = ImageSize::new(height, width);
+    if current_size != expected_video_size {
+        candle::bail!(
+            "frame {} has size {}x{} but the session expects {}x{}",
+            image_path.display(),
+            current_size.height,
+            current_size.width,
+            expected_video_size.height,
+            expected_video_size.width
+        );
+    }
+    let expected_bytes = image_size * image_size * 3;
+    let raw = &output.stdout[8..];
+    if raw.len() != expected_bytes {
+        candle::bail!(
+            "Pillow frame load returned {} bytes for resized frame {}, expected {}",
+            raw.len(),
+            image_path.display(),
+            expected_bytes
+        );
+    }
+    let image = Tensor::from_vec(raw.to_vec(), (image_size, image_size, 3), &Device::Cpu)?
+        .permute((2, 0, 1))?;
+    let normalized =
+        normalize_image_for_sam3(&(image.to_dtype(DType::F32)?.unsqueeze(0)? / 255.)?, image_mean, image_std)?
+            .squeeze(0)?;
+    Ok(FrameBlob {
+        data: normalized.flatten_all()?.to_vec1::<f32>()?,
+        frame_size: ImageSize::square(image_size),
+    })
+}
+
+fn find_pillow_python() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("SAM3_PILLOW_PYTHON").map(PathBuf::from) {
+        candidates.push(path);
+    }
+    candidates.push(PathBuf::from(".venv/bin/python"));
+    candidates.push(PathBuf::from("/home/dnorthover/ChengCode/candle_sam3/.venv/bin/python"));
+    candidates.push(PathBuf::from("python3"));
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_absolute() || candidate.exists() || candidate == Path::new("python3"))
+}
+
 fn frame_blob_from_rgb_image(
     image: image::RgbImage,
     image_size: usize,
@@ -1805,6 +2384,26 @@ fn frame_blob_from_rgb_image(
     image_std: [f32; 3],
     expected_video_size: ImageSize,
     source_label: &str,
+) -> Result<FrameBlob> {
+    frame_blob_from_rgb_image_with_filter(
+        image,
+        image_size,
+        image_mean,
+        image_std,
+        expected_video_size,
+        source_label,
+        image::imageops::FilterType::CatmullRom,
+    )
+}
+
+fn frame_blob_from_rgb_image_with_filter(
+    image: image::RgbImage,
+    image_size: usize,
+    image_mean: [f32; 3],
+    image_std: [f32; 3],
+    expected_video_size: ImageSize,
+    source_label: &str,
+    resize_filter: image::imageops::FilterType,
 ) -> Result<FrameBlob> {
     let (width, height) = image.dimensions();
     let current_size = ImageSize::new(height as usize, width as usize);
@@ -1819,14 +2418,25 @@ fn frame_blob_from_rgb_image(
         );
     }
 
+    let resized = if expected_video_size.height == image_size && expected_video_size.width == image_size {
+        image
+    } else {
+        image::imageops::resize(
+            &image,
+            image_size as u32,
+            image_size as u32,
+            resize_filter,
+        )
+    };
     let image = Tensor::from_vec(
-        image.into_raw(),
-        (expected_video_size.height, expected_video_size.width, 3),
+        resized.into_raw(),
+        (image_size, image_size, 3),
         &Device::Cpu,
     )?
     .permute((2, 0, 1))?;
-    let resized = resize_image_exact_for_sam3(&image, image_size)?;
-    let normalized = normalize_image_for_sam3(&resized, image_mean, image_std)?.squeeze(0)?;
+    let normalized =
+        normalize_image_for_sam3(&(image.to_dtype(DType::F32)?.unsqueeze(0)? / 255.)?, image_mean, image_std)?
+            .squeeze(0)?;
     Ok(FrameBlob {
         data: normalized.flatten_all()?.to_vec1::<f32>()?,
         frame_size: ImageSize::square(image_size),
@@ -2050,21 +2660,6 @@ fn sorted_image_paths(dir_path: &Path) -> Result<Vec<PathBuf>> {
     Ok(image_paths)
 }
 
-fn resize_image_exact_for_sam3(image_chw: &Tensor, image_size: usize) -> Result<Tensor> {
-    let image = match image_chw.rank() {
-        3 => image_chw.unsqueeze(0)?,
-        4 => image_chw.clone(),
-        rank => candle::bail!(
-            "sam3 exact resize expects CHW or BCHW image, got rank {}",
-            rank
-        ),
-    };
-    let image = image
-        .to_dtype(DType::F32)?
-        .upsample_bilinear2d(image_size, image_size, false)?;
-    image / 255.
-}
-
 fn normalize_image_for_sam3(
     image_bchw: &Tensor,
     image_mean: [f32; 3],
@@ -2219,6 +2814,18 @@ fn move_visual_output(
     })
 }
 
+fn tracker_visual_output(output: &VisualBackboneOutput) -> VisualBackboneOutput {
+    match (&output.sam2_backbone_fpn, &output.sam2_pos_enc) {
+        (Some(backbone_fpn), Some(vision_pos_enc)) => VisualBackboneOutput {
+            backbone_fpn: backbone_fpn.clone(),
+            vision_pos_enc: vision_pos_enc.clone(),
+            sam2_backbone_fpn: output.sam2_backbone_fpn.clone(),
+            sam2_pos_enc: output.sam2_pos_enc.clone(),
+        },
+        _ => output.clone(),
+    }
+}
+
 fn debug_prompt_metadata(
     prompt: &SessionPrompt,
     used_visual_text_prompt: bool,
@@ -2243,6 +2850,116 @@ fn debug_prompt_metadata(
             .collect(),
         box_labels: prompt.box_labels.clone().unwrap_or_default(),
     })
+}
+
+fn normalize_video_mask_prompt(mask: &Tensor, device: &Device) -> Result<Tensor> {
+    let mask = mask.to_device(device)?.to_dtype(DType::F32)?;
+    match mask.rank() {
+        2 => mask.unsqueeze(0)?.unsqueeze(0),
+        3 => mask.unsqueeze(1),
+        4 => Ok(mask),
+        rank => candle::bail!("expected video mask prompt rank 2/3/4, got {rank}"),
+    }
+}
+
+fn move_tracker_state(state: &TrackerFrameState, device: &Device) -> Result<TrackerFrameState> {
+    Ok(TrackerFrameState {
+        low_res_masks: state.low_res_masks.to_device(device)?,
+        high_res_masks: state.high_res_masks.to_device(device)?,
+        iou_scores: state.iou_scores.to_device(device)?,
+        obj_ptr: state.obj_ptr.to_device(device)?,
+        object_score_logits: state.object_score_logits.to_device(device)?,
+        maskmem_features: state
+            .maskmem_features
+            .as_ref()
+            .map(|tensor| tensor.to_device(device))
+            .transpose()?,
+        maskmem_pos_enc: state
+            .maskmem_pos_enc
+            .as_ref()
+            .map(|tensor| tensor.to_device(device))
+            .transpose()?,
+        is_cond_frame: state.is_cond_frame,
+    })
+}
+
+fn resize_mask_prompt_to_video(
+    mask_prompt: &Tensor,
+    video_size: ImageSize,
+    device: &Device,
+) -> Result<Tensor> {
+    let mask_prompt = normalize_video_mask_prompt(mask_prompt, device)?;
+    let (_, _, height, width) = mask_prompt.dims4()?;
+    if height == video_size.height && width == video_size.width {
+        Ok(mask_prompt)
+    } else {
+        resize_bilinear2d_antialias(&mask_prompt, video_size.height, video_size.width)
+    }
+}
+
+fn resize_mask_prompt_to_tracker_input(
+    mask_prompt: &Tensor,
+    input_mask_size: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let mask_prompt = normalize_video_mask_prompt(mask_prompt, device)?;
+    let (_, _, height, width) = mask_prompt.dims4()?;
+    if height == input_mask_size && width == input_mask_size {
+        Ok(mask_prompt)
+    } else {
+        resize_bilinear2d_antialias(&mask_prompt, input_mask_size, input_mask_size)
+    }
+}
+
+fn binary_mask_logits(mask: &Tensor) -> Result<Tensor> {
+    let mask = mask.to_dtype(DType::F32)?;
+    let binary = mask.ge(0.5f32)?.to_dtype(DType::F32)?;
+    binary.affine(2048.0, -1024.0)
+}
+
+fn canonicalize_single_score_tensor(tensor: &Tensor) -> Result<Tensor> {
+    let value = tensor.flatten_all()?.to_vec1::<f32>()?.into_iter().next().unwrap_or(0.0);
+    Tensor::from_vec(vec![value], (1,), tensor.device())
+}
+
+fn mask_prompt_to_object_output(
+    obj_id: u32,
+    video_mask_probs: &Tensor,
+    tracker_state: &TrackerFrameState,
+    prompt_frame_idx: Option<usize>,
+    _video_size: ImageSize,
+) -> Result<ObjectFrameOutput> {
+    let mask_logits = binary_mask_logits(video_mask_probs)?;
+    let masks = video_mask_probs.ge(0.5f32)?.to_dtype(DType::F32)?;
+    Ok(ObjectFrameOutput {
+        obj_id,
+        mask_logits,
+        masks: masks.clone(),
+        boxes_xyxy: mask_to_normalized_xyxy(&masks)?,
+        scores: canonicalize_single_score_tensor(&candle_nn::ops::sigmoid(&tracker_state.object_score_logits)?)?,
+        presence_scores: None,
+        prompt_frame_idx,
+        memory_frame_indices: Vec::new(),
+        text_prompt: None,
+        used_explicit_geometry: true,
+        reused_previous_output: false,
+    })
+}
+
+fn boxes_cxcywh_to_xyxy_tensor(
+    boxes_cxcywh: &[(f32, f32, f32, f32)],
+    device: &Device,
+) -> Result<Tensor> {
+    let mut data = Vec::with_capacity(boxes_cxcywh.len() * 4);
+    for (cx, cy, w, h) in boxes_cxcywh {
+        let half_w = *w / 2.0;
+        let half_h = *h / 2.0;
+        data.push(cx - half_w);
+        data.push(cy - half_h);
+        data.push(cx + half_w);
+        data.push(cy + half_h);
+    }
+    Tensor::from_vec(data, (boxes_cxcywh.len(), 2, 2), device)
 }
 
 fn tensor_to_mask_probs_2d(tensor: &Tensor) -> Result<Vec<Vec<f32>>> {
@@ -2327,6 +3044,44 @@ fn summarize_tracker_state(state: &TrackerFrameState) -> Result<VideoDebugTracke
             .map(|tensor| summarize_tensor(tensor, None))
             .transpose()?,
     })
+}
+
+fn truncate_prompt_for_encoder(prompt: &SessionPrompt, max_points: usize) -> SessionPrompt {
+    let Some(points) = prompt.points.as_ref() else {
+        return prompt.clone();
+    };
+    if max_points == 0 || points.len() <= max_points {
+        return prompt.clone();
+    }
+
+    let num_first = max_points / 2;
+    let num_last = max_points - num_first;
+    let mut truncated = prompt.clone();
+    let mut point_subset = Vec::with_capacity(max_points);
+    point_subset.extend_from_slice(&points[..num_first]);
+    point_subset.extend_from_slice(&points[points.len() - num_last..]);
+    truncated.points = Some(point_subset);
+    if let Some(labels) = prompt.point_labels.as_ref() {
+        let mut label_subset = Vec::with_capacity(max_points);
+        label_subset.extend_from_slice(&labels[..num_first]);
+        label_subset.extend_from_slice(&labels[labels.len() - num_last..]);
+        truncated.point_labels = Some(label_subset);
+    }
+    truncated
+}
+
+fn apply_prompt_frame_output_postprocess(
+    output: &mut ObjectFrameOutput,
+    config: &VideoConfig,
+) -> Result<()> {
+    if config.fill_hole_area == 0 {
+        return Ok(());
+    }
+    output.mask_logits =
+        postprocess_low_res_mask_logits_for_video(&output.mask_logits, config.fill_hole_area)?;
+    output.masks = candle_nn::ops::sigmoid(&output.mask_logits)?;
+    output.boxes_xyxy = mask_to_normalized_xyxy(&output.masks)?;
+    Ok(())
 }
 
 fn session_prompt_to_geometry(prompt: &SessionPrompt, device: &Device) -> Result<GeometryPrompt> {
@@ -2783,6 +3538,341 @@ mod tests {
         let config = tiny_segmentation_config();
         let tracker_config = Sam3TrackerConfig::from_sam3_config(&config);
         Sam3TrackerModel::new(&tracker_config, VarBuilder::zeros(DType::F32, device))
+    }
+
+    fn sam3_test_checkpoint_path() -> Option<PathBuf> {
+        let env_path = std::env::var_os("SAM3_TEST_CHECKPOINT")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("SAM3_TEST_CHECKPOINT_DIR").map(PathBuf::from));
+        let mut candidates = Vec::new();
+        if let Some(path) = env_path {
+            candidates.push(path);
+        }
+        candidates.push(PathBuf::from("/home/dnorthover/extcode/hf_sam3"));
+        candidates.push(PathBuf::from("/home/dnorthover/extcode/hf_sam3/sam3.pt"));
+        candidates.into_iter().find_map(|path| {
+            if path.is_dir() {
+                let file = path.join("sam3.pt");
+                file.exists().then_some(file)
+            } else if path.exists() {
+                Some(path)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn load_runtime_models_from_checkpoint(
+    ) -> Result<Option<(Sam3ImageModel, Sam3TrackerModel, Device)>> {
+        let Some(checkpoint_path) = sam3_test_checkpoint_path() else {
+            return Ok(None);
+        };
+        let device = Device::Cpu;
+        let config = Config::default();
+        let checkpoint = crate::models::sam3::checkpoint::Sam3CheckpointSource::upstream_pth(
+            checkpoint_path,
+        );
+        let model = Sam3ImageModel::from_checkpoint_source(&config, &checkpoint, DType::F32, &device)?;
+        let tracker =
+            Sam3TrackerModel::from_checkpoint_source(&config, &checkpoint, DType::F32, &device)?;
+        Ok(Some((model, tracker, device)))
+    }
+
+    fn sam3_test_tokenizer_path() -> Option<PathBuf> {
+        let checkpoint_path = sam3_test_checkpoint_path()?;
+        let tokenizer = checkpoint_path.parent()?.join("tokenizer.json");
+        tokenizer.exists().then_some(tokenizer)
+    }
+
+    fn reference_bundle_dir(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../candle-examples/examples/sam3")
+            .join(name)
+    }
+
+    fn reference_input_frames_dir(name: &str) -> PathBuf {
+        let bundle_dir = reference_bundle_dir(name);
+        let tracker_frames = bundle_dir.join("tracker_input_frames");
+        if tracker_frames.exists() {
+            tracker_frames
+        } else {
+            bundle_dir.join("frames")
+        }
+    }
+
+    fn load_reference_frame0_output(
+        bundle: &str,
+    ) -> Result<(Vec<f32>, f32, PathBuf)> {
+        let bundle_dir = reference_bundle_dir(bundle);
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(bundle_dir.join("video_results.json"))?)
+                .map_err(|err| candle::Error::Msg(err.to_string()))?;
+        let frames = match &value {
+            serde_json::Value::Array(frames) => frames,
+            serde_json::Value::Object(_) => value["frames"]
+                .as_array()
+                .ok_or_else(|| {
+                    candle::Error::Msg("reference video results missing frames array".to_owned())
+                })?,
+            _ => {
+                candle::bail!("reference video results must be an array or object with frames")
+            }
+        };
+        let frame0 = frames
+            .iter()
+            .find(|frame| frame["frame_idx"].as_u64() == Some(0))
+            .ok_or_else(|| candle::Error::Msg("reference video results missing frame 0".to_owned()))?;
+        let objects = frame0["objects"]
+            .as_array()
+            .ok_or_else(|| candle::Error::Msg("reference frame 0 missing objects array".to_owned()))?;
+        let object = &objects[0];
+        let boxes = object["boxes_xyxy"]
+            .as_array()
+            .and_then(|boxes| boxes.first())
+            .and_then(|first| first.as_array())
+            .ok_or_else(|| candle::Error::Msg("reference frame 0 missing boxes_xyxy".to_owned()))?
+            .iter()
+            .map(|value| value.as_f64().unwrap_or(0.0) as f32)
+            .collect::<Vec<_>>();
+        let score = object["scores"]
+            .as_array()
+            .and_then(|scores| scores.first())
+            .and_then(|value| value.as_f64())
+            .ok_or_else(|| candle::Error::Msg("reference frame 0 missing score".to_owned()))? as f32;
+        let mask_path = object["mask_path"]
+            .as_str()
+            .ok_or_else(|| candle::Error::Msg("reference frame 0 missing mask_path".to_owned()))?;
+        Ok((boxes, score, bundle_dir.join(mask_path)))
+    }
+
+    fn load_reference_box_prompt(bundle: &str) -> Result<(f32, f32, f32, f32)> {
+        let bundle_dir = reference_bundle_dir(bundle);
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(bundle_dir.join("reference.json"))?)
+            .map_err(|err| candle::Error::Msg(err.to_string()))?;
+        let boxes = value["boxes_cxcywh_normalized"]
+            .as_array()
+            .and_then(|boxes| boxes.first())
+            .and_then(|first| first.as_array())
+            .ok_or_else(|| candle::Error::Msg("reference bundle missing boxes_cxcywh_normalized".to_owned()))?;
+        Ok((
+            boxes[0].as_f64().unwrap_or(0.0) as f32,
+            boxes[1].as_f64().unwrap_or(0.0) as f32,
+            boxes[2].as_f64().unwrap_or(0.0) as f32,
+            boxes[3].as_f64().unwrap_or(0.0) as f32,
+        ))
+    }
+
+    fn load_reference_mask_prompt_box_xyxy(bundle: &str) -> Result<(f32, f32, f32, f32)> {
+        let bundle_dir = reference_bundle_dir(bundle);
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(bundle_dir.join("reference.json"))?)
+            .map_err(|err| candle::Error::Msg(err.to_string()))?;
+        let actions = value["scenario"]["actions"]
+            .as_array()
+            .ok_or_else(|| candle::Error::Msg("reference bundle missing scenario actions".to_owned()))?;
+        let mask = actions[0]["mask"]["box_xyxy"]
+            .as_array()
+            .ok_or_else(|| candle::Error::Msg("reference mask scenario missing box_xyxy".to_owned()))?;
+        Ok((
+            mask[0].as_f64().unwrap_or(0.0) as f32,
+            mask[1].as_f64().unwrap_or(0.0) as f32,
+            mask[2].as_f64().unwrap_or(0.0) as f32,
+            mask[3].as_f64().unwrap_or(0.0) as f32,
+        ))
+    }
+
+    fn load_reference_point_prompt(bundle: &str) -> Result<(Vec<(f32, f32)>, Vec<u32>)> {
+        let bundle_dir = reference_bundle_dir(bundle);
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(bundle_dir.join("reference.json"))?)
+                .map_err(|err| candle::Error::Msg(err.to_string()))?;
+        let actions = value["scenario"]["actions"]
+            .as_array()
+            .ok_or_else(|| candle::Error::Msg("reference bundle missing scenario actions".to_owned()))?;
+        let add_prompt = actions
+            .iter()
+            .find(|action| action["type"].as_str() == Some("add_prompt"))
+            .ok_or_else(|| candle::Error::Msg("reference bundle missing add_prompt action".to_owned()))?;
+        let points = add_prompt["points_xy_normalized"]
+            .as_array()
+            .ok_or_else(|| candle::Error::Msg("reference point scenario missing points_xy_normalized".to_owned()))?
+            .iter()
+            .map(|point| {
+                let point = point
+                    .as_array()
+                    .ok_or_else(|| {
+                        candle::Error::Msg(
+                            "reference point scenario contains a malformed point".to_owned(),
+                        )
+                    })?;
+                Ok((
+                    point[0].as_f64().unwrap_or(0.0) as f32,
+                    point[1].as_f64().unwrap_or(0.0) as f32,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let labels = add_prompt["point_labels"]
+            .as_array()
+            .ok_or_else(|| candle::Error::Msg("reference point scenario missing point_labels".to_owned()))?
+            .iter()
+            .map(|value| value.as_u64().unwrap_or(0) as u32)
+            .collect::<Vec<_>>();
+        Ok((points, labels))
+    }
+
+    fn load_reference_internal_manifest(bundle: &str) -> Result<serde_json::Value> {
+        let bundle_dir = reference_bundle_dir(bundle);
+        serde_json::from_slice(&fs::read(bundle_dir.join("debug/internal_manifest.json"))?)
+            .map_err(|err| candle::Error::Msg(err.to_string()))
+    }
+
+    fn apply_reference_predictor_runtime_overrides(
+        predictor: &mut Sam3VideoPredictor<'_>,
+        bundle: &str,
+    ) -> Result<()> {
+        let manifest = load_reference_internal_manifest(bundle)?;
+        let predictor_config = manifest["predictor_config"]
+            .as_object()
+            .ok_or_else(|| candle::Error::Msg("reference manifest missing predictor_config".to_owned()))?;
+        if let Some(fill_hole_area) = predictor_config
+            .get("fill_hole_area")
+            .and_then(|value| value.as_u64())
+        {
+            predictor.video_config.fill_hole_area = fill_hole_area as usize;
+        }
+        if let Some(max_point_num) = predictor_config
+            .get("max_point_num_in_prompt_enc")
+            .and_then(|value| value.as_u64())
+        {
+            predictor.video_config.max_point_num_in_prompt_enc = max_point_num as usize;
+        }
+        if let Some(non_overlap_masks_for_output) = predictor_config
+            .get("non_overlap_masks_for_output")
+            .and_then(|value| value.as_bool())
+        {
+            predictor.video_config.non_overlap_masks_for_output = non_overlap_masks_for_output;
+        }
+        Ok(())
+    }
+
+    fn load_reference_internal_tensor(bundle: &str, key: &str) -> Result<Tensor> {
+        use candle::safetensors::Load;
+
+        let bundle_dir = reference_bundle_dir(bundle);
+        let path = bundle_dir.join("debug/internal_fixtures.safetensors");
+        let tensors = unsafe { candle::safetensors::MmapedSafetensors::new(&path) }.map_err(
+            |err| {
+                candle::Error::Msg(format!(
+                    "failed to mmap reference fixtures {}: {err}",
+                    path.display()
+                ))
+            },
+        )?;
+        tensors
+            .get(key)
+            .map_err(|err| {
+                candle::Error::Msg(format!(
+                    "failed to read tensor `{key}` from reference fixtures {}: {err}",
+                    path.display()
+                ))
+            })?
+            .load(&Device::Cpu)
+    }
+
+    fn assert_tensor_close(label: &str, actual: &Tensor, expected: &Tensor, atol: f32) -> Result<()> {
+        if actual.shape() != expected.shape() {
+            candle::bail!(
+                "{label} shape mismatch: actual {:?}, expected {:?}",
+                actual.shape().dims(),
+                expected.shape().dims()
+            );
+        }
+        let actual = actual.to_dtype(DType::F32)?;
+        let expected = expected.to_dtype(DType::F32)?;
+        let max_abs_diff = actual
+            .broadcast_sub(&expected)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_vec0::<f32>()?;
+        if max_abs_diff > atol {
+            candle::bail!("{label} max abs diff {max_abs_diff:.6} exceeded tolerance {atol:.6}");
+        }
+        Ok(())
+    }
+
+    fn tensor_max_abs_diff(actual: &Tensor, expected: &Tensor) -> Result<f32> {
+        if actual.shape() != expected.shape() {
+            candle::bail!(
+                "shape mismatch when computing max abs diff: actual {:?}, expected {:?}",
+                actual.shape().dims(),
+                expected.shape().dims()
+            );
+        }
+        let actual = actual.to_dtype(DType::F32)?;
+        let expected = expected.to_dtype(DType::F32)?;
+        actual
+            .broadcast_sub(&expected)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_vec0::<f32>()
+    }
+
+    fn binary_mask_iou(actual: &Tensor, expected_path: &Path) -> Result<f32> {
+        let actual = tensor_to_mask_probs_2d(actual)?;
+        let expected = image::open(expected_path)
+            .map_err(|err| candle::Error::Msg(err.to_string()))?
+            .to_luma8();
+        let mut intersection = 0usize;
+        let mut union = 0usize;
+        for (y, row) in actual.iter().enumerate() {
+            for (x, value) in row.iter().enumerate() {
+                let actual_fg = *value >= 0.5;
+                let expected_fg = expected.get_pixel(x as u32, y as u32)[0] >= 128;
+                if actual_fg && expected_fg {
+                    intersection += 1;
+                }
+                if actual_fg || expected_fg {
+                    union += 1;
+                }
+            }
+        }
+        Ok(if union == 0 {
+            1.0
+        } else {
+            intersection as f32 / union as f32
+        })
+    }
+
+    fn assert_boxes_close(actual: &[f32], expected: &[f32], atol: f32) {
+        assert_eq!(actual.len(), expected.len());
+        for (idx, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() <= atol,
+                "box component {idx} mismatch: actual={actual}, expected={expected}, atol={atol}"
+            );
+        }
+    }
+
+    fn normalized_box_xyxy_to_mask_tensor(
+        box_xyxy: (f32, f32, f32, f32),
+        size: ImageSize,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let clamp = |value: f32| value.clamp(0.0, 1.0);
+        let x0 = (clamp(box_xyxy.0) * (size.width.saturating_sub(1)) as f32).round() as usize;
+        let y0 = (clamp(box_xyxy.1) * (size.height.saturating_sub(1)) as f32).round() as usize;
+        let x1 = (clamp(box_xyxy.2) * (size.width.saturating_sub(1)) as f32).round() as usize;
+        let y1 = (clamp(box_xyxy.3) * (size.height.saturating_sub(1)) as f32).round() as usize;
+        let mut data = vec![0f32; size.height * size.width];
+        if x0 <= x1 && y0 <= y1 {
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    data[y * size.width + x] = 1.0;
+                }
+            }
+        }
+        Tensor::from_vec(data, (1, 1, size.height, size.width), device)
     }
 
     fn temp_path(name: &str) -> PathBuf {
@@ -3370,6 +4460,396 @@ mod tests {
                 vec![-1.0, 1.0, 1.0, 1.0, -1.0],
                 vec![1.0, -1.0, -1.0, -1.0, -1.0],
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "diagnostic for direct-tracker visual feature parity"]
+    fn video_frame0_visual_features_match_single_click_point_fixture_bundle() -> Result<()> {
+        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint()? else {
+            return Ok(());
+        };
+        let bundle = "reference_video_point_debug_single_click";
+        let source = VideoSource::from_path(reference_input_frames_dir(bundle))?;
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        let session_id = predictor.start_session(source, VideoSessionOptions::default())?;
+        let (preprocessed_image, visual, raw_visual) = {
+            let session = predictor.sessions.get_mut(&session_id).expect("session exists");
+            let image = session.get_frame(0, &device)?.unsqueeze(0)?;
+            let raw_visual = session.get_visual_features(&model, &device, 0)?;
+            let visual = tracker_visual_output(&raw_visual);
+            (image, visual, raw_visual)
+        };
+
+        let manifest = load_reference_internal_manifest(bundle)?;
+        let records = manifest["records"]
+            .as_array()
+            .ok_or_else(|| candle::Error::Msg("single-click manifest missing records".to_owned()))?;
+        let get_image_feature_record = records.iter().find(|record| {
+            record["frame_idx"].as_u64() == Some(0)
+                && record["stage"].as_str() == Some("get_image_feature")
+        });
+        let (expected_image, expected_backbone, expected_high_res_0, expected_high_res_1) =
+            if let Some(record) = get_image_feature_record {
+                let keys = record["tensor_keys"].as_object().ok_or_else(|| {
+                    candle::Error::Msg(
+                        "single-click get_image_feature record missing tensor keys".to_owned(),
+                    )
+                })?;
+                (
+                    load_reference_internal_tensor(bundle, keys["image"].as_str().unwrap())?,
+                    load_reference_internal_tensor(
+                        bundle,
+                        keys["backbone_out.backbone_fpn.2"].as_str().unwrap(),
+                    )?,
+                    load_reference_internal_tensor(
+                        bundle,
+                        keys["backbone_out.backbone_fpn.0"].as_str().unwrap(),
+                    )?,
+                    load_reference_internal_tensor(
+                        bundle,
+                        keys["backbone_out.backbone_fpn.1"].as_str().unwrap(),
+                    )?,
+                )
+            } else {
+                let record = records
+                    .iter()
+                    .find(|record| {
+                        record["frame_idx"].as_u64() == Some(0)
+                            && record["stage"].as_str() == Some("forward_sam_heads")
+                    })
+                    .ok_or_else(|| {
+                        candle::Error::Msg(
+                            "missing single-click get_image_feature/forward_sam_heads record"
+                                .to_owned(),
+                        )
+                    })?;
+                let keys = record["tensor_keys"].as_object().ok_or_else(|| {
+                    candle::Error::Msg(
+                        "single-click forward_sam_heads record missing tensor keys".to_owned(),
+                    )
+                })?;
+                (
+                    Tensor::zeros(preprocessed_image.shape(), DType::F32, &Device::Cpu)?,
+                    load_reference_internal_tensor(bundle, keys["backbone_features"].as_str().unwrap())?,
+                    load_reference_internal_tensor(
+                        bundle,
+                        keys["high_res_features.0"].as_str().unwrap(),
+                    )?,
+                    load_reference_internal_tensor(
+                        bundle,
+                        keys["high_res_features.1"].as_str().unwrap(),
+                    )?,
+                )
+            };
+
+        if get_image_feature_record.is_some() {
+            assert_tensor_close(
+                "single-click preprocessed image",
+                &preprocessed_image.to_device(&Device::Cpu)?,
+                &expected_image,
+                1e-4,
+            )?;
+        }
+
+        let tracker_backbone = visual.backbone_fpn[2].to_device(&Device::Cpu)?;
+        let tracker_backbone_diff = tensor_max_abs_diff(&tracker_backbone, &expected_backbone)?;
+        if tracker_backbone_diff > 1e-3 {
+            let primary_backbone_diff =
+                tensor_max_abs_diff(&raw_visual.backbone_fpn[2].to_device(&Device::Cpu)?, &expected_backbone)?;
+            let sam2_backbone_diff = raw_visual
+                .sam2_backbone_fpn
+                .as_ref()
+                .map(|levels| tensor_max_abs_diff(&levels[2].to_device(&Device::Cpu)?, &expected_backbone))
+                .transpose()?;
+            candle::bail!(
+                "single-click tracker backbone feature mismatch: tracker_diff={tracker_backbone_diff:.6}, primary_diff={primary_backbone_diff:.6}, sam2_diff={:.6}",
+                sam2_backbone_diff.unwrap_or(primary_backbone_diff),
+            );
+        }
+        let projected_high_res =
+            tracker.prepare_high_res_features_for_test(&visual.backbone_fpn[..2])?;
+        assert_tensor_close(
+            "single-click projected high_res feature 0",
+            &projected_high_res[0].to_device(&Device::Cpu)?,
+            &expected_high_res_0,
+            1e-3,
+        )?;
+        assert_tensor_close(
+            "single-click projected high_res feature 1",
+            &projected_high_res[1].to_device(&Device::Cpu)?,
+            &expected_high_res_1,
+            1e-3,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "diagnostic for video preprocessing filter parity"]
+    fn video_frame0_preprocess_filter_diagnostics_against_single_click_fixture_bundle() -> Result<()> {
+        let bundle = "reference_video_point_debug_single_click";
+        let manifest = load_reference_internal_manifest(bundle)?;
+        let records = manifest["records"]
+            .as_array()
+            .ok_or_else(|| candle::Error::Msg("single-click manifest missing records".to_owned()))?;
+        let record = records
+            .iter()
+            .find(|record| {
+                record["frame_idx"].as_u64() == Some(0)
+                    && record["stage"].as_str() == Some("get_image_feature")
+            })
+            .ok_or_else(|| candle::Error::Msg("missing single-click get_image_feature record".to_owned()))?;
+        let keys = record["tensor_keys"].as_object().ok_or_else(|| {
+            candle::Error::Msg("single-click get_image_feature record missing tensor keys".to_owned())
+        })?;
+        let expected_image =
+            load_reference_internal_tensor(bundle, keys["image"].as_str().unwrap())?;
+
+        let frame_path = reference_input_frames_dir(bundle).join("000000.jpg");
+        let image = ImageReader::open(&frame_path)?
+            .decode()
+            .map_err(candle::Error::wrap)?
+            .to_rgb8();
+        let (width, height) = image.dimensions();
+
+        let filters = [
+            ("Nearest", image::imageops::FilterType::Nearest),
+            ("Triangle", image::imageops::FilterType::Triangle),
+            ("CatmullRom", image::imageops::FilterType::CatmullRom),
+            ("Gaussian", image::imageops::FilterType::Gaussian),
+            ("Lanczos3", image::imageops::FilterType::Lanczos3),
+        ];
+        let mut lines = Vec::new();
+        for (label, filter) in filters {
+            let frame = frame_blob_from_rgb_image_with_filter(
+                image.clone(),
+                1008,
+                [0.5, 0.5, 0.5],
+                [0.5, 0.5, 0.5],
+                ImageSize::new(height as usize, width as usize),
+                &frame_path.display().to_string(),
+                filter,
+            )?;
+            let actual = Tensor::from_vec(
+                frame.data,
+                (1, 3, frame.frame_size.height, frame.frame_size.width),
+                &Device::Cpu,
+            )?;
+            let diff = tensor_max_abs_diff(&actual, &expected_image)?;
+            lines.push(format!("{label}: {diff:.6}"));
+        }
+        candle::bail!("single-click preprocess filter diagnostics -> {}", lines.join(", "));
+    }
+
+    #[test]
+    fn video_process_frame_matches_visual_box_reference_bundle_frame0() -> Result<()> {
+        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint()? else {
+            return Ok(());
+        };
+        let Some(tokenizer_path) = sam3_test_tokenizer_path() else {
+            return Ok(());
+        };
+        let bundle = "reference_video_box_debug";
+        let source = VideoSource::from_path(reference_input_frames_dir(bundle))?;
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        apply_reference_predictor_runtime_overrides(&mut predictor, bundle)?;
+        let session_id = predictor.start_session(
+            source,
+            VideoSessionOptions {
+                tokenizer_path: Some(tokenizer_path),
+                ..VideoSessionOptions::default()
+            },
+        )?;
+        let (cx, cy, w, h) = load_reference_box_prompt(bundle)?;
+        predictor.add_prompt(
+            &session_id,
+            0,
+            SessionPrompt {
+                text: None,
+                points: None,
+                point_labels: None,
+                boxes: Some(vec![(cx, cy, w, h)]),
+                box_labels: Some(vec![1]),
+            },
+            None,
+            true,
+            true,
+        )?;
+        let tracker_core = Sam3VideoTrackerCore::new(&tracker);
+        let video_config = predictor.video_config.clone();
+        let output = {
+            let session = predictor.sessions.get_mut(&session_id).expect("session exists");
+            tracker_core.process_frame(
+                &model,
+                &device,
+                &video_config,
+                session,
+                0,
+                PropagationDirection::Forward,
+                VIDEO_DEBUG_MASK_THRESHOLD,
+            )?
+        };
+        assert_eq!(output.frame_idx, 0);
+        assert_eq!(output.objects.len(), 1);
+        let actual = &output.objects[0];
+        let (expected_boxes, expected_score, expected_mask_path) =
+            load_reference_frame0_output(bundle)?;
+        assert_boxes_close(
+            &actual.boxes_xyxy.flatten_all()?.to_vec1::<f32>()?,
+            &expected_boxes,
+            0.03,
+        );
+        let actual_score = actual.score_value()?;
+        assert!(
+            (actual_score - expected_score).abs() <= 0.02,
+            "frame-0 box score mismatch: actual={actual_score}, expected={expected_score}"
+        );
+        let mask_iou = binary_mask_iou(&actual.masks, &expected_mask_path)?;
+        assert!(
+            mask_iou >= 0.97,
+            "frame-0 box mask IoU too low: {mask_iou}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn video_process_frame_matches_single_click_point_reference_bundle_frame0() -> Result<()> {
+        assert_video_process_frame_matches_point_reference_bundle_frame0(
+            "reference_video_point_debug_single_click",
+        )
+    }
+
+    fn assert_video_process_frame_matches_point_reference_bundle_frame0(
+        bundle: &str,
+    ) -> Result<()> {
+        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint()? else {
+            return Ok(());
+        };
+        let source = VideoSource::from_path(reference_input_frames_dir(bundle))?;
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        apply_reference_predictor_runtime_overrides(&mut predictor, bundle)?;
+        let session_id = predictor.start_session(source, VideoSessionOptions::default())?;
+        let (points, point_labels) = load_reference_point_prompt(bundle)?;
+        predictor.add_prompt(
+            &session_id,
+            0,
+            SessionPrompt {
+                text: None,
+                points: Some(points),
+                point_labels: Some(point_labels),
+                boxes: None,
+                box_labels: None,
+            },
+            None,
+            true,
+            true,
+        )?;
+        let tracker_core = Sam3VideoTrackerCore::new(&tracker);
+        let video_config = predictor.video_config.clone();
+        let output = {
+            let session = predictor.sessions.get_mut(&session_id).expect("session exists");
+            tracker_core.process_frame(
+                &model,
+                &device,
+                &video_config,
+                session,
+                0,
+                PropagationDirection::Forward,
+                VIDEO_DEBUG_MASK_THRESHOLD,
+            )?
+        };
+        assert_eq!(output.frame_idx, 0);
+        assert_eq!(output.objects.len(), 1);
+        let actual = &output.objects[0];
+        let (expected_boxes, expected_score, expected_mask_path) =
+            load_reference_frame0_output(bundle)?;
+        assert_boxes_close(
+            &actual.boxes_xyxy.flatten_all()?.to_vec1::<f32>()?,
+            &expected_boxes,
+            0.03,
+        );
+        let actual_score = actual.score_value()?;
+        assert!(
+            (actual_score - expected_score).abs() <= 0.02,
+            "frame-0 point score mismatch for {bundle}: actual={actual_score}, expected={expected_score}"
+        );
+        let mask_iou = binary_mask_iou(&actual.masks, &expected_mask_path)?;
+        assert!(
+            mask_iou >= 0.97,
+            "frame-0 point mask IoU too low for {bundle}: {mask_iou}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn video_process_frame_matches_multi_click_point_reference_bundle_frame0() -> Result<()> {
+        assert_video_process_frame_matches_point_reference_bundle_frame0(
+            "reference_video_point_debug_multi_click",
+        )
+    }
+
+    #[test]
+    fn video_process_frame_matches_all_points_reference_bundle_frame0() -> Result<()> {
+        assert_video_process_frame_matches_point_reference_bundle_frame0(
+            "reference_video_point_debug_all_points",
+        )
+    }
+
+    #[test]
+    fn video_process_frame_matches_mask_prompt_reference_bundle_frame0() -> Result<()> {
+        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint()? else {
+            return Ok(());
+        };
+        let bundle = "reference_video_mask_debug";
+        let source = VideoSource::from_path(reference_input_frames_dir(bundle))?;
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        apply_reference_predictor_runtime_overrides(&mut predictor, bundle)?;
+        let session_id = predictor.start_session(source, VideoSessionOptions::default())?;
+        let video_size = predictor
+            .sessions
+            .get(&session_id)
+            .expect("session exists")
+            .video_size();
+        let mask_prompt = normalized_box_xyxy_to_mask_tensor(
+            load_reference_mask_prompt_box_xyxy(bundle)?,
+            video_size,
+            &device,
+        )?;
+        predictor.add_mask_prompt(&session_id, 0, mask_prompt, None)?;
+        let tracker_core = Sam3VideoTrackerCore::new(&tracker);
+        let video_config = predictor.video_config.clone();
+        let output = {
+            let session = predictor.sessions.get_mut(&session_id).expect("session exists");
+            tracker_core.process_frame(
+                &model,
+                &device,
+                &video_config,
+                session,
+                0,
+                PropagationDirection::Forward,
+                VIDEO_DEBUG_MASK_THRESHOLD,
+            )?
+        };
+        assert_eq!(output.frame_idx, 0);
+        assert_eq!(output.objects.len(), 1);
+        let actual = &output.objects[0];
+        let (expected_boxes, expected_score, expected_mask_path) =
+            load_reference_frame0_output(bundle)?;
+        assert_boxes_close(
+            &actual.boxes_xyxy.flatten_all()?.to_vec1::<f32>()?,
+            &expected_boxes,
+            0.03,
+        );
+        let actual_score = actual.score_value()?;
+        assert!(
+            (actual_score - expected_score).abs() <= 0.02,
+            "frame-0 mask score mismatch: actual={actual_score}, expected={expected_score}"
+        );
+        let mask_iou = binary_mask_iou(&actual.masks, &expected_mask_path)?;
+        assert!(
+            mask_iou >= 0.97,
+            "frame-0 mask IoU too low: {mask_iou}"
         );
         Ok(())
     }

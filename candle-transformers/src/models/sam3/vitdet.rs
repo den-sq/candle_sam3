@@ -39,8 +39,8 @@ impl PatchEmbed {
 
 #[derive(Debug)]
 struct VisionRotaryEmbedding {
-    cos: Tensor,
-    sin: Tensor,
+    freqs_real: Tensor,
+    freqs_imag: Tensor,
 }
 
 impl VisionRotaryEmbedding {
@@ -57,68 +57,67 @@ impl VisionRotaryEmbedding {
         }
         let rotary_dim = head_dim / 4;
         let seq_len = end_x * end_y;
-        let mut cos = vec![0f32; seq_len * head_dim];
-        let mut sin = vec![0f32; seq_len * head_dim];
         let inv_freqs: Vec<f32> = (0..rotary_dim)
             .map(|i| 1f32 / (config.rope_theta as f32).powf((4 * i) as f32 / head_dim as f32))
             .collect();
+        let mut freqs_real = vec![0f32; seq_len * (head_dim / 2)];
+        let mut freqs_imag = vec![0f32; seq_len * (head_dim / 2)];
         for flat_idx in 0..seq_len {
             let x_pos = (flat_idx % end_x) as f32 * scale;
             let y_pos = (flat_idx / end_x) as f32 * scale;
-            let row = &mut cos[flat_idx * head_dim..(flat_idx + 1) * head_dim];
-            let row_sin = &mut sin[flat_idx * head_dim..(flat_idx + 1) * head_dim];
+            let row_real =
+                &mut freqs_real[flat_idx * (head_dim / 2)..(flat_idx + 1) * (head_dim / 2)];
+            let row_imag =
+                &mut freqs_imag[flat_idx * (head_dim / 2)..(flat_idx + 1) * (head_dim / 2)];
             for (i, inv_freq) in inv_freqs.iter().copied().enumerate() {
                 let x_freq = x_pos * inv_freq;
                 let y_freq = y_pos * inv_freq;
-                let x_offset = 2 * i;
-                row[x_offset] = x_freq.cos();
-                row[x_offset + 1] = x_freq.cos();
-                row_sin[x_offset] = x_freq.sin();
-                row_sin[x_offset + 1] = x_freq.sin();
-
-                let y_offset = 2 * rotary_dim + 2 * i;
-                row[y_offset] = y_freq.cos();
-                row[y_offset + 1] = y_freq.cos();
-                row_sin[y_offset] = y_freq.sin();
-                row_sin[y_offset + 1] = y_freq.sin();
+                row_real[i] = x_freq.cos();
+                row_imag[i] = x_freq.sin();
+                row_real[rotary_dim + i] = y_freq.cos();
+                row_imag[rotary_dim + i] = y_freq.sin();
             }
         }
         Ok(Self {
-            cos: Tensor::from_slice(&cos, (seq_len, head_dim), device)?,
-            sin: Tensor::from_slice(&sin, (seq_len, head_dim), device)?,
+            freqs_real: Tensor::from_slice(&freqs_real, (seq_len, head_dim / 2), device)?,
+            freqs_imag: Tensor::from_slice(&freqs_imag, (seq_len, head_dim / 2), device)?,
         })
     }
 
     fn apply(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
         let (_, _, seq_len, head_dim) = q.dims4()?;
-        let cos = self
-            .cos
+        let freqs_real = self
+            .freqs_real
             .narrow(0, 0, seq_len)?
-            .reshape((1, 1, seq_len, head_dim))?;
-        let sin = self
-            .sin
+            .reshape((1, 1, seq_len, head_dim / 2))?;
+        let freqs_imag = self
+            .freqs_imag
             .narrow(0, 0, seq_len)?
-            .reshape((1, 1, seq_len, head_dim))?;
-        let q_dtype = q.dtype();
-        let k_dtype = k.dtype();
-        let q = q.to_dtype(DType::F32)?;
-        let k = k.to_dtype(DType::F32)?;
-        let q_rot = rotate_pairwise(&q)?;
-        let k_rot = rotate_pairwise(&k)?;
-        let q = (q.broadcast_mul(&cos)? + q_rot.broadcast_mul(&sin)?)?.to_dtype(q_dtype)?;
-        let k = (k.broadcast_mul(&cos)? + k_rot.broadcast_mul(&sin)?)?.to_dtype(k_dtype)?;
-        Ok((q, k))
+            .reshape((1, 1, seq_len, head_dim / 2))?;
+        Ok((
+            apply_rotary_enc_real(q, &freqs_real, &freqs_imag)?,
+            apply_rotary_enc_real(k, &freqs_real, &freqs_imag)?,
+        ))
     }
 }
 
-fn rotate_pairwise(xs: &Tensor) -> Result<Tensor> {
+fn apply_rotary_enc_real(
+    xs: &Tensor,
+    freqs_real: &Tensor,
+    freqs_imag: &Tensor,
+) -> Result<Tensor> {
     let (batch_size, num_heads, seq_len, head_dim) = xs.dims4()?;
-    let xs = xs.reshape((batch_size, num_heads, seq_len, head_dim / 2, 2))?;
-    let pair = xs.chunk(2, 4)?;
-    let even = pair[0].clone();
-    let odd = pair[1].clone();
-    let rotated = Tensor::cat(&[&odd.neg()?, &even], 4)?;
-    rotated.reshape((batch_size, num_heads, seq_len, head_dim))
+    let xs_dtype = xs.dtype();
+    let xs = xs
+        .to_dtype(DType::F32)?
+        .reshape((batch_size, num_heads, seq_len, head_dim / 2, 2))?;
+    let xs_real = xs.i((.., .., .., .., 0))?;
+    let xs_imag = xs.i((.., .., .., .., 1))?;
+    let real = (xs_real.broadcast_mul(freqs_real)? - xs_imag.broadcast_mul(freqs_imag)?)?;
+    let imag = (xs_real.broadcast_mul(freqs_imag)? + xs_imag.broadcast_mul(freqs_real)?)?;
+    Tensor::stack(&[&real, &imag], 4)?
+        .reshape((batch_size, num_heads, seq_len, head_dim))?
+        .to_dtype(xs_dtype)
 }
 
 #[derive(Debug)]
@@ -138,7 +137,7 @@ impl Sam3VisionAttention {
         vb: VarBuilder,
     ) -> Result<Self> {
         let qkv = candle_nn::linear_b(config.embed_dim, config.embed_dim * 3, true, vb.pp("qkv"))?;
-        let proj = candle_nn::linear(config.embed_dim, config.embed_dim, vb.pp("proj"))?;
+        let proj = candle_nn::linear_b(config.embed_dim, config.embed_dim, true, vb.pp("proj"))?;
         let head_dim = config.embed_dim / config.num_heads;
         Ok(Self {
             qkv,
@@ -192,8 +191,8 @@ impl Sam3VisionMlp {
     fn new(config: &VisionConfig, vb: VarBuilder) -> Result<Self> {
         let hidden_dim = ((config.embed_dim as f64) * config.mlp_ratio) as usize;
         Ok(Self {
-            fc1: candle_nn::linear(config.embed_dim, hidden_dim, vb.pp("fc1"))?,
-            fc2: candle_nn::linear(hidden_dim, config.embed_dim, vb.pp("fc2"))?,
+            fc1: candle_nn::linear_b(config.embed_dim, hidden_dim, true, vb.pp("fc1"))?,
+            fc2: candle_nn::linear_b(hidden_dim, config.embed_dim, true, vb.pp("fc2"))?,
         })
     }
 

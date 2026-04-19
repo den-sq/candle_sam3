@@ -126,7 +126,7 @@ impl Default for NeckConfig {
             d_model: 256,
             scale_factors: [4.0, 2.0, 1.0, 0.5],
             scalp: 1,
-            add_sam2_neck: false,
+            add_sam2_neck: true,
         }
     }
 }

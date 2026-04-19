@@ -9,7 +9,12 @@ use crate::models::segment_anything::{
     linear, prompt_encoder::PromptEncoder, transformer::TwoWayTransformer, LayerNorm2d, Linear,
 };
 
-use super::{checkpoint::Sam3CheckpointSource, neck::VisualBackboneOutput, Config};
+use super::{
+    checkpoint::Sam3CheckpointSource,
+    neck::{Sam3DualViTDetNeck, VisualBackboneOutput},
+    vitdet::Sam3ViTDetTrunk,
+    Config,
+};
 
 const STRICT_PORT_IN_PROGRESS: &str = "SAM3 tracker strict port in progress; legacy tracker implementation was removed. See candle-transformers/src/models/sam3/VIDEO_TRACKER_STRICT_PORT.md before implementing tracker behavior.";
 const NO_OBJ_SCORE: f64 = -1024.0;
@@ -801,6 +806,7 @@ impl Sam3TrackerMaskDecoder {
         output_tokens.push(self.iou_token.embeddings());
         output_tokens.push(self.mask_tokens.embeddings());
         let output_tokens = Tensor::cat(output_tokens.as_slice(), 0)?.unsqueeze(0)?;
+        let output_tokens = output_tokens.to_dtype(sparse_prompt_embeddings.dtype())?;
         let output_tokens = output_tokens.expand((
             sparse_prompt_embeddings.dim(0)?,
             output_tokens.dim(1)?,
@@ -839,25 +845,17 @@ impl Sam3TrackerMaskDecoder {
             .transpose(1, 2)?
             .reshape((batch_size, channels, height, width))?;
         let upscaled_embedding = if self.use_high_res_features {
-            match (
-                high_res_features,
-                self.conv_s0.as_ref(),
-                self.conv_s1.as_ref(),
-            ) {
-                (Some(high_res_features), Some(conv_s0), Some(conv_s1))
-                    if high_res_features.len() >= 2 =>
-                {
-                    let feat_s0 = high_res_features[0].apply(conv_s0)?;
-                    let feat_s1 = high_res_features[1].apply(conv_s1)?;
+            match high_res_features {
+                Some(high_res_features) if high_res_features.len() >= 2 => {
                     let upscaled_embedding = self.output_upscaling_conv1.forward(&src_tokens)?;
+                    let feat_s1 = high_res_features[1].to_dtype(upscaled_embedding.dtype())?;
                     let upscaled_embedding = upscaled_embedding.broadcast_add(&feat_s1)?;
                     let upscaled_embedding = upscaled_embedding
                         .apply(&self.output_upscaling_ln)?
                         .gelu()?;
-                    self.output_upscaling_conv2
-                        .forward(&upscaled_embedding)?
-                        .broadcast_add(&feat_s0)?
-                        .gelu()?
+                    let upscaled_embedding = self.output_upscaling_conv2.forward(&upscaled_embedding)?;
+                    let feat_s0 = high_res_features[0].to_dtype(upscaled_embedding.dtype())?;
+                    upscaled_embedding.broadcast_add(&feat_s0)?.gelu()?
                 }
                 _ => self
                     .output_upscaling_conv1
@@ -953,6 +951,8 @@ impl Sam3TrackerMaskDecoder {
 #[derive(Debug)]
 pub struct Sam3TrackerModel {
     config: Sam3TrackerConfig,
+    vision_trunk: Option<Sam3ViTDetTrunk>,
+    vision_neck: Option<Sam3DualViTDetNeck>,
     mask_downsample: Conv2d,
     sam_prompt_encoder: PromptEncoder,
     sam_mask_decoder: Sam3TrackerMaskDecoder,
@@ -967,6 +967,20 @@ pub struct Sam3TrackerModel {
 
 impl Sam3TrackerModel {
     pub fn new(config: &Sam3TrackerConfig, vb: VarBuilder) -> Result<Self> {
+        let (vision_trunk, vision_neck) = if config.predictor.with_backbone {
+            (
+                Some(Sam3ViTDetTrunk::new(
+                    &Config::default().vision,
+                    vb.pp("backbone").pp("vision_backbone").pp("trunk"),
+                )?),
+                Some(Sam3DualViTDetNeck::new(
+                    &Config::default().neck,
+                    vb.pp("backbone").pp("vision_backbone"),
+                )?),
+            )
+        } else {
+            (None, None)
+        };
         let mask_downsample = candle_nn::conv2d(
             1,
             1,
@@ -1008,6 +1022,8 @@ impl Sam3TrackerModel {
         )?;
         Ok(Self {
             config: config.clone(),
+            vision_trunk,
+            vision_neck,
             mask_downsample,
             sam_prompt_encoder,
             sam_mask_decoder,
@@ -1053,6 +1069,30 @@ impl Sam3TrackerModel {
         self.config.shapes.input_mask_size
     }
 
+    pub fn encode_image_features(&self, image: &Tensor) -> Result<VisualBackboneOutput> {
+        let vision_trunk = self.vision_trunk.as_ref().ok_or_else(|| {
+            candle::Error::Msg(
+                "tracker image-feature path is unavailable because predictor.with_backbone=false"
+                    .to_owned(),
+            )
+        })?;
+        let vision_neck = self.vision_neck.as_ref().ok_or_else(|| {
+            candle::Error::Msg(
+                "tracker image-feature path is unavailable because predictor.with_backbone=false"
+                    .to_owned(),
+            )
+        })?;
+        let image = match image.rank() {
+            3 => image.unsqueeze(0)?,
+            4 => image.clone(),
+            rank => {
+                candle::bail!("sam3 tracker image encoder expects CHW or BCHW input, got rank {rank}")
+            }
+        };
+        let trunk = vision_trunk.forward(&image)?;
+        vision_neck.forward(&trunk)
+    }
+
     pub fn track_frame(
         &self,
         _visual: &VisualBackboneOutput,
@@ -1065,7 +1105,7 @@ impl Sam3TrackerModel {
         _history: &BTreeMap<usize, TrackerFrameState>,
         is_conditioning_frame: bool,
         reverse: bool,
-        use_prev_mem_frame: bool,
+        _use_prev_mem_frame: bool,
         run_mem_encoder: bool,
     ) -> Result<TrackerStepOutput> {
         if reverse {
@@ -1073,7 +1113,7 @@ impl Sam3TrackerModel {
                 "SAM3 tracker strict port currently supports prompt-frame forward tracking only; reverse tracking lands in a later step."
             );
         }
-        if !_history.is_empty() || use_prev_mem_frame {
+        if !_history.is_empty() {
             candle::bail!(
                 "SAM3 tracker strict port currently supports prompt frames without history only; memory-conditioned tracking lands in a later step."
             );
@@ -1094,15 +1134,37 @@ impl Sam3TrackerModel {
                 "SAM3 tracker strict port currently supports either mask prompts or point/box prompts, not both at once."
             );
         }
+        let compute_dtype = self.no_obj_ptr.dtype();
         let backbone_features = _visual
             .backbone_fpn
             .last()
-            .expect("checked non-empty above");
-        let high_res_features = if _visual.backbone_fpn.len() > 1 {
-            Some(&_visual.backbone_fpn[.._visual.backbone_fpn.len() - 1])
+            .expect("checked non-empty above")
+            .to_dtype(compute_dtype)?;
+        let prepared_high_res_features = if _visual.backbone_fpn.len() > 1 {
+            Some(self.prepare_high_res_features(
+                &_visual.backbone_fpn[.._visual.backbone_fpn.len() - 1],
+            )?)
         } else {
             None
         };
+        let high_res_features = prepared_high_res_features.as_deref();
+        if let Some(mask_input) = _mask_input {
+            let state = self.use_mask_as_output(
+                &backbone_features,
+                high_res_features,
+                mask_input,
+                is_conditioning_frame,
+            )?;
+            return Ok(TrackerStepOutput {
+                state,
+                prompt_frame_indices: if is_conditioning_frame {
+                    vec![_frame_idx]
+                } else {
+                    Vec::new()
+                },
+                memory_frame_indices: Vec::new(),
+            });
+        }
         let point_prompt = self.prepare_point_prompt(
             _point_coords,
             _point_labels,
@@ -1113,24 +1175,15 @@ impl Sam3TrackerModel {
             .as_ref()
             .map(|(_, labels)| labels.dim(1).unwrap_or(0))
             .unwrap_or(0);
-        let state = if let Some(mask_input) = _mask_input {
-            self.use_mask_as_output(
-                backbone_features,
-                high_res_features,
-                mask_input,
-                is_conditioning_frame,
-            )?
-        } else {
-            let multimask_output = self.use_multimask(is_conditioning_frame, point_count);
-            self.forward_sam_heads(
-                backbone_features,
-                point_prompt.as_ref(),
-                None,
-                high_res_features,
-                multimask_output,
-                is_conditioning_frame,
-            )?
-        };
+        let multimask_output = self.use_multimask(is_conditioning_frame, point_count);
+        let state = self.forward_sam_heads(
+            &backbone_features,
+            point_prompt.as_ref(),
+            None,
+            high_res_features,
+            multimask_output,
+            is_conditioning_frame,
+        )?;
         Ok(TrackerStepOutput {
             state,
             prompt_frame_indices: if is_conditioning_frame {
@@ -1184,6 +1237,58 @@ impl Sam3TrackerModel {
                 .contains(&point_count)
     }
 
+    fn prepare_high_res_features(&self, high_res_features: &[Tensor]) -> Result<Vec<Tensor>> {
+        if high_res_features.len() < 2 {
+            candle::bail!(
+                "tracker expected at least two high-resolution feature levels, got {}",
+                high_res_features.len()
+            );
+        }
+        let feat_s0 = &high_res_features[0];
+        let feat_s1 = &high_res_features[1];
+        let compute_dtype = self.no_obj_ptr.dtype();
+        let projected_s0 = self.config.mask_decoder.transformer_dim / 8;
+        let projected_s1 = self.config.mask_decoder.transformer_dim / 4;
+        let (_, channels_s0, _, _) = feat_s0.dims4()?;
+        let (_, channels_s1, _, _) = feat_s1.dims4()?;
+        if channels_s0 == projected_s0 && channels_s1 == projected_s1 {
+            return Ok(vec![
+                feat_s0.to_dtype(compute_dtype)?,
+                feat_s1.to_dtype(compute_dtype)?,
+            ]);
+        }
+        if channels_s0 == self.config.hidden_dim && channels_s1 == self.config.hidden_dim {
+            let conv_s0 = self
+                .sam_mask_decoder
+                .conv_s0
+                .as_ref()
+                .ok_or_else(|| candle::Error::Msg("tracker high-res projection conv_s0 missing".into()))?;
+            let conv_s1 = self
+                .sam_mask_decoder
+                .conv_s1
+                .as_ref()
+                .ok_or_else(|| candle::Error::Msg("tracker high-res projection conv_s1 missing".into()))?;
+            return Ok(vec![
+                feat_s0.apply(conv_s0)?.to_dtype(compute_dtype)?,
+                feat_s1.apply(conv_s1)?.to_dtype(compute_dtype)?,
+            ]);
+        }
+        candle::bail!(
+            "unexpected tracker high-res feature channel contract: s0={}, s1={}, expected projected [{projected_s0}, {projected_s1}] or hidden_dim {}",
+            channels_s0,
+            channels_s1,
+            self.config.hidden_dim
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_high_res_features_for_test(
+        &self,
+        high_res_features: &[Tensor],
+    ) -> Result<Vec<Tensor>> {
+        self.prepare_high_res_features(high_res_features)
+    }
+
     fn forward_sam_heads(
         &self,
         backbone_features: &Tensor,
@@ -1223,7 +1328,13 @@ impl Sam3TrackerModel {
             None,
             sam_mask_prompt.as_ref(),
         )?;
-        let image_pe = self.sam_prompt_encoder.get_dense_pe()?;
+        let backbone_dtype = backbone_features.dtype();
+        let sparse_embeddings = sparse_embeddings.to_dtype(backbone_dtype)?;
+        let dense_embeddings = dense_embeddings.to_dtype(backbone_dtype)?;
+        let image_pe = self
+            .sam_prompt_encoder
+            .get_dense_pe()?
+            .to_dtype(backbone_dtype)?;
         let (low_res_multimasks, ious, sam_output_tokens, object_score_logits) =
             self.sam_mask_decoder.forward(
                 backbone_features,
@@ -1306,18 +1417,23 @@ impl Sam3TrackerModel {
         let mask_inputs = normalize_mask_prompt(mask_inputs, device)?;
         let mask_inputs_float = mask_inputs.to_dtype(DType::F32)?;
         let high_res_masks = mask_inputs_float.affine(20.0, -10.0)?;
-        let low_res_masks = high_res_masks.upsample_bilinear2d(
-            self.low_res_mask_size(),
-            self.low_res_mask_size(),
-            false,
+        let mask_input_low_res_size = (self.input_mask_size() / self.config.backbone_stride) * 4;
+        let low_res_masks = resize_bilinear2d_antialias(
+            &high_res_masks,
+            mask_input_low_res_size,
+            mask_input_low_res_size,
         )?;
         let iou_scores = Tensor::ones((mask_inputs_float.dim(0)?, 1), DType::F32, device)?;
         let mask_prompt = self.mask_downsample.forward(&mask_inputs_float)?;
+        let prepared_high_res_features = match high_res_features {
+            Some(high_res_features) => Some(self.prepare_high_res_features(high_res_features)?),
+            None => None,
+        };
         let state = self.forward_sam_heads(
             backbone_features,
             None,
             Some(&mask_prompt),
-            high_res_features,
+            prepared_high_res_features.as_deref(),
             false,
             is_cond_frame,
         )?;
@@ -1326,7 +1442,8 @@ impl Sam3TrackerModel {
             .gt(0f64)?
             .to_dtype(DType::F32)?
             .sum(1)?
-            .gt(0f64)?;
+            .gt(0f64)?
+            .unsqueeze(1)?;
         let object_score_logits = object_present.to_dtype(DType::F32)?.affine(20.0, -10.0)?;
         let obj_ptr = object_present
             .broadcast_as(state.obj_ptr.shape())?
@@ -1363,6 +1480,88 @@ impl Sam3TrackerModel {
     ) -> Result<(Tensor, Tensor)> {
         candle::bail!("{STRICT_PORT_IN_PROGRESS}")
     }
+}
+
+pub(crate) fn resize_bilinear2d_antialias(
+    input: &Tensor,
+    out_h: usize,
+    out_w: usize,
+) -> Result<Tensor> {
+    let input_cpu = input.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+    let (batch, channels, in_h, in_w) = input_cpu.dims4()?;
+    let input_vec = input_cpu.flatten_all()?.to_vec1::<f32>()?;
+    let width_weights = antialias_linear_weights(in_w, out_w);
+    let height_weights = antialias_linear_weights(in_h, out_h);
+    let mut horizontal = vec![0.0f32; batch * channels * in_h * out_w];
+    let mut output = vec![0.0f32; batch * channels * out_h * out_w];
+    let input_stride_c = in_h * in_w;
+    let input_stride_b = channels * input_stride_c;
+    let horizontal_stride_c = in_h * out_w;
+    let horizontal_stride_b = channels * horizontal_stride_c;
+    let output_stride_c = out_h * out_w;
+    let output_stride_b = channels * output_stride_c;
+
+    for b in 0..batch {
+        for c in 0..channels {
+            let input_base = b * input_stride_b + c * input_stride_c;
+            let horizontal_base = b * horizontal_stride_b + c * horizontal_stride_c;
+            let output_base = b * output_stride_b + c * output_stride_c;
+            for y in 0..in_h {
+                let row_offset = input_base + y * in_w;
+                let horizontal_row_offset = horizontal_base + y * out_w;
+                for (out_x, weights) in width_weights.iter().enumerate() {
+                    let mut value = 0.0f32;
+                    for (src_x, weight) in weights {
+                        value += input_vec[row_offset + *src_x] * *weight;
+                    }
+                    horizontal[horizontal_row_offset + out_x] = value;
+                }
+            }
+            for (out_y, weights) in height_weights.iter().enumerate() {
+                let output_row_offset = output_base + out_y * out_w;
+                for out_x in 0..out_w {
+                    let mut value = 0.0f32;
+                    for (src_y, weight) in weights {
+                        value += horizontal[horizontal_base + *src_y * out_w + out_x] * *weight;
+                    }
+                    output[output_row_offset + out_x] = value;
+                }
+            }
+        }
+    }
+
+    Tensor::from_vec(output, (batch, channels, out_h, out_w), &Device::Cpu)?.to_device(input.device())
+}
+
+fn antialias_linear_weights(input_size: usize, output_size: usize) -> Vec<Vec<(usize, f32)>> {
+    let scale = input_size as f32 / output_size as f32;
+    let support = scale.max(1.0);
+    let radius = support;
+    let mut all_weights = Vec::with_capacity(output_size);
+    for out_idx in 0..output_size {
+        let center = scale * (out_idx as f32 + 0.5) - 0.5;
+        let xmin = (center - radius).floor() as isize;
+        let xmax = (center + radius).ceil() as isize;
+        let mut weights = Vec::new();
+        let mut weight_sum = 0.0f32;
+        for src_idx in xmin..=xmax {
+            let distance = (src_idx as f32 - center) / support;
+            let weight = (1.0 - distance.abs()).max(0.0) / support;
+            if weight == 0.0 {
+                continue;
+            }
+            let clamped = src_idx.clamp(0, input_size.saturating_sub(1) as isize) as usize;
+            weights.push((clamped, weight));
+            weight_sum += weight;
+        }
+        if weight_sum > 0.0 {
+            for (_, weight) in weights.iter_mut() {
+                *weight /= weight_sum;
+            }
+        }
+        all_weights.push(weights);
+    }
+    all_weights
 }
 
 fn normalize_point_coords(coords: &Tensor, device: &Device) -> Result<Tensor> {
@@ -1414,7 +1613,11 @@ fn repeat_interleave(xs: &Tensor, repeats: usize, dim: usize) -> Result<Tensor> 
 mod tests {
     use super::*;
 
-    use std::{collections::HashMap, fs, path::PathBuf};
+    use std::{
+        collections::HashMap,
+        fs,
+        path::PathBuf,
+    };
 
     use serde::Deserialize;
 
@@ -1777,6 +1980,9 @@ mod tests {
         Default,
         TemporalDisambiguation,
         PointSingleClick,
+        PointMultiClick,
+        PointAllPoints,
+        MaskDirect,
     }
 
     impl TrackerFixtureBundle {
@@ -1789,12 +1995,25 @@ mod tests {
                 Self::PointSingleClick => {
                     "../candle-examples/examples/sam3/reference_video_point_debug_single_click/debug"
                 }
+                Self::PointMultiClick => {
+                    "../candle-examples/examples/sam3/reference_video_point_debug_multi_click/debug"
+                }
+                Self::PointAllPoints => {
+                    "../candle-examples/examples/sam3/reference_video_point_debug_all_points/debug"
+                }
+                Self::MaskDirect => {
+                    "../candle-examples/examples/sam3/reference_video_mask_debug/debug"
+                }
             }
         }
     }
 
     fn tracker_fixture_dir(bundle: TrackerFixtureBundle) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(bundle.debug_dir())
+    }
+
+    fn tracker_fixture_tensor_path(bundle: TrackerFixtureBundle) -> PathBuf {
+        tracker_fixture_dir(bundle).join("internal_fixtures.safetensors")
     }
 
     fn load_tracker_internal_manifest(
@@ -1813,6 +2032,207 @@ mod tests {
                 path.display()
             ))
         })
+    }
+
+    fn load_tracker_fixture_tensor(bundle: TrackerFixtureBundle, key: &str) -> Result<Tensor> {
+        use candle::safetensors::Load;
+
+        let path = tracker_fixture_tensor_path(bundle);
+        let tensors = unsafe { candle::safetensors::MmapedSafetensors::new(&path) }.map_err(
+            |err| {
+                candle::Error::Msg(format!(
+                    "failed to mmap tracker fixture tensors {}: {err}",
+                    path.display()
+                ))
+            },
+        )?;
+        tensors
+            .get(key)
+            .map_err(|err| {
+                candle::Error::Msg(format!(
+                    "failed to read tensor `{key}` from tracker fixture {}: {err}",
+                    path.display()
+                ))
+            })?
+            .load(&candle::Device::Cpu)
+    }
+
+    fn tracker_test_checkpoint_path() -> Option<PathBuf> {
+        let env_path = std::env::var_os("SAM3_TEST_CHECKPOINT")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("SAM3_TEST_CHECKPOINT_DIR").map(PathBuf::from));
+        let mut candidates = Vec::new();
+        if let Some(path) = env_path {
+            candidates.push(path);
+        }
+        candidates.push(PathBuf::from("/home/dnorthover/extcode/hf_sam3"));
+        candidates.push(PathBuf::from("/home/dnorthover/extcode/hf_sam3/sam3.pt"));
+        candidates.into_iter().find_map(|path| {
+            if path.is_dir() {
+                let file = path.join("sam3.pt");
+                file.exists().then_some(file)
+            } else if path.exists() {
+                Some(path)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn load_runtime_tracker_model_from_checkpoint() -> Result<Option<Sam3TrackerModel>> {
+        let Some(checkpoint_path) = tracker_test_checkpoint_path() else {
+            return Ok(None);
+        };
+        let config = Config::default();
+        Sam3TrackerModel::from_checkpoint_source(
+            &config,
+            &Sam3CheckpointSource::upstream_pth(checkpoint_path),
+            DType::F32,
+            &candle::Device::Cpu,
+        )
+        .map(Some)
+    }
+
+    fn build_fixture_visual_output(
+        bundle: TrackerFixtureBundle,
+        forward_stage: &TrackerInternalRecord,
+    ) -> Result<VisualBackboneOutput> {
+        let high_res_0 = load_tracker_fixture_tensor(
+            bundle,
+            forward_stage.tensor_keys["high_res_features.0"].as_str(),
+        )?;
+        let high_res_1 = load_tracker_fixture_tensor(
+            bundle,
+            forward_stage.tensor_keys["high_res_features.1"].as_str(),
+        )?;
+        let backbone = load_tracker_fixture_tensor(
+            bundle,
+            forward_stage.tensor_keys["backbone_features"].as_str(),
+        )?;
+        let pos0 = Tensor::zeros(high_res_0.shape(), high_res_0.dtype(), &candle::Device::Cpu)?;
+        let pos1 = Tensor::zeros(high_res_1.shape(), high_res_1.dtype(), &candle::Device::Cpu)?;
+        let pos2 = Tensor::zeros(backbone.shape(), backbone.dtype(), &candle::Device::Cpu)?;
+        Ok(VisualBackboneOutput {
+            backbone_fpn: vec![high_res_0, high_res_1, backbone],
+            vision_pos_enc: vec![pos0, pos1, pos2],
+            sam2_backbone_fpn: None,
+            sam2_pos_enc: None,
+        })
+    }
+
+    fn assert_tensor_close(label: &str, actual: &Tensor, expected: &Tensor, atol: f32) -> Result<()> {
+        if actual.shape() != expected.shape() {
+            candle::bail!(
+                "{label} shape mismatch: actual {:?}, expected {:?}",
+                actual.shape().dims(),
+                expected.shape().dims()
+            );
+        }
+        let actual = actual.to_dtype(DType::F32)?;
+        let expected = expected.to_dtype(DType::F32)?;
+        let max_abs_diff = actual
+            .broadcast_sub(&expected)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_vec0::<f32>()?;
+        if max_abs_diff > atol {
+            candle::bail!(
+                "{label} max abs diff {max_abs_diff:.6} exceeded tolerance {atol:.6}"
+            );
+        }
+        Ok(())
+    }
+
+    fn assert_prompt_frame_point_fixture_matches(
+        bundle: TrackerFixtureBundle,
+        expected_point_count: usize,
+        low_res_mask_atol: f32,
+        high_res_mask_atol: f32,
+        iou_atol: f32,
+        obj_ptr_atol: f32,
+        object_score_atol: f32,
+    ) -> Result<()> {
+        let Some(model) = load_runtime_tracker_model_from_checkpoint()? else {
+            return Ok(());
+        };
+        let manifest = load_tracker_internal_manifest(bundle)?;
+        let forward_stage = tracker_record(&manifest, 0, "forward_sam_heads")?;
+        let track_stage = tracker_record(&manifest, 0, "track_step")?;
+        assert_eq!(
+            track_stage.metadata["point_input_count"].as_u64(),
+            Some(expected_point_count as u64)
+        );
+        let visual = build_fixture_visual_output(bundle, forward_stage)?;
+        let point_coords =
+            load_tracker_fixture_tensor(bundle, forward_stage.tensor_keys["point_inputs.point_coords"].as_str())?;
+        let point_labels =
+            load_tracker_fixture_tensor(bundle, forward_stage.tensor_keys["point_inputs.point_labels"].as_str())?;
+        let actual = model.track_frame(
+            &visual,
+            0,
+            30,
+            Some(&point_coords),
+            Some(&point_labels),
+            None,
+            None,
+            &BTreeMap::new(),
+            true,
+            false,
+            false,
+            false,
+        )?;
+        let expected_low_res_masks = load_tracker_fixture_tensor(
+            bundle,
+            forward_stage.tensor_keys["forward_sam_heads_output.low_res_masks"].as_str(),
+        )?;
+        let expected_high_res_masks = load_tracker_fixture_tensor(
+            bundle,
+            forward_stage.tensor_keys["forward_sam_heads_output.high_res_masks"].as_str(),
+        )?;
+        let expected_ious = load_tracker_fixture_tensor(
+            bundle,
+            forward_stage.tensor_keys["forward_sam_heads_output.ious"].as_str(),
+        )?;
+        let expected_obj_ptr = load_tracker_fixture_tensor(
+            bundle,
+            forward_stage.tensor_keys["forward_sam_heads_output.obj_ptr"].as_str(),
+        )?;
+        let expected_object_score_logits = load_tracker_fixture_tensor(
+            bundle,
+            forward_stage.tensor_keys["forward_sam_heads_output.object_score_logits"].as_str(),
+        )?;
+        assert_tensor_close(
+            "prompt point low_res_masks",
+            &actual.state.low_res_masks,
+            &expected_low_res_masks,
+            low_res_mask_atol,
+        )?;
+        assert_tensor_close(
+            "prompt point high_res_masks",
+            &actual.state.high_res_masks,
+            &expected_high_res_masks,
+            high_res_mask_atol,
+        )?;
+        assert_tensor_close(
+            "prompt point iou_scores",
+            &actual.state.iou_scores,
+            &expected_ious,
+            iou_atol,
+        )?;
+        assert_tensor_close(
+            "prompt point obj_ptr",
+            &actual.state.obj_ptr,
+            &expected_obj_ptr,
+            obj_ptr_atol,
+        )?;
+        assert_tensor_close(
+            "prompt point object_score_logits",
+            &actual.state.object_score_logits,
+            &expected_object_score_logits,
+            object_score_atol,
+        )?;
+        Ok(())
     }
 
     fn tracker_record<'a>(
@@ -2406,6 +2826,148 @@ mod tests {
     }
 
     #[test]
+    fn tracker_track_frame_matches_single_click_point_fixture_values() -> Result<()> {
+        assert_prompt_frame_point_fixture_matches(
+            TrackerFixtureBundle::PointSingleClick,
+            1,
+            1.0,
+            1.0,
+            0.2,
+            0.5,
+            0.5,
+        )
+    }
+
+    #[test]
+    fn tracker_track_frame_matches_multi_click_point_fixture_values() -> Result<()> {
+        assert_prompt_frame_point_fixture_matches(
+            TrackerFixtureBundle::PointMultiClick,
+            4,
+            1.0,
+            1.0,
+            0.2,
+            0.5,
+            0.5,
+        )
+    }
+
+    #[test]
+    fn tracker_track_frame_matches_all_points_fixture_values() -> Result<()> {
+        assert_prompt_frame_point_fixture_matches(
+            TrackerFixtureBundle::PointAllPoints,
+            6,
+            1.0,
+            1.0,
+            0.2,
+            0.5,
+            0.5,
+        )
+    }
+
+    #[test]
+    fn tracker_track_frame_matches_mask_prompt_fixture_values() -> Result<()> {
+        let Some(model) = load_runtime_tracker_model_from_checkpoint()? else {
+            return Ok(());
+        };
+        let manifest = load_tracker_internal_manifest(TrackerFixtureBundle::MaskDirect)?;
+        let use_mask_stage = tracker_record(&manifest, 0, "use_mask_as_output")?;
+        let track_stage = tracker_record(&manifest, 0, "track_step")?;
+        assert_eq!(track_stage.metadata["has_mask_inputs"].as_bool(), Some(true));
+        let visual = build_fixture_visual_output(TrackerFixtureBundle::MaskDirect, use_mask_stage)?;
+        let mask_input = load_tracker_fixture_tensor(
+            TrackerFixtureBundle::MaskDirect,
+            track_stage.tensor_keys["mask_inputs"].as_str(),
+        )?;
+        let actual = model.track_frame(
+            &visual,
+            0,
+            30,
+            None,
+            None,
+            None,
+            Some(&mask_input),
+            &BTreeMap::new(),
+            true,
+            false,
+            true,
+            false,
+        )?;
+        let expected_low_res_masks = load_tracker_fixture_tensor(
+            TrackerFixtureBundle::MaskDirect,
+            use_mask_stage.tensor_keys["use_mask_as_output.low_res_masks"].as_str(),
+        )?;
+        let expected_high_res_masks = load_tracker_fixture_tensor(
+            TrackerFixtureBundle::MaskDirect,
+            use_mask_stage.tensor_keys["use_mask_as_output.high_res_masks"].as_str(),
+        )?;
+        let expected_ious = load_tracker_fixture_tensor(
+            TrackerFixtureBundle::MaskDirect,
+            use_mask_stage.tensor_keys["use_mask_as_output.ious"].as_str(),
+        )?;
+        let expected_obj_ptr = load_tracker_fixture_tensor(
+            TrackerFixtureBundle::MaskDirect,
+            use_mask_stage.tensor_keys["use_mask_as_output.obj_ptr"].as_str(),
+        )?;
+        let expected_object_score_logits = load_tracker_fixture_tensor(
+            TrackerFixtureBundle::MaskDirect,
+            use_mask_stage.tensor_keys["use_mask_as_output.object_score_logits"].as_str(),
+        )?;
+        assert_tensor_close(
+            "mask prompt low_res_masks",
+            &actual.state.low_res_masks,
+            &expected_low_res_masks,
+            5e-4,
+        )?;
+        assert_tensor_close(
+            "mask prompt high_res_masks",
+            &actual.state.high_res_masks,
+            &expected_high_res_masks,
+            1e-5,
+        )?;
+        assert_tensor_close(
+            "mask prompt iou_scores",
+            &actual.state.iou_scores,
+            &expected_ious,
+            1e-5,
+        )?;
+        assert_tensor_close(
+            "mask prompt obj_ptr",
+            &actual.state.obj_ptr,
+            &expected_obj_ptr,
+            0.5,
+        )?;
+        assert_tensor_close(
+            "mask prompt object_score_logits",
+            &actual.state.object_score_logits,
+            &expected_object_score_logits,
+            1e-5,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn default_box_bundle_routes_through_visual_prompt_before_tracker_runtime() -> Result<()> {
+        let manifest = load_tracker_internal_manifest(TrackerFixtureBundle::Default)?;
+        let visual_prompt_stage = tracker_record(&manifest, 0, "get_visual_prompt")?;
+        let prompt_stage = tracker_record(&manifest, 0, "sam_prompt_encoder")?;
+        let forward_stage = tracker_record(&manifest, 0, "forward_sam_heads")?;
+        assert_eq!(
+            visual_prompt_stage.metadata["input_box_count"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            visual_prompt_stage.metadata["created_visual_prompt"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(prompt_stage.metadata["has_boxes"].as_bool(), Some(false));
+        assert_eq!(
+            forward_stage.metadata["has_point_inputs"].as_bool(),
+            Some(false)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn tracker_track_frame_executes_prompt_frame_point_path() -> Result<()> {
         let device = candle::Device::Cpu;
         let model = Sam3TrackerModel::new(
@@ -2482,6 +3044,36 @@ mod tests {
             )
             .expect_err("memory-conditioned tracker path should remain blocked");
         assert!(err.to_string().contains("memory-conditioned tracking"));
+        Ok(())
+    }
+
+    #[test]
+    fn tracker_track_frame_executes_prompt_frame_mask_path() -> Result<()> {
+        let device = candle::Device::Cpu;
+        let model = Sam3TrackerModel::new(
+            &Sam3TrackerConfig::from_sam3_config(&tiny_config()),
+            VarBuilder::zeros(DType::F32, &device),
+        )?;
+        let mask_input = Tensor::zeros((1, 1, 64, 64), DType::F32, &device)?;
+        let output = model.track_frame(
+            &dummy_visual(&device)?,
+            0,
+            1,
+            None,
+            None,
+            None,
+            Some(&mask_input),
+            &BTreeMap::new(),
+            true,
+            false,
+            true,
+            false,
+        )?;
+        assert_eq!(output.state.low_res_masks.dims4()?, (1, 1, 16, 16));
+        assert_eq!(output.state.high_res_masks.dims4()?, (1, 1, 64, 64));
+        assert_eq!(output.state.iou_scores.to_vec2::<f32>()?, vec![vec![1.0]]);
+        assert!(output.prompt_frame_indices == vec![0]);
+        assert!(output.memory_frame_indices.is_empty());
         Ok(())
     }
 }

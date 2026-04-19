@@ -4,7 +4,7 @@ use candle_nn::{Conv2d, Conv2dConfig, ConvTranspose2d, ConvTranspose2dConfig, Mo
 use super::config::NeckConfig;
 use super::vitdet::ViTDetTrunkOutput;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VisualBackboneOutput {
     pub backbone_fpn: Vec<Tensor>,
     pub vision_pos_enc: Vec<Tensor>,
