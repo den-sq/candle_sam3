@@ -1298,6 +1298,11 @@ def install_video_internal_fixture_recorder(target, debug_dir: Path, capture_fra
     original_forward_sam_heads = getattr(tracker, "_forward_sam_heads", None)
     original_use_mask_as_output = getattr(tracker, "_use_mask_as_output", None)
     original_tracker_forward_image = getattr(tracker, "forward_image", None)
+    original_memory_transformer_encoder_forward = getattr(
+        getattr(getattr(tracker, "transformer", None), "encoder", None),
+        "forward",
+        None,
+    )
     original_add_new_points_or_box = getattr(tracker, "add_new_points_or_box", None)
     original_add_new_mask = getattr(tracker, "add_new_mask", None)
     original_prompt_encoder_forward = getattr(
@@ -1764,6 +1769,38 @@ def install_video_internal_fixture_recorder(target, debug_dir: Path, capture_fra
             )
         return result
 
+    def wrapped_memory_transformer_encoder_forward(self, *args, **kwargs):
+        call_args = bind_call_arguments(
+            original_memory_transformer_encoder_forward, self, args, kwargs
+        )
+        frame_idx = recorder.current_context().get("frame_idx")
+        if frame_idx is None or not recorder.should_capture(frame_idx):
+            return original_memory_transformer_encoder_forward(*args, **kwargs)
+        result = original_memory_transformer_encoder_forward(*args, **kwargs)
+        tensor_map = {
+            "src": call_args["src"],
+            "prompt": call_args["prompt"],
+        }
+        if call_args.get("src_pos") is not None:
+            tensor_map["src_pos"] = call_args["src_pos"]
+        if call_args.get("prompt_pos") is not None:
+            tensor_map["prompt_pos"] = call_args["prompt_pos"]
+        add_result_tree(tensor_map, "memory_transformer_encoder_output", result)
+        recorder.add_record(
+            stage="memory_transformer_encoder",
+            frame_idx=frame_idx,
+            metadata={
+                "feat_sizes": [
+                    [int(h), int(w)] for h, w in (call_args.get("feat_sizes") or [])
+                ],
+                "num_obj_ptr_tokens": int(call_args.get("num_obj_ptr_tokens", 0)),
+                "batch_first": bool(getattr(self, "batch_first", False)),
+                "pos_enc_at_input": bool(getattr(self, "pos_enc_at_input", False)),
+            },
+            tensors=tensor_map,
+        )
+        return result
+
     def wrapped_track_step(self, *args, **kwargs):
         call_args = bind_call_arguments(original_track_step, self, args, kwargs)
         frame_idx = int(call_args["frame_idx"])
@@ -2048,6 +2085,11 @@ def install_video_internal_fixture_recorder(target, debug_dir: Path, capture_fra
     tracker._prepare_memory_conditioned_features = types.MethodType(
         wrapped_prepare_memory_conditioned_features, tracker
     )
+    if original_memory_transformer_encoder_forward is not None:
+        tracker.transformer.encoder.forward = types.MethodType(
+            wrapped_memory_transformer_encoder_forward,
+            tracker.transformer.encoder,
+        )
     tracker.track_step = types.MethodType(wrapped_track_step, tracker)
     tracker._encode_new_memory = types.MethodType(wrapped_encode_new_memory, tracker)
     if original_forward_sam_heads is not None:

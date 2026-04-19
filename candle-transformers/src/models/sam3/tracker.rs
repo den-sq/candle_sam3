@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
-use candle::{DType, Device, IndexOp, Result, Tensor};
+use candle::{D, DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{
-    Conv2d, Conv2dConfig, ConvTranspose2d, ConvTranspose2dConfig, Embedding, Module, VarBuilder,
+    Conv2d, Conv2dConfig, ConvTranspose2d, ConvTranspose2dConfig, Embedding, LayerNorm, Module,
+    VarBuilder,
 };
 
 use crate::models::segment_anything::{
@@ -618,6 +619,433 @@ struct Sam3TrackerMaskDecoder {
     dynamic_multimask_stability_thresh: f32,
 }
 
+#[derive(Debug)]
+struct TrackerRoPEAttention {
+    num_heads: usize,
+    head_dim: usize,
+    scale: f64,
+    freqs_real: Tensor,
+    freqs_imag: Tensor,
+    rope_k_repeat: bool,
+}
+
+impl TrackerRoPEAttention {
+    fn new(config: &Sam3TrackerAttentionConfig, device: &Device) -> Result<Self> {
+        if config.embedding_dim % config.num_heads != 0 {
+            candle::bail!(
+                "tracker attention embedding_dim {} must be divisible by num_heads {}",
+                config.embedding_dim,
+                config.num_heads
+            );
+        }
+        let head_dim = config.embedding_dim / config.num_heads;
+        if head_dim % 4 != 0 {
+            candle::bail!("tracker attention head_dim must be divisible by 4, got {head_dim}");
+        }
+        let (freqs_real, freqs_imag) = compute_tracker_axial_freqs(
+            head_dim,
+            config.feat_sizes[0],
+            config.feat_sizes[1],
+            config.rope_theta,
+            device,
+        )?;
+        Ok(Self {
+            num_heads: config.num_heads,
+            head_dim,
+            scale: (head_dim as f64).powf(-0.5),
+            freqs_real,
+            freqs_imag,
+            rope_k_repeat: config.rope_k_repeat,
+        })
+    }
+
+    fn forward(&self, q: &Tensor, k: &Tensor, v: &Tensor, num_k_exclude_rope: usize) -> Result<Tensor> {
+        let in_dtype = q.dtype();
+        let (batch_size, q_seq_len, q_dim) = q.dims3()?;
+        let (_, k_seq_len, k_dim) = k.dims3()?;
+        let (_, v_seq_len, v_dim) = v.dims3()?;
+        if k_seq_len != v_seq_len {
+            candle::bail!(
+                "tracker attention expected key/value sequence lengths to match, got {k_seq_len} and {v_seq_len}"
+            );
+        }
+        if q_dim != self.num_heads * self.head_dim
+            || k_dim != self.num_heads * self.head_dim
+            || v_dim != self.num_heads * self.head_dim
+        {
+            candle::bail!(
+                "tracker attention expected q/k/v dims to match num_heads*head_dim={}, got q={}, k={}, v={}",
+                self.num_heads * self.head_dim,
+                q_dim,
+                k_dim,
+                v_dim
+            );
+        }
+        let q = q
+            .reshape((batch_size, q_seq_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .to_dtype(DType::F32)?;
+        let k = k
+            .reshape((batch_size, k_seq_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .to_dtype(DType::F32)?;
+        let v = v
+            .reshape((batch_size, v_seq_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .to_dtype(DType::F32)?;
+        let (q, k) = apply_tracker_axial_rotary(
+            &q,
+            &k,
+            &self.freqs_real,
+            &self.freqs_imag,
+            self.rope_k_repeat,
+            num_k_exclude_rope,
+        )?;
+        let q = (q * self.scale)?;
+        let attn = q.matmul(&k.transpose(2, 3)?)?;
+        let attn = candle_nn::ops::softmax_last_dim(&attn)?;
+        let out = attn.matmul(&v)?;
+        out.transpose(1, 2)?
+            .reshape((batch_size, q_seq_len, self.num_heads * self.head_dim))?
+            .to_dtype(in_dtype)
+    }
+}
+
+#[derive(Debug)]
+struct TrackerTransformerLayer {
+    self_attn_q_proj: Linear,
+    self_attn_k_proj: Linear,
+    self_attn_v_proj: Linear,
+    self_attn_out_proj: Linear,
+    cross_attn_q_proj: Linear,
+    cross_attn_k_proj: Linear,
+    cross_attn_v_proj: Linear,
+    cross_attn_out_proj: Linear,
+    self_attention_rope: TrackerRoPEAttention,
+    cross_attention_rope: TrackerRoPEAttention,
+    linear1: Linear,
+    linear2: Linear,
+    norm1: LayerNorm,
+    norm2: LayerNorm,
+    norm3: LayerNorm,
+    pos_enc_at_attn: bool,
+    pos_enc_at_cross_attn_queries: bool,
+    pos_enc_at_cross_attn_keys: bool,
+    cross_attention_first: bool,
+}
+
+impl TrackerTransformerLayer {
+    fn new(config: &Sam3TrackerTransformerConfig, vb: VarBuilder) -> Result<Self> {
+        let d_model = config.d_model;
+        let cross_kv_dim = config.cross_attention.kv_in_dim.unwrap_or(d_model);
+        let self_attn_q_proj = linear(vb.pp("self_attn").pp("q_proj"), d_model, d_model, true)?;
+        let self_attn_k_proj = linear(vb.pp("self_attn").pp("k_proj"), d_model, d_model, true)?;
+        let self_attn_v_proj = linear(vb.pp("self_attn").pp("v_proj"), d_model, d_model, true)?;
+        let self_attn_out_proj =
+            linear(vb.pp("self_attn").pp("out_proj"), d_model, d_model, true)?;
+        let cross_attn_q_proj =
+            linear(vb.pp("cross_attn_image").pp("q_proj"), d_model, d_model, true)?;
+        let cross_attn_k_proj = linear(
+            vb.pp("cross_attn_image").pp("k_proj"),
+            cross_kv_dim,
+            d_model,
+            true,
+        )?;
+        let cross_attn_v_proj = linear(
+            vb.pp("cross_attn_image").pp("v_proj"),
+            cross_kv_dim,
+            d_model,
+            true,
+        )?;
+        let cross_attn_out_proj =
+            linear(vb.pp("cross_attn_image").pp("out_proj"), d_model, d_model, true)?;
+        Ok(Self {
+            self_attn_q_proj,
+            self_attn_k_proj,
+            self_attn_v_proj,
+            self_attn_out_proj,
+            cross_attn_q_proj,
+            cross_attn_k_proj,
+            cross_attn_v_proj,
+            cross_attn_out_proj,
+            self_attention_rope: TrackerRoPEAttention::new(
+                &config.self_attention,
+                vb.device(),
+            )?,
+            cross_attention_rope: TrackerRoPEAttention::new(
+                &config.cross_attention,
+                vb.device(),
+            )?,
+            linear1: linear(
+                vb.pp("linear1"),
+                d_model,
+                config.layer.dim_feedforward,
+                true,
+            )?,
+            linear2: linear(
+                vb.pp("linear2"),
+                config.layer.dim_feedforward,
+                d_model,
+                true,
+            )?,
+            norm1: candle_nn::layer_norm(d_model, 1e-5, vb.pp("norm1"))?,
+            norm2: candle_nn::layer_norm(d_model, 1e-5, vb.pp("norm2"))?,
+            norm3: candle_nn::layer_norm(d_model, 1e-5, vb.pp("norm3"))?,
+            pos_enc_at_attn: config.layer.pos_enc_at_attn,
+            pos_enc_at_cross_attn_queries: config.layer.pos_enc_at_cross_attn_queries,
+            pos_enc_at_cross_attn_keys: config.layer.pos_enc_at_cross_attn_keys,
+            cross_attention_first: config.layer.cross_attention_first,
+        })
+    }
+
+    fn forward_self_attention(&self, tgt: &Tensor, query_pos: Option<&Tensor>) -> Result<Tensor> {
+        let tgt2 = self.norm1.forward(tgt)?;
+        let qk = match (self.pos_enc_at_attn, query_pos) {
+            (true, Some(query_pos)) => tgt2.broadcast_add(query_pos)?,
+            _ => tgt2.clone(),
+        };
+        let q = self.self_attn_q_proj.forward(&qk)?;
+        let k = self.self_attn_k_proj.forward(&qk)?;
+        let v = self.self_attn_v_proj.forward(&tgt2)?;
+        let out = self.self_attention_rope.forward(&q, &k, &v, 0)?;
+        let tgt2 = self.self_attn_out_proj.forward(&out)?;
+        tgt.broadcast_add(&tgt2)
+    }
+
+    fn forward_cross_attention(
+        &self,
+        tgt: &Tensor,
+        memory: &Tensor,
+        query_pos: Option<&Tensor>,
+        memory_pos: Option<&Tensor>,
+        num_k_exclude_rope: usize,
+    ) -> Result<Tensor> {
+        let tgt2 = self.norm2.forward(tgt)?;
+        let mut q_input = tgt2.clone();
+        if self.pos_enc_at_cross_attn_queries {
+            if let Some(query_pos) = query_pos {
+                q_input = q_input.broadcast_add(query_pos)?;
+            }
+        }
+        let q = self.cross_attn_q_proj.forward(&q_input)?;
+        let mut k_input = memory.clone();
+        if self.pos_enc_at_cross_attn_keys {
+            if let Some(memory_pos) = memory_pos {
+                k_input = k_input.broadcast_add(memory_pos)?;
+            }
+        }
+        let k = self.cross_attn_k_proj.forward(&k_input)?;
+        let v = self.cross_attn_v_proj.forward(memory)?;
+        let out = self
+            .cross_attention_rope
+            .forward(&q, &k, &v, num_k_exclude_rope)?;
+        let tgt2 = self.cross_attn_out_proj.forward(&out)?;
+        tgt.broadcast_add(&tgt2)
+    }
+
+    fn forward(
+        &self,
+        tgt: &Tensor,
+        memory: &Tensor,
+        query_pos: Option<&Tensor>,
+        memory_pos: Option<&Tensor>,
+        num_k_exclude_rope: usize,
+    ) -> Result<Tensor> {
+        let tgt = if self.cross_attention_first {
+            let tgt = self.forward_cross_attention(
+                tgt,
+                memory,
+                query_pos,
+                memory_pos,
+                num_k_exclude_rope,
+            )?;
+            self.forward_self_attention(&tgt, query_pos)?
+        } else {
+            let tgt = self.forward_self_attention(tgt, query_pos)?;
+            self.forward_cross_attention(
+                &tgt,
+                memory,
+                query_pos,
+                memory_pos,
+                num_k_exclude_rope,
+            )?
+        };
+        let tgt2 = self.norm3.forward(&tgt)?;
+        let tgt2 = self.linear2.forward(&self.linear1.forward(&tgt2)?.relu()?)?;
+        tgt.broadcast_add(&tgt2)
+    }
+}
+
+#[derive(Debug)]
+struct TrackerMemoryTransformer {
+    layers: Vec<TrackerTransformerLayer>,
+    norm: LayerNorm,
+    pos_enc_at_input: bool,
+}
+
+impl TrackerMemoryTransformer {
+    fn new(config: &Sam3TrackerTransformerConfig, vb: VarBuilder) -> Result<Self> {
+        let layers_vb = vb.pp("layers");
+        let mut layers = Vec::with_capacity(config.encoder.num_layers);
+        for layer_idx in 0..config.encoder.num_layers {
+            layers.push(TrackerTransformerLayer::new(
+                config,
+                layers_vb.pp(layer_idx),
+            )?);
+        }
+        Ok(Self {
+            layers,
+            norm: candle_nn::layer_norm(config.d_model, 1e-5, vb.pp("norm"))?,
+            pos_enc_at_input: config.encoder.pos_enc_at_input,
+        })
+    }
+
+    fn forward(
+        &self,
+        src: &Tensor,
+        memory: &Tensor,
+        src_pos: Option<&Tensor>,
+        memory_pos: Option<&Tensor>,
+        num_obj_ptr_tokens: usize,
+    ) -> Result<Tensor> {
+        let mut output = if self.pos_enc_at_input {
+            match src_pos {
+                Some(src_pos) => src.broadcast_add(&(src_pos * 0.1f64)?)?,
+                None => src.clone(),
+            }
+        } else {
+            src.clone()
+        };
+        for layer in self.layers.iter() {
+            output = layer.forward(
+                &output,
+                memory,
+                src_pos,
+                memory_pos,
+                num_obj_ptr_tokens,
+            )?;
+        }
+        self.norm.forward(&output)
+    }
+}
+
+fn compute_tracker_axial_freqs(
+    dim: usize,
+    end_x: usize,
+    end_y: usize,
+    theta: f32,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    if dim % 4 != 0 {
+        candle::bail!("tracker rotary dim must be divisible by 4, got {dim}");
+    }
+    let rotary_dim = dim / 4;
+    let seq_len = end_x * end_y;
+    let inv_freqs: Vec<f32> = (0..rotary_dim)
+        .map(|i| 1f32 / theta.powf((4 * i) as f32 / dim as f32))
+        .collect();
+    let mut freqs_real = vec![0f32; seq_len * (dim / 2)];
+    let mut freqs_imag = vec![0f32; seq_len * (dim / 2)];
+    for flat_idx in 0..seq_len {
+        let x_pos = (flat_idx % end_x) as f32;
+        let y_pos = (flat_idx / end_x) as f32;
+        let row_real = &mut freqs_real[flat_idx * (dim / 2)..(flat_idx + 1) * (dim / 2)];
+        let row_imag = &mut freqs_imag[flat_idx * (dim / 2)..(flat_idx + 1) * (dim / 2)];
+        for (i, inv_freq) in inv_freqs.iter().copied().enumerate() {
+            let x_freq = x_pos * inv_freq;
+            let y_freq = y_pos * inv_freq;
+            row_real[i] = x_freq.cos();
+            row_imag[i] = x_freq.sin();
+            row_real[rotary_dim + i] = y_freq.cos();
+            row_imag[rotary_dim + i] = y_freq.sin();
+        }
+    }
+    Ok((
+        Tensor::from_slice(&freqs_real, (seq_len, dim / 2), device)?,
+        Tensor::from_slice(&freqs_imag, (seq_len, dim / 2), device)?,
+    ))
+}
+
+fn apply_tracker_rotary_single(
+    xs: &Tensor,
+    freqs_real: &Tensor,
+    freqs_imag: &Tensor,
+) -> Result<Tensor> {
+    let (batch_size, num_heads, seq_len, head_dim) = xs.dims4()?;
+    let xs_dtype = xs.dtype();
+    let xs = xs
+        .to_dtype(DType::F32)?
+        .reshape((batch_size, num_heads, seq_len, head_dim / 2, 2))?;
+    let xs_real = xs.i((.., .., .., .., 0))?;
+    let xs_imag = xs.i((.., .., .., .., 1))?;
+    let freqs_real = freqs_real.reshape((1, 1, seq_len, head_dim / 2))?;
+    let freqs_imag = freqs_imag.reshape((1, 1, seq_len, head_dim / 2))?;
+    let real = (xs_real.broadcast_mul(&freqs_real)? - xs_imag.broadcast_mul(&freqs_imag)?)?;
+    let imag = (xs_real.broadcast_mul(&freqs_imag)? + xs_imag.broadcast_mul(&freqs_real)?)?;
+    Tensor::stack(&[&real, &imag], 4)?
+        .reshape((batch_size, num_heads, seq_len, head_dim))?
+        .to_dtype(xs_dtype)
+}
+
+fn apply_tracker_axial_rotary(
+    q: &Tensor,
+    k: &Tensor,
+    freqs_real: &Tensor,
+    freqs_imag: &Tensor,
+    repeat_freqs_k: bool,
+    num_k_exclude_rope: usize,
+) -> Result<(Tensor, Tensor)> {
+    let q_seq_len = q.dim(2)?;
+    let k_seq_len = k.dim(2)?;
+    let q_freqs_real = freqs_real.narrow(0, 0, q_seq_len)?;
+    let q_freqs_imag = freqs_imag.narrow(0, 0, q_seq_len)?;
+    let q = apply_tracker_rotary_single(q, &q_freqs_real, &q_freqs_imag)?;
+
+    let num_k_rope = k_seq_len.saturating_sub(num_k_exclude_rope);
+    if num_k_rope == 0 {
+        return Ok((q, k.clone()));
+    }
+    let mut k_freqs_real = q_freqs_real.clone();
+    let mut k_freqs_imag = q_freqs_imag.clone();
+    if num_k_rope != q_seq_len {
+        if !repeat_freqs_k || num_k_rope % q_seq_len != 0 {
+            candle::bail!(
+                "tracker rotary expected key rope length {num_k_rope} to equal query length {q_seq_len} or be a whole-number repeat"
+            );
+        }
+        let repeat_factor = num_k_rope / q_seq_len;
+        k_freqs_real = k_freqs_real.repeat((repeat_factor, 1))?;
+        k_freqs_imag = k_freqs_imag.repeat((repeat_factor, 1))?;
+    }
+    let k_rope = k.narrow(2, 0, num_k_rope)?;
+    let k_rope = apply_tracker_rotary_single(&k_rope, &k_freqs_real, &k_freqs_imag)?;
+    let k = if num_k_rope < k_seq_len {
+        let k_tail = k.narrow(2, num_k_rope, k_seq_len - num_k_rope)?;
+        Tensor::cat(&[&k_rope, &k_tail], 2)?
+    } else {
+        k_rope
+    };
+    Ok((q, k))
+}
+
+#[derive(Debug)]
+struct PreparedMemoryConditioning {
+    pix_feat_with_mem: Tensor,
+    selected_conditioning_frame_indices: Vec<usize>,
+    selected_memory_frame_indices: Vec<usize>,
+    selected_object_pointer_frame_indices: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct PreparedMemoryPrompt {
+    prompt: Option<Tensor>,
+    prompt_pos: Option<Tensor>,
+    num_obj_ptr_tokens: usize,
+    selected_conditioning_frame_indices: Vec<usize>,
+    selected_memory_frame_indices: Vec<usize>,
+    selected_object_pointer_frame_indices: Vec<usize>,
+}
+
 impl Sam3TrackerMaskDecoder {
     fn new(config: &Sam3TrackerMaskDecoderConfig, vb: VarBuilder) -> Result<Self> {
         let num_mask_tokens = config.num_multimask_outputs + 1;
@@ -953,6 +1381,7 @@ pub struct Sam3TrackerModel {
     config: Sam3TrackerConfig,
     vision_trunk: Option<Sam3ViTDetTrunk>,
     vision_neck: Option<Sam3DualViTDetNeck>,
+    memory_transformer: TrackerMemoryTransformer,
     mask_downsample: Conv2d,
     sam_prompt_encoder: PromptEncoder,
     sam_mask_decoder: Sam3TrackerMaskDecoder,
@@ -991,6 +1420,8 @@ impl Sam3TrackerModel {
             },
             vb.pp("mask_downsample"),
         )?;
+        let memory_transformer =
+            TrackerMemoryTransformer::new(&config.transformer, vb.pp("transformer").pp("encoder"))?;
         let sam_prompt_encoder = PromptEncoder::new(
             config.prompt_encoder.embed_dim,
             (
@@ -1024,6 +1455,7 @@ impl Sam3TrackerModel {
             config: config.clone(),
             vision_trunk,
             vision_neck,
+            memory_transformer,
             mask_downsample,
             sam_prompt_encoder,
             sam_mask_decoder,
@@ -1096,6 +1528,457 @@ impl Sam3TrackerModel {
         self.obj_ptr_tpos_proj.forward(&pos_enc)
     }
 
+    fn cal_mem_score(&self, object_score_logits: &Tensor, iou_score: &Tensor) -> Result<f32> {
+        let zeros = Tensor::zeros_like(object_score_logits)?;
+        let object_score_norm = object_score_logits
+            .gt(0f64)?
+            .where_cond(
+                &((candle_nn::ops::sigmoid(object_score_logits)? * 2f64)? - 1f64)?,
+                &zeros,
+            )?;
+        object_score_norm
+            .broadcast_mul(iou_score)?
+            .mean_all()?
+            .to_dtype(DType::F32)?
+            .to_vec0::<f32>()
+    }
+
+    fn frame_filter(
+        &self,
+        history: &BTreeMap<usize, TrackerFrameState>,
+        track_in_reverse: bool,
+        frame_idx: usize,
+        num_frames: usize,
+        r: usize,
+    ) -> Result<Vec<usize>> {
+        if (frame_idx == 0 && !track_in_reverse)
+            || (frame_idx + 1 == num_frames && track_in_reverse)
+        {
+            return Ok(Vec::new());
+        }
+
+        let max_num = self.config.max_obj_ptrs_in_encoder.min(num_frames);
+        let (start, end, step, must_include) = if !track_in_reverse {
+            (frame_idx.saturating_sub(1) as isize, 0isize, -(r as isize), frame_idx.saturating_sub(1))
+        } else {
+            (
+                (frame_idx + 1) as isize,
+                num_frames as isize,
+                r as isize,
+                frame_idx + 1,
+            )
+        };
+
+        let mut valid_indices = Vec::new();
+        let mut i = start;
+        while if !track_in_reverse { i >= end } else { i < end } {
+            let frame = i as usize;
+            let Some(state) = history.get(&frame) else {
+                i += step;
+                continue;
+            };
+            if state.is_cond_frame {
+                i += step;
+                continue;
+            }
+            let iou_score = state.iou_scores.max(D::Minus1)?;
+            let score_per_frame = self.cal_mem_score(&state.object_score_logits, &iou_score)?;
+            if score_per_frame > self.config.mf_threshold {
+                valid_indices.insert(0, frame);
+            }
+            if valid_indices.len() >= max_num.saturating_sub(1) {
+                break;
+            }
+            i += step;
+        }
+        if !valid_indices.contains(&must_include) {
+            valid_indices.push(must_include);
+        }
+        Ok(valid_indices)
+    }
+
+    fn select_closest_cond_frame_indices(
+        &self,
+        frame_idx: usize,
+        cond_frame_outputs: &BTreeMap<usize, &TrackerFrameState>,
+    ) -> (Vec<usize>, Vec<usize>) {
+        if self.config.max_cond_frames_in_attn == usize::MAX {
+            return (
+                cond_frame_outputs.keys().copied().collect(),
+                Vec::new(),
+            );
+        }
+
+        let mut selected = Vec::new();
+        let push_unique = |items: &mut Vec<usize>, value: Option<usize>| {
+            if let Some(value) = value {
+                if !items.contains(&value) {
+                    items.push(value);
+                }
+            }
+        };
+        if self.config.keep_first_cond_frame {
+            let idx_first = cond_frame_outputs
+                .keys()
+                .copied()
+                .filter(|t| *t < frame_idx)
+                .min()
+                .or_else(|| cond_frame_outputs.keys().copied().filter(|t| *t > frame_idx).max());
+            push_unique(&mut selected, idx_first);
+        }
+        let idx_before = cond_frame_outputs
+            .keys()
+            .copied()
+            .filter(|t| *t < frame_idx)
+            .max();
+        push_unique(&mut selected, idx_before);
+        let idx_after = cond_frame_outputs
+            .keys()
+            .copied()
+            .filter(|t| *t >= frame_idx)
+            .min();
+        push_unique(&mut selected, idx_after);
+
+        let num_remain = self
+            .config
+            .max_cond_frames_in_attn
+            .saturating_sub(selected.len());
+        let mut remaining = cond_frame_outputs
+            .keys()
+            .copied()
+            .filter(|t| !selected.contains(t))
+            .collect::<Vec<_>>();
+        remaining.sort_by_key(|t| {
+            let abs = if *t >= frame_idx { *t - frame_idx } else { frame_idx - *t };
+            (abs, *t)
+        });
+        selected.extend(remaining.into_iter().take(num_remain));
+
+        let selected_set = selected.clone();
+        let unselected = cond_frame_outputs
+            .keys()
+            .copied()
+            .filter(|t| !selected_set.contains(t))
+            .collect::<Vec<_>>();
+        (selected, unselected)
+    }
+
+    fn prepare_memory_conditioned_features(
+        &self,
+        frame_idx: usize,
+        is_init_cond_frame: bool,
+        current_vision_feats: &[Tensor],
+        current_vision_pos_embeds: &[Tensor],
+        feat_sizes: &[(usize, usize)],
+        history: &BTreeMap<usize, TrackerFrameState>,
+        num_frames: usize,
+        track_in_reverse: bool,
+        use_prev_mem_frame: bool,
+    ) -> Result<PreparedMemoryConditioning> {
+        let batch_size = current_vision_feats
+            .last()
+            .ok_or_else(|| candle::Error::Msg("tracker requires at least one current vision feature".into()))?
+            .dim(1)?;
+        let channels = self.config.hidden_dim;
+        let (height, width) = *feat_sizes
+            .last()
+            .ok_or_else(|| candle::Error::Msg("tracker requires at least one feature size".into()))?;
+        if self.config.num_maskmem == 0 || is_init_cond_frame || !use_prev_mem_frame {
+            let pix_feat_with_mem = current_vision_feats
+                .last()
+                .expect("checked above")
+                .broadcast_add(&self.no_mem_embed)?
+                .permute((1, 2, 0))?
+                .reshape((batch_size, channels, height, width))?;
+            return Ok(PreparedMemoryConditioning {
+                pix_feat_with_mem,
+                selected_conditioning_frame_indices: Vec::new(),
+                selected_memory_frame_indices: Vec::new(),
+                selected_object_pointer_frame_indices: Vec::new(),
+            });
+        }
+
+        let cond_frame_outputs = history
+            .iter()
+            .filter_map(|(frame, state)| state.is_cond_frame.then_some((*frame, state)))
+            .collect::<BTreeMap<_, _>>();
+        if cond_frame_outputs.is_empty() {
+            candle::bail!("tracker memory conditioning expected at least one conditioning frame");
+        }
+        let prepared_prompt = self.build_memory_conditioning_prompt(
+            frame_idx,
+            history,
+            num_frames,
+            track_in_reverse,
+            &cond_frame_outputs,
+        )?;
+        let selected_conditioning_frame_indices =
+            prepared_prompt.selected_conditioning_frame_indices.clone();
+        let selected_object_pointer_frame_indices =
+            prepared_prompt.selected_object_pointer_frame_indices.clone();
+        let selected_memory_frame_indices = prepared_prompt.selected_memory_frame_indices.clone();
+
+        let Some(prompt) = prepared_prompt.prompt else {
+            let pix_feat_with_mem = current_vision_feats
+                .last()
+                .expect("checked above")
+                .broadcast_add(&self.no_mem_embed)?
+                .permute((1, 2, 0))?
+                .reshape((batch_size, channels, height, width))?;
+            return Ok(PreparedMemoryConditioning {
+                pix_feat_with_mem,
+                selected_conditioning_frame_indices,
+                selected_memory_frame_indices,
+                selected_object_pointer_frame_indices,
+            });
+        };
+        let prompt_pos = prepared_prompt
+            .prompt_pos
+            .expect("prompt position encoding must exist whenever prompt exists");
+        let num_obj_ptr_tokens = prepared_prompt.num_obj_ptr_tokens;
+        let src = current_vision_feats
+            .last()
+            .expect("checked above")
+            .transpose(0, 1)?
+            .contiguous()?;
+        let src_pos = current_vision_pos_embeds
+            .last()
+            .expect("checked above")
+            .transpose(0, 1)?
+            .contiguous()?;
+        let prompt = prompt.transpose(0, 1)?.contiguous()?;
+        let prompt_pos = prompt_pos.transpose(0, 1)?.contiguous()?;
+        let encoded = self.memory_transformer.forward(
+            &src,
+            &prompt,
+            Some(&src_pos),
+            Some(&prompt_pos),
+            num_obj_ptr_tokens,
+        )?;
+        let pix_feat_with_mem = encoded
+            .transpose(1, 2)?
+            .reshape((batch_size, channels, height, width))?;
+        Ok(PreparedMemoryConditioning {
+            pix_feat_with_mem,
+            selected_conditioning_frame_indices,
+            selected_memory_frame_indices,
+            selected_object_pointer_frame_indices,
+        })
+    }
+
+    fn build_memory_conditioning_prompt(
+        &self,
+        frame_idx: usize,
+        history: &BTreeMap<usize, TrackerFrameState>,
+        num_frames: usize,
+        track_in_reverse: bool,
+        cond_frame_outputs: &BTreeMap<usize, &TrackerFrameState>,
+    ) -> Result<PreparedMemoryPrompt> {
+        let device = cond_frame_outputs
+            .values()
+            .next()
+            .map(|state| state.obj_ptr.device())
+            .ok_or_else(|| candle::Error::Msg("tracker memory conditioning expected at least one conditioning frame".into()))?;
+        let batch_size = cond_frame_outputs
+            .values()
+            .next()
+            .map(|state| state.obj_ptr.dim(0))
+            .transpose()?
+            .ok_or_else(|| candle::Error::Msg("tracker memory conditioning expected at least one conditioning frame".into()))?;
+        let channels = self.config.hidden_dim;
+        let (selected_cond_ordered, unselected_cond_indices) =
+            self.select_closest_cond_frame_indices(frame_idx, cond_frame_outputs);
+        let mut selected_conditioning_frame_indices = selected_cond_ordered.clone();
+        selected_conditioning_frame_indices.sort_unstable();
+        let unselected_cond_outputs = unselected_cond_indices
+            .iter()
+            .filter_map(|frame| cond_frame_outputs.get(frame).map(|state| (*frame, *state)))
+            .collect::<BTreeMap<_, _>>();
+
+        let tpos_sign_mul: i64 = if track_in_reverse { -1 } else { 1 };
+        let mut prompt_parts = Vec::new();
+        let mut prompt_pos_parts = Vec::new();
+        let mut selected_memory_frame_indices_ordered = Vec::new();
+        let mut selected_object_pointer_frame_indices = Vec::new();
+
+        for &selected_frame in selected_cond_ordered.iter() {
+            let prev = cond_frame_outputs
+                .get(&selected_frame)
+                .expect("selected conditioning frame missing from history");
+            let Some(maskmem_features) = &prev.maskmem_features else {
+                candle::bail!(
+                    "conditioning frame {selected_frame} is missing maskmem_features required for tracker memory conditioning"
+                );
+            };
+            let Some(maskmem_pos_enc) = &prev.maskmem_pos_enc else {
+                candle::bail!(
+                    "conditioning frame {selected_frame} is missing maskmem_pos_enc required for tracker memory conditioning"
+                );
+            };
+            prompt_parts.push(maskmem_features.flatten(2, 3)?.permute((2, 0, 1))?);
+            let pos = maskmem_pos_enc.flatten(2, 3)?.permute((2, 0, 1))?;
+            let pos = pos.broadcast_add(&self.maskmem_tpos_enc.i(self.config.num_maskmem - 1)?)?;
+            prompt_pos_parts.push(pos);
+        }
+
+        let r = self.config.memory_temporal_stride_for_eval.max(1);
+        let valid_indices = if self.config.use_memory_selection {
+            Some(self.frame_filter(history, track_in_reverse, frame_idx, num_frames, r)?)
+        } else {
+            None
+        };
+        for t_pos in 1..self.config.num_maskmem {
+            let t_rel = self.config.num_maskmem - t_pos;
+            let prev_frame_idx = if let Some(valid_indices) = valid_indices.as_ref() {
+                if t_rel > valid_indices.len() {
+                    continue;
+                }
+                valid_indices[valid_indices.len() - t_rel]
+            } else if t_rel == 1 {
+                if !track_in_reverse {
+                    frame_idx.saturating_sub(t_rel)
+                } else {
+                    frame_idx + t_rel
+                }
+            } else if !track_in_reverse {
+                let nearest = ((frame_idx.saturating_sub(2)) / r) * r;
+                nearest.saturating_sub((t_rel - 2) * r)
+            } else {
+                let nearest = (frame_idx + 1).div_ceil(r) * r;
+                nearest + (t_rel - 2) * r
+            };
+            let prev = history
+                .get(&prev_frame_idx)
+                .filter(|state| !state.is_cond_frame)
+                .or_else(|| unselected_cond_outputs.get(&prev_frame_idx).copied());
+            let Some(prev) = prev else {
+                continue;
+            };
+            let Some(maskmem_features) = &prev.maskmem_features else {
+                candle::bail!(
+                    "memory frame {prev_frame_idx} is missing maskmem_features required for tracker memory conditioning"
+                );
+            };
+            let Some(maskmem_pos_enc) = &prev.maskmem_pos_enc else {
+                candle::bail!(
+                    "memory frame {prev_frame_idx} is missing maskmem_pos_enc required for tracker memory conditioning"
+                );
+            };
+            prompt_parts.push(maskmem_features.flatten(2, 3)?.permute((2, 0, 1))?);
+            let pos = maskmem_pos_enc.flatten(2, 3)?.permute((2, 0, 1))?;
+            let pos =
+                pos.broadcast_add(&self.maskmem_tpos_enc.i(self.config.num_maskmem - t_pos - 1)?)?;
+            prompt_pos_parts.push(pos);
+            selected_memory_frame_indices_ordered.push(prev_frame_idx);
+        }
+
+        let max_obj_ptrs_in_encoder = self.config.max_obj_ptrs_in_encoder.min(num_frames);
+        let ptr_cond_frames = if !track_in_reverse {
+            selected_cond_ordered
+                .iter()
+                .copied()
+                .filter(|t| *t <= frame_idx)
+                .collect::<Vec<_>>()
+        } else {
+            selected_cond_ordered
+                .iter()
+                .copied()
+                .filter(|t| *t >= frame_idx)
+                .collect::<Vec<_>>()
+        };
+        let mut obj_ptr_tensors = Vec::new();
+        let mut obj_ptr_offsets = Vec::new();
+        for selected_frame in ptr_cond_frames.iter().copied() {
+            selected_object_pointer_frame_indices.push(selected_frame);
+            obj_ptr_offsets.push(((frame_idx as i64 - selected_frame as i64) * tpos_sign_mul) as i64);
+            obj_ptr_tensors.push(
+                cond_frame_outputs
+                    .get(&selected_frame)
+                    .expect("conditioning frame missing obj_ptr source")
+                    .obj_ptr
+                    .clone(),
+            );
+        }
+        for t_diff in 1..max_obj_ptrs_in_encoder {
+            let frame = if let Some(valid_indices) = valid_indices.as_ref() {
+                if t_diff > valid_indices.len().saturating_sub(1) {
+                    break;
+                }
+                valid_indices[valid_indices.len() - t_diff]
+            } else if !track_in_reverse {
+                let frame = frame_idx.saturating_sub(t_diff);
+                if frame_idx < t_diff {
+                    break;
+                }
+                frame
+            } else {
+                let frame = frame_idx + t_diff;
+                if frame >= num_frames {
+                    break;
+                }
+                frame
+            };
+            let prev = history
+                .get(&frame)
+                .filter(|state| !state.is_cond_frame)
+                .or_else(|| unselected_cond_outputs.get(&frame).copied());
+            if let Some(prev) = prev {
+                selected_object_pointer_frame_indices.push(frame);
+                obj_ptr_offsets.push(t_diff as i64);
+                obj_ptr_tensors.push(prev.obj_ptr.clone());
+            }
+        }
+
+        let mut num_obj_ptr_tokens = 0usize;
+        if !obj_ptr_tensors.is_empty() {
+            let mut obj_ptrs = Tensor::stack(obj_ptr_tensors.as_slice(), 0)?;
+            let mut obj_pos = self.get_tpos_enc(
+                obj_ptr_offsets.as_slice(),
+                device,
+                Some(max_obj_ptrs_in_encoder),
+                false,
+            )?;
+            obj_pos = obj_pos
+                .unsqueeze(1)?
+                .expand((obj_ptr_offsets.len(), batch_size, self.config.memory_dim))?;
+            if self.config.memory_dim < channels {
+                let split = channels / self.config.memory_dim;
+                obj_ptrs = obj_ptrs
+                    .reshape((obj_ptrs.dim(0)?, batch_size, split, self.config.memory_dim))?
+                    .permute((0, 2, 1, 3))?
+                    .flatten(0, 1)?;
+                obj_pos = repeat_interleave(&obj_pos, split, 0)?;
+            }
+            num_obj_ptr_tokens = obj_ptrs.dim(0)?;
+            prompt_parts.push(obj_ptrs);
+            prompt_pos_parts.push(obj_pos);
+        }
+
+        let mut selected_memory_frame_indices = selected_memory_frame_indices_ordered;
+        selected_memory_frame_indices.sort_unstable();
+        if prompt_parts.is_empty() {
+            return Ok(PreparedMemoryPrompt {
+                prompt: None,
+                prompt_pos: None,
+                num_obj_ptr_tokens,
+                selected_conditioning_frame_indices,
+                selected_memory_frame_indices,
+                selected_object_pointer_frame_indices,
+            });
+        }
+
+        let prompt_refs = prompt_parts.iter().collect::<Vec<_>>();
+        let prompt_pos_refs = prompt_pos_parts.iter().collect::<Vec<_>>();
+        Ok(PreparedMemoryPrompt {
+            prompt: Some(Tensor::cat(prompt_refs.as_slice(), 0)?),
+            prompt_pos: Some(Tensor::cat(prompt_pos_refs.as_slice(), 0)?),
+            num_obj_ptr_tokens,
+            selected_conditioning_frame_indices,
+            selected_memory_frame_indices,
+            selected_object_pointer_frame_indices,
+        })
+    }
+
     pub fn encode_image_features(&self, image: &Tensor) -> Result<VisualBackboneOutput> {
         let vision_trunk = self.vision_trunk.as_ref().ok_or_else(|| {
             candle::Error::Msg(
@@ -1140,11 +2023,6 @@ impl Sam3TrackerModel {
                 "SAM3 tracker strict port currently supports prompt-frame forward tracking only; reverse tracking lands in a later step."
             );
         }
-        if !_history.is_empty() {
-            candle::bail!(
-                "SAM3 tracker strict port currently supports prompt frames without history only; memory-conditioned tracking lands in a later step."
-            );
-        }
         if run_mem_encoder {
             candle::bail!(
                 "SAM3 tracker strict port currently supports run_mem_encoder=false only; memory writes land in a later step."
@@ -1162,11 +2040,6 @@ impl Sam3TrackerModel {
             );
         }
         let compute_dtype = self.no_obj_ptr.dtype();
-        let backbone_features = _visual
-            .backbone_fpn
-            .last()
-            .expect("checked non-empty above")
-            .to_dtype(compute_dtype)?;
         let prepared_high_res_features = if _visual.backbone_fpn.len() > 1 {
             Some(self.prepare_high_res_features(
                 &_visual.backbone_fpn[.._visual.backbone_fpn.len() - 1],
@@ -1175,6 +2048,67 @@ impl Sam3TrackerModel {
             None
         };
         let high_res_features = prepared_high_res_features.as_deref();
+        let mut prompt_frame_indices = if is_conditioning_frame {
+            vec![_frame_idx]
+        } else {
+            Vec::new()
+        };
+        let mut memory_frame_indices = Vec::new();
+        let backbone_features = if !_history.is_empty() {
+            let feat_sizes = _visual
+                .backbone_fpn
+                .iter()
+                .zip(_visual.vision_pos_enc.iter())
+                .map(|(feat, pos)| {
+                    let (_, feat_channels, feat_h, feat_w) = feat.dims4()?;
+                    let pos_shape = pos.dims4()?;
+                    if pos_shape != (1, feat_channels, feat_h, feat_w) {
+                        candle::bail!(
+                            "tracker expected matching feature/pos shapes, got ({feat_channels}, {feat_h}, {feat_w}) and {pos_shape:?}"
+                        );
+                    }
+                    Ok((feat_h, feat_w))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let current_vision_feats = _visual
+                .backbone_fpn
+                .iter()
+                .map(|feat| {
+                    feat.to_dtype(compute_dtype)?
+                        .permute((2, 3, 0, 1))?
+                        .reshape((feat.dim(2)? * feat.dim(3)?, feat.dim(0)?, feat.dim(1)?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let current_vision_pos_embeds = _visual
+                .vision_pos_enc
+                .iter()
+                .map(|pos| {
+                    pos.to_dtype(compute_dtype)?
+                        .permute((2, 3, 0, 1))?
+                        .reshape((pos.dim(2)? * pos.dim(3)?, pos.dim(0)?, pos.dim(1)?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let prepared = self.prepare_memory_conditioned_features(
+                _frame_idx,
+                is_conditioning_frame,
+                current_vision_feats.as_slice(),
+                current_vision_pos_embeds.as_slice(),
+                feat_sizes.as_slice(),
+                _history,
+                _num_frames,
+                reverse,
+                _use_prev_mem_frame,
+            )?;
+            prompt_frame_indices = prepared.selected_conditioning_frame_indices;
+            memory_frame_indices = prepared.selected_memory_frame_indices;
+            prepared.pix_feat_with_mem.to_dtype(compute_dtype)?
+        } else {
+            _visual
+                .backbone_fpn
+                .last()
+                .expect("checked non-empty above")
+                .to_dtype(compute_dtype)?
+        };
         if let Some(mask_input) = _mask_input {
             let state = self.use_mask_as_output(
                 &backbone_features,
@@ -1184,12 +2118,8 @@ impl Sam3TrackerModel {
             )?;
             return Ok(TrackerStepOutput {
                 state,
-                prompt_frame_indices: if is_conditioning_frame {
-                    vec![_frame_idx]
-                } else {
-                    Vec::new()
-                },
-                memory_frame_indices: Vec::new(),
+                prompt_frame_indices,
+                memory_frame_indices,
             });
         }
         let point_prompt = self.prepare_point_prompt(
@@ -1213,12 +2143,8 @@ impl Sam3TrackerModel {
         )?;
         Ok(TrackerStepOutput {
             state,
-            prompt_frame_indices: if is_conditioning_frame {
-                vec![_frame_idx]
-            } else {
-                Vec::new()
-            },
-            memory_frame_indices: Vec::new(),
+            prompt_frame_indices,
+            memory_frame_indices,
         })
     }
 
@@ -2025,6 +2951,11 @@ mod tests {
     enum TrackerFixtureBundle {
         Default,
         TemporalDisambiguation,
+        LongHistoryStride1,
+        LongHistoryObjPtrOverflow,
+        LongHistoryStrideGt1,
+        LongHistoryKeepFirstCond,
+        LongHistoryTemporalDisambiguation,
         PointSingleClick,
         PointMultiClick,
         PointAllPoints,
@@ -2039,6 +2970,21 @@ mod tests {
                 Self::Default => "../candle-examples/examples/sam3/reference_video_box_debug/debug",
                 Self::TemporalDisambiguation => {
                     "../candle-examples/examples/sam3/reference_video_box_debug_temporal_disambiguation/debug"
+                }
+                Self::LongHistoryStride1 => {
+                    "../candle-examples/examples/sam3/reference_video_long_history_stride1_debug/debug"
+                }
+                Self::LongHistoryObjPtrOverflow => {
+                    "../candle-examples/examples/sam3/reference_video_long_history_obj_ptr_overflow_debug/debug"
+                }
+                Self::LongHistoryStrideGt1 => {
+                    "../candle-examples/examples/sam3/reference_video_long_history_stride_gt1_debug/debug"
+                }
+                Self::LongHistoryKeepFirstCond => {
+                    "../candle-examples/examples/sam3/reference_video_long_history_keep_first_cond_debug/debug"
+                }
+                Self::LongHistoryTemporalDisambiguation => {
+                    "../candle-examples/examples/sam3/reference_video_long_history_temporal_disambiguation_debug/debug"
                 }
                 Self::PointSingleClick => {
                     "../candle-examples/examples/sam3/reference_video_point_debug_single_click/debug"
@@ -2153,6 +3099,17 @@ mod tests {
         let fixture = &manifest.tracker_config;
         let predictor = &manifest.predictor_config;
         let mut config = Sam3TrackerConfig::build_tracker(fixture.use_memory_selection);
+        config.image_size = fixture.image_size;
+        config.backbone_stride = fixture.backbone_stride;
+        config.num_maskmem = fixture.num_maskmem;
+        config.max_cond_frames_in_attn = fixture.max_cond_frames_in_attn;
+        config.keep_first_cond_frame = fixture.keep_first_cond_frame;
+        config.memory_temporal_stride_for_eval = fixture.memory_temporal_stride_for_eval;
+        config.max_obj_ptrs_in_encoder = fixture.max_obj_ptrs_in_encoder;
+        config.non_overlap_masks_for_mem_enc = fixture.non_overlap_masks_for_mem_enc;
+        config.sigmoid_scale_for_mem_enc = fixture.sigmoid_scale_for_mem_enc;
+        config.sigmoid_bias_for_mem_enc = fixture.sigmoid_bias_for_mem_enc;
+        config.mf_threshold = fixture.mf_threshold;
         config.multimask_output_in_sam = fixture.multimask_output_in_sam;
         config.multimask_output_for_tracking = fixture.multimask_output_for_tracking;
         config.multimask_min_pt_num = fixture.multimask_min_pt_num;
@@ -2214,21 +3171,41 @@ mod tests {
         bundle: TrackerFixtureBundle,
         forward_stage: &TrackerInternalRecord,
     ) -> Result<VisualBackboneOutput> {
-        let high_res_0 = load_tracker_fixture_tensor(
-            bundle,
-            forward_stage.tensor_keys["high_res_features.0"].as_str(),
-        )?;
-        let high_res_1 = load_tracker_fixture_tensor(
-            bundle,
-            forward_stage.tensor_keys["high_res_features.1"].as_str(),
-        )?;
-        let backbone = load_tracker_fixture_tensor(
-            bundle,
-            forward_stage.tensor_keys["backbone_features"].as_str(),
-        )?;
-        let pos0 = Tensor::zeros(high_res_0.shape(), high_res_0.dtype(), &candle::Device::Cpu)?;
-        let pos1 = Tensor::zeros(high_res_1.shape(), high_res_1.dtype(), &candle::Device::Cpu)?;
-        let pos2 = Tensor::zeros(backbone.shape(), backbone.dtype(), &candle::Device::Cpu)?;
+        let (feat0_key, feat1_key, feat2_key, pos0_key, pos1_key, pos2_key) =
+            if forward_stage.tensor_keys.contains_key("high_res_features.0") {
+                (
+                    "high_res_features.0",
+                    "high_res_features.1",
+                    "backbone_features",
+                    None,
+                    None,
+                    None,
+                )
+            } else {
+                (
+                    "forward_image_output.backbone_fpn.0",
+                    "forward_image_output.backbone_fpn.1",
+                    "forward_image_output.backbone_fpn.2",
+                    Some("forward_image_output.vision_pos_enc.0"),
+                    Some("forward_image_output.vision_pos_enc.1"),
+                    Some("forward_image_output.vision_pos_enc.2"),
+                )
+            };
+        let high_res_0 = load_tracker_fixture_tensor(bundle, forward_stage.tensor_keys[feat0_key].as_str())?;
+        let high_res_1 = load_tracker_fixture_tensor(bundle, forward_stage.tensor_keys[feat1_key].as_str())?;
+        let backbone = load_tracker_fixture_tensor(bundle, forward_stage.tensor_keys[feat2_key].as_str())?;
+        let pos0 = match pos0_key {
+            Some(key) => load_tracker_fixture_tensor(bundle, forward_stage.tensor_keys[key].as_str())?,
+            None => Tensor::zeros(high_res_0.shape(), high_res_0.dtype(), &candle::Device::Cpu)?,
+        };
+        let pos1 = match pos1_key {
+            Some(key) => load_tracker_fixture_tensor(bundle, forward_stage.tensor_keys[key].as_str())?,
+            None => Tensor::zeros(high_res_1.shape(), high_res_1.dtype(), &candle::Device::Cpu)?,
+        };
+        let pos2 = match pos2_key {
+            Some(key) => load_tracker_fixture_tensor(bundle, forward_stage.tensor_keys[key].as_str())?,
+            None => Tensor::zeros(backbone.shape(), backbone.dtype(), &candle::Device::Cpu)?,
+        };
         Ok(VisualBackboneOutput {
             backbone_fpn: vec![high_res_0, high_res_1, backbone],
             vision_pos_enc: vec![pos0, pos1, pos2],
@@ -2591,6 +3568,17 @@ mod tests {
             })
     }
 
+    fn maybe_tracker_record<'a>(
+        manifest: &'a TrackerInternalManifest,
+        frame_idx: usize,
+        stage: &str,
+    ) -> Option<&'a TrackerInternalRecord> {
+        manifest
+            .records
+            .iter()
+            .find(|record| record.frame_idx == frame_idx && record.stage == stage)
+    }
+
     fn fixture_shape(record: &TrackerInternalRecord, key: &str) -> Result<Vec<usize>> {
         record
             .tensor_stats
@@ -2615,6 +3603,627 @@ mod tests {
                     record.frame_idx, record.stage
                 ))
             })
+    }
+
+    fn metadata_usize_vec(metadata: &serde_json::Value, key: &str) -> Result<Vec<usize>> {
+        metadata
+            .get(key)
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| {
+                candle::Error::Msg(format!("tracker fixture metadata missing usize vec `{key}`"))
+            })?
+            .iter()
+            .map(|value| {
+                value.as_u64().map(|value| value as usize).ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "tracker fixture metadata `{key}` contained non-usize value {value}"
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    fn metadata_i64_vec(metadata: &serde_json::Value, key: &str) -> Result<Vec<i64>> {
+        metadata
+            .get(key)
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| {
+                candle::Error::Msg(format!("tracker fixture metadata missing i64 vec `{key}`"))
+            })?
+            .iter()
+            .map(|value| {
+                value.as_i64().ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "tracker fixture metadata `{key}` contained non-i64 value {value}"
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    fn load_track_step_history_state(
+        bundle: TrackerFixtureBundle,
+        manifest: &TrackerInternalManifest,
+        frame_idx: usize,
+        dtype: DType,
+    ) -> Result<Option<TrackerFrameState>> {
+        let Some(track_step) = maybe_tracker_record(manifest, frame_idx, "track_step") else {
+            return Ok(None);
+        };
+        let device = &candle::Device::Cpu;
+        let is_cond_frame = track_step.metadata["is_init_cond_frame"].as_bool().unwrap_or(false);
+        let low_res_masks = load_tracker_fixture_tensor(
+            bundle,
+            track_step.tensor_keys["track_step_output.pred_masks"].as_str(),
+        )?
+        .to_dtype(dtype)?;
+        let high_res_masks = load_tracker_fixture_tensor(
+            bundle,
+            track_step.tensor_keys["track_step_output.pred_masks_high_res"].as_str(),
+        )?
+        .to_dtype(dtype)?;
+        let obj_ptr = load_tracker_fixture_tensor(
+            bundle,
+            track_step.tensor_keys["track_step_output.obj_ptr"].as_str(),
+        )?
+        .to_dtype(dtype)?;
+        let object_score_logits = load_tracker_fixture_tensor(
+            bundle,
+            track_step.tensor_keys["track_step_output.object_score_logits"].as_str(),
+        )?
+        .to_dtype(dtype)?;
+        let iou_scores = match track_step.tensor_keys.get("track_step_output.iou_score") {
+            Some(key) => load_tracker_fixture_tensor(bundle, key.as_str())?.to_dtype(dtype)?,
+            None => Tensor::zeros((low_res_masks.dim(0)?, 1), dtype, device)?,
+        };
+        let maskmem_features = track_step
+            .tensor_keys
+            .get("track_step_output.maskmem_features")
+            .map(|key| load_tracker_fixture_tensor(bundle, key.as_str()))
+            .transpose()?;
+        let maskmem_features = maskmem_features.map(|tensor| tensor.to_dtype(dtype)).transpose()?;
+        let maskmem_pos_enc = track_step
+            .tensor_keys
+            .get("track_step_output.maskmem_pos_enc.0")
+            .map(|key| load_tracker_fixture_tensor(bundle, key.as_str()))
+            .transpose()?;
+        let maskmem_pos_enc = maskmem_pos_enc.map(|tensor| tensor.to_dtype(dtype)).transpose()?;
+        if maskmem_features.is_some() || !is_cond_frame {
+            return Ok(Some(TrackerFrameState {
+                low_res_masks,
+                high_res_masks,
+                iou_scores,
+                obj_ptr,
+                object_score_logits,
+                maskmem_features,
+                maskmem_pos_enc,
+                is_cond_frame,
+            }));
+        }
+
+        let Some(preflight) = maybe_tracker_record(manifest, frame_idx, "propagate_in_video_preflight") else {
+            return Ok(Some(TrackerFrameState {
+                low_res_masks,
+                high_res_masks,
+                iou_scores,
+                obj_ptr,
+                object_score_logits,
+                maskmem_features: None,
+                maskmem_pos_enc: None,
+                is_cond_frame,
+            }));
+        };
+        let features_key = format!("preflight_output.cond_frame_outputs.{frame_idx}.maskmem_features");
+        let pos_key = format!("preflight_output.cond_frame_outputs.{frame_idx}.maskmem_pos_enc.0");
+        let maskmem_features = preflight
+            .tensor_keys
+            .get(&features_key)
+            .map(|key| load_tracker_fixture_tensor(bundle, key.as_str()))
+            .transpose()?;
+        let maskmem_features = maskmem_features.map(|tensor| tensor.to_dtype(dtype)).transpose()?;
+        let maskmem_pos_enc = preflight
+            .tensor_keys
+            .get(&pos_key)
+            .map(|key| load_tracker_fixture_tensor(bundle, key.as_str()))
+            .transpose()?;
+        let maskmem_pos_enc = maskmem_pos_enc.map(|tensor| tensor.to_dtype(dtype)).transpose()?;
+        Ok(Some(TrackerFrameState {
+            low_res_masks,
+            high_res_masks,
+            iou_scores,
+            obj_ptr,
+            object_score_logits,
+            maskmem_features,
+            maskmem_pos_enc,
+            is_cond_frame,
+        }))
+    }
+
+    fn load_prepare_selected_conditioning_state(
+        bundle: TrackerFixtureBundle,
+        prepare: &TrackerInternalRecord,
+        frame_idx: usize,
+        image_size: usize,
+        dtype: DType,
+    ) -> Result<Option<TrackerFrameState>> {
+        let pred_key = format!("selected_conditioning_frames.{frame_idx}.pred_masks");
+        let Some(pred_key_ref) = prepare.tensor_keys.get(&pred_key) else {
+            return Ok(None);
+        };
+        let device = &candle::Device::Cpu;
+        let low_res_masks = load_tracker_fixture_tensor(bundle, pred_key_ref.as_str())?.to_dtype(dtype)?;
+        let iou_key = format!("selected_conditioning_frames.{frame_idx}.iou_score");
+        let iou_scores = match prepare.tensor_keys.get(&iou_key) {
+            Some(key) => load_tracker_fixture_tensor(bundle, key.as_str())?.to_dtype(dtype)?,
+            None => Tensor::zeros((low_res_masks.dim(0)?, 1), dtype, device)?,
+        };
+        let obj_ptr = load_tracker_fixture_tensor(
+            bundle,
+            prepare.tensor_keys[format!("selected_conditioning_frames.{frame_idx}.obj_ptr").as_str()]
+                .as_str(),
+        )?
+        .to_dtype(dtype)?;
+        let object_score_logits = load_tracker_fixture_tensor(
+            bundle,
+            prepare.tensor_keys[format!("selected_conditioning_frames.{frame_idx}.object_score_logits").as_str()]
+                .as_str(),
+        )?
+        .to_dtype(dtype)?;
+        let maskmem_features = load_tracker_fixture_tensor(
+            bundle,
+            prepare.tensor_keys[format!("selected_conditioning_frames.{frame_idx}.maskmem_features").as_str()]
+                .as_str(),
+        )?
+        .to_dtype(dtype)?;
+        let maskmem_pos_enc = load_tracker_fixture_tensor(
+            bundle,
+            prepare.tensor_keys[format!("selected_conditioning_frames.{frame_idx}.maskmem_pos_enc.0").as_str()]
+                .as_str(),
+        )?
+        .to_dtype(dtype)?;
+        let high_res_masks =
+            Tensor::zeros((low_res_masks.dim(0)?, 1, image_size, image_size), dtype, device)?;
+        Ok(Some(TrackerFrameState {
+            low_res_masks,
+            high_res_masks,
+            iou_scores,
+            obj_ptr,
+            object_score_logits,
+            maskmem_features: Some(maskmem_features),
+            maskmem_pos_enc: Some(maskmem_pos_enc),
+            is_cond_frame: true,
+        }))
+    }
+
+    fn load_prepare_selected_memory_state(
+        bundle: TrackerFixtureBundle,
+        prepare: &TrackerInternalRecord,
+        frame_idx: usize,
+        image_size: usize,
+        dtype: DType,
+    ) -> Result<Option<TrackerFrameState>> {
+        let pred_key = format!("selected_memory_frames.{frame_idx}.pred_masks");
+        let Some(pred_key_ref) = prepare.tensor_keys.get(&pred_key) else {
+            return Ok(None);
+        };
+        let device = &candle::Device::Cpu;
+        let low_res_masks = load_tracker_fixture_tensor(bundle, pred_key_ref.as_str())?.to_dtype(dtype)?;
+        let iou_key = format!("selected_memory_frames.{frame_idx}.iou_score");
+        let iou_scores = match prepare.tensor_keys.get(&iou_key) {
+            Some(key) => load_tracker_fixture_tensor(bundle, key.as_str())?.to_dtype(dtype)?,
+            None => Tensor::zeros((low_res_masks.dim(0)?, 1), dtype, device)?,
+        };
+        let obj_ptr = load_tracker_fixture_tensor(
+            bundle,
+            prepare.tensor_keys[format!("selected_memory_frames.{frame_idx}.obj_ptr").as_str()]
+                .as_str(),
+        )?
+        .to_dtype(dtype)?;
+        let object_score_logits = load_tracker_fixture_tensor(
+            bundle,
+            prepare.tensor_keys[format!("selected_memory_frames.{frame_idx}.object_score_logits").as_str()]
+                .as_str(),
+        )?
+        .to_dtype(dtype)?;
+        let maskmem_features = load_tracker_fixture_tensor(
+            bundle,
+            prepare.tensor_keys[format!("selected_memory_frames.{frame_idx}.maskmem_features").as_str()]
+                .as_str(),
+        )?
+        .to_dtype(dtype)?;
+        let maskmem_pos_enc = load_tracker_fixture_tensor(
+            bundle,
+            prepare.tensor_keys[format!("selected_memory_frames.{frame_idx}.maskmem_pos_enc.0").as_str()]
+                .as_str(),
+        )?
+        .to_dtype(dtype)?;
+        let high_res_masks =
+            Tensor::zeros((low_res_masks.dim(0)?, 1, image_size, image_size), dtype, device)?;
+        Ok(Some(TrackerFrameState {
+            low_res_masks,
+            high_res_masks,
+            iou_scores,
+            obj_ptr,
+            object_score_logits,
+            maskmem_features: Some(maskmem_features),
+            maskmem_pos_enc: Some(maskmem_pos_enc),
+            is_cond_frame: false,
+        }))
+    }
+
+    fn build_history_for_prepare_frame(
+        bundle: TrackerFixtureBundle,
+        manifest: &TrackerInternalManifest,
+        prepare: &TrackerInternalRecord,
+        target_frame_idx: usize,
+        image_size: usize,
+        dtype: DType,
+    ) -> Result<BTreeMap<usize, TrackerFrameState>> {
+        let selected_cond = metadata_usize_vec(&prepare.metadata, "selected_conditioning_frame_indices")?;
+        let unselected_cond = prepare
+            .metadata
+            .get("unselected_conditioning_frame_indices")
+            .and_then(|value| value.as_array())
+            .map(|_| metadata_usize_vec(&prepare.metadata, "unselected_conditioning_frame_indices"))
+            .transpose()?
+            .unwrap_or_default();
+        let selected_memory =
+            metadata_usize_vec(&prepare.metadata, "selected_memory_frame_indices")?;
+        let selected_object_pointer_frames =
+            metadata_usize_vec(&prepare.metadata, "selected_object_pointer_frame_indices")?;
+        let mut history = BTreeMap::new();
+
+        for frame_idx in 0..target_frame_idx {
+            if let Some(state) = load_track_step_history_state(bundle, manifest, frame_idx, dtype)? {
+                history.insert(frame_idx, state);
+            }
+        }
+
+        for frame_idx in selected_cond.iter().copied() {
+            if let Some(state) =
+                load_prepare_selected_conditioning_state(bundle, prepare, frame_idx, image_size, dtype)?
+            {
+                history.insert(frame_idx, state);
+            }
+        }
+
+        for frame_idx in unselected_cond.iter().copied() {
+            if history.contains_key(&frame_idx) {
+                continue;
+            }
+            if let Some(state) = load_track_step_history_state(bundle, manifest, frame_idx, dtype)? {
+                history.insert(frame_idx, state);
+            }
+        }
+
+        for frame_idx in selected_memory.iter().copied() {
+            if history.contains_key(&frame_idx) {
+                continue;
+            }
+            if let Some(state) =
+                load_prepare_selected_memory_state(bundle, prepare, frame_idx, image_size, dtype)?
+            {
+                history.insert(frame_idx, state);
+            }
+        }
+
+        for frame_idx in selected_object_pointer_frames.iter().copied() {
+            if history.contains_key(&frame_idx) {
+                continue;
+            }
+            let key = format!("selected_object_pointer_frames.{frame_idx}.obj_ptr");
+            let Some(obj_ptr_key) = prepare.tensor_keys.get(&key) else {
+                continue;
+            };
+            let device = &candle::Device::Cpu;
+            let obj_ptr = load_tracker_fixture_tensor(bundle, obj_ptr_key.as_str())?.to_dtype(dtype)?;
+            let low_res_masks = Tensor::zeros(
+                (obj_ptr.dim(0)?, 1, 1, 1),
+                dtype,
+                device,
+            )?;
+            let high_res_masks = Tensor::zeros(
+                (obj_ptr.dim(0)?, 1, image_size, image_size),
+                dtype,
+                device,
+            )?;
+            let iou_scores = Tensor::zeros((obj_ptr.dim(0)?, 1), dtype, device)?;
+            let object_score_logits = Tensor::zeros((obj_ptr.dim(0)?, 1), dtype, device)?;
+            history.insert(
+                frame_idx,
+                TrackerFrameState {
+                    low_res_masks,
+                    high_res_masks,
+                    iou_scores,
+                    obj_ptr,
+                    object_score_logits,
+                    maskmem_features: None,
+                    maskmem_pos_enc: None,
+                    is_cond_frame: false,
+                },
+            );
+        }
+
+        Ok(history)
+    }
+
+    fn assert_prepare_memory_conditioned_features_fixture_matches(
+        bundle: TrackerFixtureBundle,
+        frame_idx: usize,
+        pix_feat_atol: f32,
+    ) -> Result<()> {
+        let Some(model) = load_runtime_tracker_model_from_bundle(bundle)? else {
+            return Ok(());
+        };
+        let manifest = load_tracker_internal_manifest(bundle)?;
+        let track_step = tracker_record(&manifest, frame_idx, "track_step")?;
+        let prepare = tracker_record(&manifest, frame_idx, "prepare_memory_conditioned_features")?;
+        let compute_dtype = model.no_obj_ptr.dtype();
+        let current_vision_feats = vec![load_tracker_fixture_tensor(
+            bundle,
+            track_step.tensor_keys["current_vision_feats"].as_str(),
+        )?
+        .to_dtype(compute_dtype)?];
+        let current_vision_pos_embeds = vec![load_tracker_fixture_tensor(
+            bundle,
+            track_step.tensor_keys["current_vision_pos_embeds"].as_str(),
+        )?
+        .to_dtype(compute_dtype)?];
+        let history = build_history_for_prepare_frame(
+            bundle,
+            &manifest,
+            prepare,
+            frame_idx,
+            model.config.image_size,
+            compute_dtype,
+        )?;
+        let actual = model.prepare_memory_conditioned_features(
+            frame_idx,
+            false,
+            current_vision_feats.as_slice(),
+            current_vision_pos_embeds.as_slice(),
+            &[(model.config.image_embedding_size(), model.config.image_embedding_size())],
+            &history,
+            30,
+            false,
+            true,
+        )?;
+        let expected_cond = metadata_usize_vec(&prepare.metadata, "selected_conditioning_frame_indices")?;
+        let expected_mem = metadata_usize_vec(&prepare.metadata, "selected_memory_frame_indices")?;
+        let expected_ptr = metadata_usize_vec(
+            &prepare.metadata,
+            "selected_object_pointer_frame_indices",
+        )?;
+        assert_eq!(actual.selected_conditioning_frame_indices, expected_cond);
+        assert_eq!(actual.selected_memory_frame_indices, expected_mem);
+        assert_eq!(actual.selected_object_pointer_frame_indices, expected_ptr);
+
+        let expected_pix = load_tracker_fixture_tensor(
+            bundle,
+            prepare.tensor_keys["pix_feat_with_mem"].as_str(),
+        )?;
+        assert_tensor_close(
+            "prepare_memory_conditioned_features.pix_feat_with_mem",
+            &actual.pix_feat_with_mem,
+            &expected_pix,
+            pix_feat_atol,
+        )?;
+
+        let offsets = metadata_i64_vec(
+            &prepare.metadata,
+            "selected_object_pointer_temporal_offsets",
+        )?;
+        let max_abs_pos = prepare.metadata["max_obj_ptrs_in_encoder"]
+            .as_u64()
+            .ok_or_else(|| {
+                candle::Error::Msg(
+                    "prepare_memory_conditioned_features missing max_obj_ptrs_in_encoder".into(),
+                )
+            })? as usize;
+        let expected_pos = load_tracker_fixture_tensor(
+            bundle,
+            prepare.tensor_keys["object_pointer_temporal_pos_enc"].as_str(),
+        )?;
+        let actual_pos =
+            model.get_tpos_enc(offsets.as_slice(), &candle::Device::Cpu, Some(max_abs_pos), false)?;
+        assert_tensor_close(
+            "prepare_memory_conditioned_features.object_pointer_temporal_pos_enc",
+            &actual_pos,
+            &expected_pos,
+            2e-2,
+        )?;
+        Ok(())
+    }
+
+    fn assert_memory_conditioning_prompt_fixture_matches(
+        bundle: TrackerFixtureBundle,
+        frame_idx: usize,
+        prompt_atol: f32,
+        prompt_pos_atol: f32,
+    ) -> Result<()> {
+        let Some(model) = load_runtime_tracker_model_from_bundle(bundle)? else {
+            return Ok(());
+        };
+        let manifest = load_tracker_internal_manifest(bundle)?;
+        let prepare = tracker_record(&manifest, frame_idx, "prepare_memory_conditioned_features")?;
+        let encoder = tracker_record(&manifest, frame_idx, "memory_transformer_encoder")?;
+        let history = build_history_for_prepare_frame(
+            bundle,
+            &manifest,
+            prepare,
+            frame_idx,
+            model.config.image_size,
+            model.no_obj_ptr.dtype(),
+        )?;
+        let cond_frame_outputs = history
+            .iter()
+            .filter_map(|(frame, state)| state.is_cond_frame.then_some((*frame, state)))
+            .collect::<BTreeMap<_, _>>();
+        let prepared = model.build_memory_conditioning_prompt(
+            frame_idx,
+            &history,
+            30,
+            false,
+            &cond_frame_outputs,
+        )?;
+        let expected_prompt = load_tracker_fixture_tensor(
+            bundle,
+            encoder.tensor_keys["prompt"].as_str(),
+        )?;
+        let expected_prompt_pos = load_tracker_fixture_tensor(
+            bundle,
+            encoder.tensor_keys["prompt_pos"].as_str(),
+        )?;
+        let actual_prompt = prepared
+            .prompt
+            .ok_or_else(|| candle::Error::Msg("expected prompt tensor for fixture".into()))?;
+        let actual_prompt_pos = prepared
+            .prompt_pos
+            .ok_or_else(|| candle::Error::Msg("expected prompt_pos tensor for fixture".into()))?;
+        assert_eq!(
+            prepared.num_obj_ptr_tokens,
+            encoder.metadata["num_obj_ptr_tokens"].as_u64().unwrap_or(0) as usize
+        );
+        assert_tensor_close(
+            "memory_conditioning_prompt.prompt",
+            &actual_prompt,
+            &expected_prompt,
+            prompt_atol,
+        )?;
+        assert_tensor_close(
+            "memory_conditioning_prompt.prompt_pos",
+            &actual_prompt_pos,
+            &expected_prompt_pos,
+            prompt_pos_atol,
+        )?;
+        Ok(())
+    }
+
+    fn assert_memory_transformer_encoder_fixture_matches(
+        bundle: TrackerFixtureBundle,
+        frame_idx: usize,
+        memory_atol: f32,
+    ) -> Result<()> {
+        let Some(model) = load_runtime_tracker_model_from_bundle(bundle)? else {
+            return Ok(());
+        };
+        let manifest = load_tracker_internal_manifest(bundle)?;
+        let track_step = tracker_record(&manifest, frame_idx, "track_step")?;
+        let encoder = tracker_record(&manifest, frame_idx, "memory_transformer_encoder")?;
+        let src = load_tracker_fixture_tensor(
+            bundle,
+            track_step.tensor_keys["current_vision_feats"].as_str(),
+        )?
+        .to_dtype(model.no_obj_ptr.dtype())?
+        .transpose(0, 1)?;
+        let src_pos = load_tracker_fixture_tensor(
+            bundle,
+            track_step.tensor_keys["current_vision_pos_embeds"].as_str(),
+        )?
+        .to_dtype(model.no_obj_ptr.dtype())?
+        .transpose(0, 1)?;
+        let prompt = load_tracker_fixture_tensor(bundle, encoder.tensor_keys["prompt"].as_str())?
+            .to_dtype(model.no_obj_ptr.dtype())?
+            .transpose(0, 1)?;
+        let prompt_pos = load_tracker_fixture_tensor(
+            bundle,
+            encoder.tensor_keys["prompt_pos"].as_str(),
+        )?
+        .to_dtype(model.no_obj_ptr.dtype())?
+        .transpose(0, 1)?;
+        let expected_memory = load_tracker_fixture_tensor(
+            bundle,
+            encoder.tensor_keys["memory_transformer_encoder_output.memory"].as_str(),
+        )?;
+        let actual = model.memory_transformer.forward(
+            &src,
+            &prompt,
+            Some(&src_pos),
+            Some(&prompt_pos),
+            encoder.metadata["num_obj_ptr_tokens"].as_u64().unwrap_or(0) as usize,
+        )?;
+        let actual = actual.transpose(0, 1)?;
+        assert_tensor_close(
+            "memory_transformer_encoder.memory",
+            &actual,
+            &expected_memory,
+            memory_atol,
+        )?;
+        Ok(())
+    }
+
+    fn assert_memory_transformer_encoder_from_reconstructed_prompt_fixture_matches(
+        bundle: TrackerFixtureBundle,
+        frame_idx: usize,
+        memory_atol: f32,
+    ) -> Result<()> {
+        let Some(model) = load_runtime_tracker_model_from_bundle(bundle)? else {
+            return Ok(());
+        };
+        let manifest = load_tracker_internal_manifest(bundle)?;
+        let track_step = tracker_record(&manifest, frame_idx, "track_step")?;
+        let prepare = tracker_record(&manifest, frame_idx, "prepare_memory_conditioned_features")?;
+        let encoder = tracker_record(&manifest, frame_idx, "memory_transformer_encoder")?;
+        let history = build_history_for_prepare_frame(
+            bundle,
+            &manifest,
+            prepare,
+            frame_idx,
+            model.config.image_size,
+            model.no_obj_ptr.dtype(),
+        )?;
+        let cond_frame_outputs = history
+            .iter()
+            .filter_map(|(frame, state)| state.is_cond_frame.then_some((*frame, state)))
+            .collect::<BTreeMap<_, _>>();
+        let prepared = model.build_memory_conditioning_prompt(
+            frame_idx,
+            &history,
+            30,
+            false,
+            &cond_frame_outputs,
+        )?;
+        let src = load_tracker_fixture_tensor(
+            bundle,
+            track_step.tensor_keys["current_vision_feats"].as_str(),
+        )?
+        .to_dtype(model.no_obj_ptr.dtype())?
+        .transpose(0, 1)?;
+        let src_pos = load_tracker_fixture_tensor(
+            bundle,
+            track_step.tensor_keys["current_vision_pos_embeds"].as_str(),
+        )?
+        .to_dtype(model.no_obj_ptr.dtype())?
+        .transpose(0, 1)?;
+        let prompt = prepared
+            .prompt
+            .ok_or_else(|| candle::Error::Msg("expected reconstructed prompt".into()))?
+            .to_dtype(model.no_obj_ptr.dtype())?
+            .transpose(0, 1)?;
+        let prompt_pos = prepared
+            .prompt_pos
+            .ok_or_else(|| candle::Error::Msg("expected reconstructed prompt_pos".into()))?
+            .to_dtype(model.no_obj_ptr.dtype())?
+            .transpose(0, 1)?;
+        let expected_memory = load_tracker_fixture_tensor(
+            bundle,
+            encoder.tensor_keys["memory_transformer_encoder_output.memory"].as_str(),
+        )?;
+        let actual = model.memory_transformer.forward(
+            &src,
+            &prompt,
+            Some(&src_pos),
+            Some(&prompt_pos),
+            prepared.num_obj_ptr_tokens,
+        )?;
+        let actual = actual.transpose(0, 1)?;
+        assert_tensor_close(
+            "memory_transformer_encoder.reconstructed_prompt.memory",
+            &actual,
+            &expected_memory,
+            memory_atol,
+        )?;
+        Ok(())
     }
 
     #[test]
@@ -3466,6 +5075,182 @@ mod tests {
     }
 
     #[test]
+    fn tracker_prepare_memory_conditioned_features_matches_stride1_long_history_fixture_values(
+    ) -> Result<()> {
+        assert_prepare_memory_conditioned_features_fixture_matches(
+            TrackerFixtureBundle::LongHistoryStride1,
+            28,
+            1.1e-1,
+        )
+    }
+
+    #[test]
+    fn tracker_prepare_memory_conditioned_features_matches_stride_gt1_long_history_fixture_values(
+    ) -> Result<()> {
+        assert_prepare_memory_conditioned_features_fixture_matches(
+            TrackerFixtureBundle::LongHistoryStrideGt1,
+            28,
+            1.1e-1,
+        )
+    }
+
+    #[test]
+    fn tracker_prepare_memory_conditioned_features_matches_obj_ptr_overflow_fixture_values(
+    ) -> Result<()> {
+        assert_prepare_memory_conditioned_features_fixture_matches(
+            TrackerFixtureBundle::LongHistoryObjPtrOverflow,
+            29,
+            1.1e-1,
+        )
+    }
+
+    #[test]
+    fn tracker_prepare_memory_conditioned_features_matches_keep_first_cond_long_history_fixture_values(
+    ) -> Result<()> {
+        assert_prepare_memory_conditioned_features_fixture_matches(
+            TrackerFixtureBundle::LongHistoryKeepFirstCond,
+            28,
+            1.1e-1,
+        )
+    }
+
+    #[test]
+    fn tracker_prepare_memory_conditioned_features_matches_temporal_disambiguation_long_history_fixture_values(
+    ) -> Result<()> {
+        assert_prepare_memory_conditioned_features_fixture_matches(
+            TrackerFixtureBundle::LongHistoryTemporalDisambiguation,
+            28,
+            1.1e-1,
+        )
+    }
+
+    #[test]
+    fn tracker_get_tpos_enc_matches_stride1_long_history_fixture_values() -> Result<()> {
+        let Some(model) =
+            load_runtime_tracker_model_from_bundle(TrackerFixtureBundle::LongHistoryStride1)?
+        else {
+            return Ok(());
+        };
+        let manifest = load_tracker_internal_manifest(TrackerFixtureBundle::LongHistoryStride1)?;
+        let stage = tracker_record(&manifest, 28, "prepare_memory_conditioned_features")?;
+        let offsets = metadata_i64_vec(
+            &stage.metadata,
+            "selected_object_pointer_temporal_offsets",
+        )?;
+        let max_abs_pos = stage.metadata["max_obj_ptrs_in_encoder"]
+            .as_u64()
+            .ok_or_else(|| {
+                candle::Error::Msg(
+                    "stride1 fixture missing max_obj_ptrs_in_encoder".into(),
+                )
+            })? as usize;
+        let expected = load_tracker_fixture_tensor(
+            TrackerFixtureBundle::LongHistoryStride1,
+            stage.tensor_keys["object_pointer_temporal_pos_enc"].as_str(),
+        )?;
+        let actual = model.get_tpos_enc(
+            offsets.as_slice(),
+            &candle::Device::Cpu,
+            Some(max_abs_pos),
+            false,
+        )?;
+        assert_tensor_close("get_tpos_enc stride1", &actual, &expected, 2e-2)?;
+        Ok(())
+    }
+
+    #[test]
+    fn tracker_memory_conditioning_prompt_matches_stride1_long_history_fixture_values(
+    ) -> Result<()> {
+        assert_memory_conditioning_prompt_fixture_matches(
+            TrackerFixtureBundle::LongHistoryStride1,
+            28,
+            1e-4,
+            2e-2,
+        )
+    }
+
+    #[test]
+    fn tracker_memory_transformer_encoder_matches_stride1_long_history_fixture_values(
+    ) -> Result<()> {
+        assert_memory_transformer_encoder_fixture_matches(
+            TrackerFixtureBundle::LongHistoryStride1,
+            28,
+            1e-1,
+        )
+    }
+
+    #[test]
+    fn tracker_memory_transformer_encoder_from_reconstructed_prompt_matches_stride1_long_history_fixture_values(
+    ) -> Result<()> {
+        assert_memory_transformer_encoder_from_reconstructed_prompt_fixture_matches(
+            TrackerFixtureBundle::LongHistoryStride1,
+            28,
+            1e-1,
+        )
+    }
+
+    #[test]
+    fn tracker_object_pointer_selection_overflows_and_truncates_at_encoder_cap() -> Result<()> {
+        let manifest =
+            load_tracker_internal_manifest(TrackerFixtureBundle::LongHistoryObjPtrOverflow)?;
+        let stage = tracker_record(&manifest, 29, "prepare_memory_conditioned_features")?;
+        let max_obj_ptrs = stage.metadata["max_obj_ptrs_in_encoder"]
+            .as_u64()
+            .ok_or_else(|| {
+                candle::Error::Msg(
+                    "object-pointer overflow fixture missing max_obj_ptrs_in_encoder".into(),
+                )
+            })? as usize;
+        let frame_indices =
+            metadata_usize_vec(&stage.metadata, "selected_object_pointer_frame_indices")?;
+        let is_cond = stage.metadata["selected_object_pointer_is_conditioning"]
+            .as_array()
+            .ok_or_else(|| {
+                candle::Error::Msg(
+                    "object-pointer overflow fixture missing selected_object_pointer_is_conditioning"
+                        .into(),
+                )
+            })?
+            .iter()
+            .map(|value| value.as_bool().unwrap_or(false))
+            .collect::<Vec<_>>();
+        if frame_indices.len() != is_cond.len() {
+            candle::bail!(
+                "object-pointer overflow fixture has mismatched frame/is_cond lengths: {} vs {}",
+                frame_indices.len(),
+                is_cond.len()
+            );
+        }
+        let non_cond_frames = frame_indices
+            .iter()
+            .zip(is_cond.iter())
+            .filter_map(|(frame_idx, is_cond)| (!*is_cond).then_some(*frame_idx))
+            .collect::<Vec<_>>();
+        assert!(
+            frame_indices.len() > max_obj_ptrs,
+            "overflow fixture should exceed cap: selected {} <= cap {}",
+            frame_indices.len(),
+            max_obj_ptrs
+        );
+        assert_eq!(
+            non_cond_frames.len(),
+            max_obj_ptrs.saturating_sub(1),
+            "overflow fixture should retain exactly cap-1 non-conditioning object pointers"
+        );
+        assert!(
+            !non_cond_frames.contains(&13),
+            "oldest non-conditioning object pointer frame should be truncated once cap is exceeded"
+        );
+        for expected in 14..=28 {
+            assert!(
+                non_cond_frames.contains(&expected),
+                "expected non-conditioning object pointer frame {expected} to be retained"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn tracker_use_multimask_matches_fixture_branch_decisions() -> Result<()> {
         let Some(default_model) =
             load_runtime_tracker_model_from_bundle(TrackerFixtureBundle::PointSingleClick)?
@@ -3562,34 +5347,30 @@ mod tests {
     }
 
     #[test]
-    fn tracker_track_frame_still_reports_strict_port_status_for_memory_conditioning() -> Result<()>
-    {
-        let device = candle::Device::Cpu;
-        let model = Sam3TrackerModel::new(
-            &Sam3TrackerConfig::from_sam3_config(&tiny_config()),
-            VarBuilder::zeros(DType::F32, &device),
+    fn tracker_history_builder_recovers_selected_long_history_frames() -> Result<()> {
+        let Some(model) =
+            load_runtime_tracker_model_from_bundle(TrackerFixtureBundle::LongHistoryStride1)?
+        else {
+            return Ok(());
+        };
+        let manifest = load_tracker_internal_manifest(TrackerFixtureBundle::LongHistoryStride1)?;
+        let prepare = tracker_record(&manifest, 28, "prepare_memory_conditioned_features")?;
+        let history = build_history_for_prepare_frame(
+            TrackerFixtureBundle::LongHistoryStride1,
+            &manifest,
+            prepare,
+            28,
+            model.config.image_size,
+            model.no_obj_ptr.dtype(),
         )?;
-        let point_coords = Tensor::from_vec(vec![12f32, 18f32], (1, 1, 2), &device)?;
-        let point_labels = Tensor::from_vec(vec![1f32], (1, 1), &device)?;
-        let mut history = BTreeMap::new();
-        history.insert(0, dummy_state(&device)?);
-        let err = model
-            .track_frame(
-                &dummy_visual(&device)?,
-                1,
-                2,
-                Some(&point_coords),
-                Some(&point_labels),
-                None,
-                None,
-                &history,
-                false,
-                false,
-                true,
-                false,
-            )
-            .expect_err("memory-conditioned tracker path should remain blocked");
-        assert!(err.to_string().contains("memory-conditioned tracking"));
+        for frame_idx in metadata_usize_vec(&prepare.metadata, "selected_conditioning_frame_indices")? {
+            assert!(history.contains_key(&frame_idx));
+            assert!(history.get(&frame_idx).unwrap().is_cond_frame);
+        }
+        for frame_idx in metadata_usize_vec(&prepare.metadata, "selected_memory_frame_indices")? {
+            assert!(history.contains_key(&frame_idx));
+            assert!(!history.get(&frame_idx).unwrap().is_cond_frame);
+        }
         Ok(())
     }
 
