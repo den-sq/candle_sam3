@@ -86,14 +86,14 @@ impl VisionRotaryEmbedding {
 
     fn apply(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
         let (_, _, seq_len, head_dim) = q.dims4()?;
-        let freqs_real = self
-            .freqs_real
-            .narrow(0, 0, seq_len)?
-            .reshape((1, 1, seq_len, head_dim / 2))?;
-        let freqs_imag = self
-            .freqs_imag
-            .narrow(0, 0, seq_len)?
-            .reshape((1, 1, seq_len, head_dim / 2))?;
+        let freqs_real =
+            self.freqs_real
+                .narrow(0, 0, seq_len)?
+                .reshape((1, 1, seq_len, head_dim / 2))?;
+        let freqs_imag =
+            self.freqs_imag
+                .narrow(0, 0, seq_len)?
+                .reshape((1, 1, seq_len, head_dim / 2))?;
         Ok((
             apply_rotary_enc_real(q, &freqs_real, &freqs_imag)?,
             apply_rotary_enc_real(k, &freqs_real, &freqs_imag)?,
@@ -101,11 +101,7 @@ impl VisionRotaryEmbedding {
     }
 }
 
-fn apply_rotary_enc_real(
-    xs: &Tensor,
-    freqs_real: &Tensor,
-    freqs_imag: &Tensor,
-) -> Result<Tensor> {
+fn apply_rotary_enc_real(xs: &Tensor, freqs_real: &Tensor, freqs_imag: &Tensor) -> Result<Tensor> {
     let (batch_size, num_heads, seq_len, head_dim) = xs.dims4()?;
     let xs_dtype = xs.dtype();
     let xs = xs
@@ -804,16 +800,17 @@ mod tests {
             )
         })?;
         let device = test_device()?;
-        let fixture = candle::safetensors::load(PathBuf::from(&fixture_path), &device).map_err(
-            |err| {
+        let fixture =
+            candle::safetensors::load(PathBuf::from(&fixture_path), &device).map_err(|err| {
                 candle::Error::Msg(format!(
                     "failed to load block0 debug fixture {}: {err}",
                     fixture_path
                 ))
-            },
+            })?;
+        let mut weights = load_interactive_visual_fixture_tensors(
+            "vision_backbone_weights.safetensors",
+            &device,
         )?;
-        let mut weights =
-            load_interactive_visual_fixture_tensors("vision_backbone_weights.safetensors", &device)?;
         if let Some(exported_weights) = fixture_trunk_weights(&fixture)? {
             weights.extend(exported_weights);
         }
@@ -849,9 +846,7 @@ mod tests {
             }
         }
         if let Some((name, max_abs_diff)) = failures.first() {
-            candle::bail!(
-                "{name}: max_abs_diff={max_abs_diff:.8} exceeded atol=0.00001000"
-            );
+            candle::bail!("{name}: max_abs_diff={max_abs_diff:.8} exceeded atol=0.00001000");
         }
         Ok(())
     }
@@ -866,16 +861,17 @@ mod tests {
             )
         })?;
         let device = test_device()?;
-        let fixture = candle::safetensors::load(PathBuf::from(&fixture_path), &device).map_err(
-            |err| {
+        let fixture =
+            candle::safetensors::load(PathBuf::from(&fixture_path), &device).map_err(|err| {
                 candle::Error::Msg(format!(
                     "failed to load block0 debug fixture {}: {err}",
                     fixture_path
                 ))
-            },
+            })?;
+        let mut weights = load_interactive_visual_fixture_tensors(
+            "vision_backbone_weights.safetensors",
+            &device,
         )?;
-        let mut weights =
-            load_interactive_visual_fixture_tensors("vision_backbone_weights.safetensors", &device)?;
         if let Some(exported_weights) = fixture_trunk_weights(&fixture)? {
             weights.extend(exported_weights);
         }
@@ -1023,17 +1019,11 @@ mod tests {
         }
         let patch_h = height / patch_size;
         let patch_w = width / patch_size;
-        let image = image.reshape((
-            batch,
-            channels,
-            patch_h,
-            patch_size,
-            patch_w,
-            patch_size,
+        let image = image.reshape((batch, channels, patch_h, patch_size, patch_w, patch_size))?;
+        let image = image.permute((0, 2, 4, 1, 3, 5))?.reshape((
+            batch * patch_h * patch_w,
+            channels * patch_size * patch_size,
         ))?;
-        let image = image
-            .permute((0, 2, 4, 1, 3, 5))?
-            .reshape((batch * patch_h * patch_w, channels * patch_size * patch_size))?;
         let weight = weight.reshape((out_channels, in_channels * patch_size * patch_size))?;
         let output = image.matmul(&weight.transpose(0, 1)?)?;
         output

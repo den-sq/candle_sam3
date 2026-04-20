@@ -17,8 +17,8 @@ use super::{
     geometry::{EncodedPrompt, GeometryPrompt},
     image::{GroundingOutput, ImageSize},
     neck::VisualBackboneOutput,
-    tracker::resize_bilinear2d_antialias,
     text::TextEncoding,
+    tracker::resize_bilinear2d_antialias,
     Config, Sam3ImageModel, Sam3TrackerConfig, Sam3TrackerModel, TrackerFrameState,
 };
 
@@ -816,20 +816,17 @@ impl TrackedObject {
         }
         self.mask_prompt_frames.remove(&frame_idx);
         self.last_updated_frame = frame_idx;
-        self.frame_outputs.clear();
-        self.tracker_states.clear();
     }
 
     fn add_mask_prompt(&mut self, frame_idx: usize, mask: Tensor) {
         self.mask_prompt_frames.insert(frame_idx, mask);
         self.prompt_frames.remove(&frame_idx);
         self.last_updated_frame = frame_idx;
-        self.frame_outputs.clear();
-        self.tracker_states.clear();
     }
 
     fn has_prompt_on_frame(&self, frame_idx: usize) -> bool {
-        self.prompt_frames.contains_key(&frame_idx) || self.mask_prompt_frames.contains_key(&frame_idx)
+        self.prompt_frames.contains_key(&frame_idx)
+            || self.mask_prompt_frames.contains_key(&frame_idx)
     }
 
     fn nearest_prompt(
@@ -849,6 +846,46 @@ impl TrackedObject {
                 .next()
                 .map(|(idx, prompt)| (*idx, prompt.clone())),
         }
+    }
+
+    fn nearest_input_frame_idx(
+        &self,
+        frame_idx: usize,
+        direction: PropagationDirection,
+    ) -> Option<usize> {
+        match direction {
+            PropagationDirection::Forward | PropagationDirection::Both => self
+                .prompt_frames
+                .keys()
+                .chain(self.mask_prompt_frames.keys())
+                .copied()
+                .filter(|idx| *idx <= frame_idx)
+                .max(),
+            PropagationDirection::Backward => self
+                .prompt_frames
+                .keys()
+                .chain(self.mask_prompt_frames.keys())
+                .copied()
+                .filter(|idx| *idx >= frame_idx)
+                .min(),
+        }
+    }
+
+    fn nearest_input_uses_explicit_geometry(
+        &self,
+        frame_idx: usize,
+        direction: PropagationDirection,
+    ) -> bool {
+        let Some(input_frame_idx) = self.nearest_input_frame_idx(frame_idx, direction) else {
+            return false;
+        };
+        if self.mask_prompt_frames.contains_key(&input_frame_idx) {
+            return true;
+        }
+        self.prompt_frames
+            .get(&input_frame_idx)
+            .map(SessionPrompt::has_geometry)
+            .unwrap_or(false)
     }
 
     fn latest_text_prompt(
@@ -899,7 +936,11 @@ impl TrackedObject {
         match direction {
             PropagationDirection::Forward | PropagationDirection::Both => {
                 self.prompt_frames.range(..=frame_idx).next_back().is_some()
-                    || self.mask_prompt_frames.range(..=frame_idx).next_back().is_some()
+                    || self
+                        .mask_prompt_frames
+                        .range(..=frame_idx)
+                        .next_back()
+                        .is_some()
             }
             PropagationDirection::Backward => {
                 self.prompt_frames.range(frame_idx..).next().is_some()
@@ -1092,6 +1133,39 @@ impl Sam3VideoSession {
         obj_id
     }
 
+    fn ensure_object(
+        &mut self,
+        obj_id: Option<u32>,
+        creation_frame: usize,
+        max_objects: usize,
+    ) -> Result<u32> {
+        match obj_id {
+            Some(obj_id) => {
+                if !self.tracked_objects.contains_key(&obj_id) {
+                    if self.tracked_objects.len() >= max_objects {
+                        candle::bail!(
+                            "cannot allocate another tracked object because max_objects={} was reached",
+                            max_objects
+                        );
+                    }
+                    self.next_obj_id = self.next_obj_id.max(obj_id.saturating_add(1));
+                    self.tracked_objects
+                        .insert(obj_id, TrackedObject::new(obj_id, creation_frame));
+                }
+                Ok(obj_id)
+            }
+            None => {
+                if self.tracked_objects.len() >= max_objects {
+                    candle::bail!(
+                        "cannot allocate another tracked object because max_objects={} was reached",
+                        max_objects
+                    )
+                }
+                Ok(self.allocate_object(creation_frame))
+            }
+        }
+    }
+
     fn add_prompt(
         &mut self,
         frame_idx: usize,
@@ -1115,25 +1189,14 @@ impl Sam3VideoSession {
             )
         }
 
-        let obj_id = match obj_id {
-            Some(obj_id) => obj_id,
-            None => {
-                if self.tracked_objects.len() >= max_objects {
-                    candle::bail!(
-                        "cannot allocate another tracked object because max_objects={} was reached",
-                        max_objects
-                    )
-                }
-                self.allocate_object(frame_idx)
-            }
-        };
+        let obj_id = self.ensure_object(obj_id, frame_idx, max_objects)?;
 
         let tracked = self
             .tracked_objects
             .get_mut(&obj_id)
             .ok_or_else(|| candle::Error::Msg(format!("unknown obj_id {}", obj_id)))?;
         tracked.add_prompt(frame_idx, prompt, clear_old_points, clear_old_boxes);
-        self.invalidate_object_outputs(obj_id);
+        self.invalidate_object_outputs_from(obj_id, frame_idx);
         Ok(obj_id)
     }
 
@@ -1151,18 +1214,7 @@ impl Sam3VideoSession {
                 self.num_frames()
             );
         }
-        let obj_id = match obj_id {
-            Some(obj_id) => obj_id,
-            None => {
-                if self.tracked_objects.len() >= max_objects {
-                    candle::bail!(
-                        "cannot allocate another tracked object because max_objects={} was reached",
-                        max_objects
-                    )
-                }
-                self.allocate_object(frame_idx)
-            }
-        };
+        let obj_id = self.ensure_object(obj_id, frame_idx, max_objects)?;
         let storage_device = self.storage_device().clone();
         let tracked = self
             .tracked_objects
@@ -1170,20 +1222,22 @@ impl Sam3VideoSession {
             .ok_or_else(|| candle::Error::Msg(format!("unknown obj_id {}", obj_id)))?;
         let mask = normalize_video_mask_prompt(&mask, &storage_device)?;
         tracked.add_mask_prompt(frame_idx, mask);
-        self.invalidate_object_outputs(obj_id);
+        self.invalidate_object_outputs_from(obj_id, frame_idx);
         Ok(obj_id)
     }
 
-    fn invalidate_object_outputs(&mut self, obj_id: u32) {
+    fn invalidate_object_outputs_from(&mut self, obj_id: u32, frame_idx: usize) {
         if let Some(object) = self.tracked_objects.get_mut(&obj_id) {
-            object.frame_outputs.clear();
-            object.tracker_states.clear();
+            object.frame_outputs.retain(|idx, _| *idx <= frame_idx);
+            object.tracker_states.retain(|idx, _| *idx <= frame_idx);
         }
         let mut empty_frames = Vec::new();
-        for (frame_idx, frame_outputs) in self.frame_outputs.iter_mut() {
-            frame_outputs.remove(&obj_id);
+        for (cached_frame_idx, frame_outputs) in self.frame_outputs.iter_mut() {
+            if *cached_frame_idx >= frame_idx {
+                frame_outputs.remove(&obj_id);
+            }
             if frame_outputs.is_empty() {
-                empty_frames.push(*frame_idx);
+                empty_frames.push(*cached_frame_idx);
             }
         }
         for frame_idx in empty_frames {
@@ -1195,7 +1249,7 @@ impl Sam3VideoSession {
         self.tracked_objects
             .remove(&obj_id)
             .ok_or_else(|| candle::Error::Msg(format!("unknown obj_id {}", obj_id)))?;
-        self.invalidate_object_outputs(obj_id);
+        self.invalidate_object_outputs_from(obj_id, 0);
         Ok(())
     }
 
@@ -1492,6 +1546,11 @@ impl<'a> Sam3VideoPredictor<'a> {
             options.direction,
             options.start_frame_idx,
             options.max_frame_num_to_track,
+            self.tracker_core
+                .tracker
+                .config()
+                .predictor
+                .always_start_from_first_ann_frame,
         )?;
         let output_threshold = options
             .output_prob_threshold
@@ -1566,6 +1625,515 @@ impl<'a> Sam3VideoTrackerCore<'a> {
 }
 
 impl Sam3VideoTrackerCore<'_> {
+    fn correction_frame_is_cond_frame(&self) -> bool {
+        self.tracker
+            .config()
+            .predictor
+            .add_all_frames_to_correct_as_cond
+    }
+
+    fn prompt_frame_uses_point_memory(&self, object: &TrackedObject, frame_idx: usize) -> bool {
+        if object.mask_prompt_frames.contains_key(&frame_idx) {
+            return false;
+        }
+        let Some(prompt) = object.prompt_frames.get(&frame_idx) else {
+            return false;
+        };
+        prompt.text.is_none()
+            && prompt
+                .boxes
+                .as_ref()
+                .map(|boxes| boxes.is_empty())
+                .unwrap_or(true)
+            && prompt
+                .points
+                .as_ref()
+                .map(|points| !points.is_empty())
+                .unwrap_or(false)
+    }
+
+    fn ensure_history_states_have_memory(
+        &self,
+        model: &Sam3ImageModel,
+        compute_device: &Device,
+        session: &mut Sam3VideoSession,
+        object: &TrackedObject,
+        frame_idx: usize,
+        direction: PropagationDirection,
+    ) -> Result<()> {
+        let missing_history_frames = object
+            .tracker_history(frame_idx, direction)
+            .into_iter()
+            .filter_map(|(history_frame_idx, state)| {
+                (state.is_cond_frame
+                    && (state.maskmem_features.is_none() || state.maskmem_pos_enc.is_none()))
+                .then_some(history_frame_idx)
+            })
+            .collect::<Vec<_>>();
+        for history_frame_idx in missing_history_frames {
+            let state = session
+                .tracked_objects
+                .get(&object.obj_id)
+                .and_then(|tracked| tracked.tracker_states.get(&history_frame_idx))
+                .cloned()
+                .ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "missing tracker state for obj_id {} frame {} during Step 6 preflight",
+                        object.obj_id, history_frame_idx
+                    ))
+                })?;
+            let visual = tracker_visual_output(&session.get_visual_features(
+                model,
+                compute_device,
+                history_frame_idx,
+            )?);
+            let (maskmem_features, maskmem_pos_enc) = self.tracker.encode_external_memory(
+                &visual,
+                &state.high_res_masks.to_device(compute_device)?,
+                &state.object_score_logits.to_device(compute_device)?,
+                self.prompt_frame_uses_point_memory(object, history_frame_idx),
+            )?;
+            let mut updated_state = move_tracker_state(&state, compute_device)?;
+            updated_state.maskmem_features = Some(maskmem_features);
+            updated_state.maskmem_pos_enc = Some(maskmem_pos_enc);
+            let updated_state = move_tracker_state(&updated_state, session.storage_device())?;
+            if let Some(tracked) = session.tracked_objects.get_mut(&object.obj_id) {
+                tracked
+                    .tracker_states
+                    .insert(history_frame_idx, updated_state);
+            }
+        }
+        Ok(())
+    }
+
+    fn trim_past_non_cond_memory(
+        &self,
+        session: &mut Sam3VideoSession,
+        object: &TrackedObject,
+        frame_idx: usize,
+        direction: PropagationDirection,
+    ) {
+        if !self
+            .tracker
+            .config()
+            .predictor
+            .trim_past_non_cond_mem_for_eval
+        {
+            return;
+        }
+        let stride = self.tracker.config().memory_temporal_stride_for_eval.max(1);
+        let signed_frame_idx = frame_idx as isize;
+        let trim_distance = (stride * self.tracker.config().num_maskmem) as isize;
+        let far_obj_ptr_distance = (20 * self.tracker.config().max_obj_ptrs_in_encoder) as isize;
+        let mut trim_targets = Vec::new();
+        match direction {
+            PropagationDirection::Forward | PropagationDirection::Both => {
+                if let Some(target) = signed_frame_idx.checked_sub(trim_distance) {
+                    trim_targets.push(target as usize);
+                }
+                if self.tracker.config().use_memory_selection
+                    && !self
+                        .tracker
+                        .config()
+                        .predictor
+                        .offload_output_to_cpu_for_eval
+                {
+                    if let Some(target) = signed_frame_idx.checked_sub(far_obj_ptr_distance) {
+                        trim_targets.push(target as usize);
+                    }
+                }
+            }
+            PropagationDirection::Backward => {
+                trim_targets.push((signed_frame_idx + trim_distance) as usize);
+                if self.tracker.config().use_memory_selection
+                    && !self
+                        .tracker
+                        .config()
+                        .predictor
+                        .offload_output_to_cpu_for_eval
+                {
+                    trim_targets.push((signed_frame_idx + far_obj_ptr_distance) as usize);
+                }
+            }
+        }
+        if let Some(tracked) = session.tracked_objects.get_mut(&object.obj_id) {
+            for target_frame_idx in trim_targets {
+                let Some(state) = tracked.tracker_states.get_mut(&target_frame_idx) else {
+                    continue;
+                };
+                if state.is_cond_frame {
+                    continue;
+                }
+                state.maskmem_features = None;
+                state.maskmem_pos_enc = None;
+            }
+        }
+    }
+
+    fn history_on_compute_device(
+        &self,
+        session: &Sam3VideoSession,
+        obj_id: u32,
+        frame_idx: usize,
+        direction: PropagationDirection,
+        compute_device: &Device,
+    ) -> Result<BTreeMap<usize, TrackerFrameState>> {
+        let object = session.tracked_objects.get(&obj_id).ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "unknown obj_id {} while building tracker history",
+                obj_id
+            ))
+        })?;
+        object
+            .tracker_history(frame_idx, direction)
+            .into_iter()
+            .map(|(history_frame_idx, state)| {
+                Ok((
+                    history_frame_idx,
+                    move_tracker_state(&state, compute_device)?,
+                ))
+            })
+            .collect()
+    }
+
+    fn previous_frame_low_res_mask_input(
+        &self,
+        object: &TrackedObject,
+        frame_idx: usize,
+        compute_device: &Device,
+    ) -> Result<Option<Tensor>> {
+        if !self.tracker.config().predictor.iter_use_prev_mask_pred {
+            return Ok(None);
+        }
+        let Some(state) = object.tracker_states.get(&frame_idx) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            state
+                .low_res_masks
+                .to_device(compute_device)?
+                .clamp(-32.0f32, 32.0f32)?,
+        ))
+    }
+
+    fn attach_state_memory(
+        &self,
+        visual: &VisualBackboneOutput,
+        state: &TrackerFrameState,
+        is_mask_from_points: bool,
+    ) -> Result<TrackerFrameState> {
+        let (maskmem_features, maskmem_pos_enc) = self.tracker.encode_external_memory(
+            visual,
+            &state.high_res_masks,
+            &state.object_score_logits,
+            is_mask_from_points,
+        )?;
+        let mut state = state.clone();
+        state.maskmem_features = Some(maskmem_features);
+        state.maskmem_pos_enc = Some(maskmem_pos_enc);
+        Ok(state)
+    }
+
+    fn clear_non_cond_mem_around_input(&self, session: &mut Sam3VideoSession, frame_idx: usize) {
+        let predictor = &self.tracker.config().predictor;
+        if !predictor.clear_non_cond_mem_around_input {
+            return;
+        }
+        if !predictor.clear_non_cond_mem_for_multi_obj && session.tracked_objects.len() > 1 {
+            return;
+        }
+        let stride = self.tracker.config().memory_temporal_stride_for_eval.max(1);
+        let radius = stride * self.tracker.config().num_maskmem;
+        let frame_idx_begin = frame_idx.saturating_sub(radius);
+        let frame_idx_end = frame_idx.saturating_add(radius);
+        for object in session.tracked_objects.values_mut() {
+            for target_frame_idx in frame_idx_begin..=frame_idx_end {
+                let Some(state) = object.tracker_states.get_mut(&target_frame_idx) else {
+                    continue;
+                };
+                if state.is_cond_frame {
+                    continue;
+                }
+                state.maskmem_features = None;
+                state.maskmem_pos_enc = None;
+            }
+        }
+    }
+
+    fn run_propagated_frame(
+        &self,
+        config: &VideoConfig,
+        model: &Sam3ImageModel,
+        compute_device: &Device,
+        session: &mut Sam3VideoSession,
+        frame_idx: usize,
+        object: &TrackedObject,
+        direction: PropagationDirection,
+    ) -> Result<(ObjectFrameOutput, TrackerFrameState, Option<f32>)> {
+        self.ensure_history_states_have_memory(
+            model,
+            compute_device,
+            session,
+            object,
+            frame_idx,
+            direction,
+        )?;
+        let history = self.history_on_compute_device(
+            session,
+            object.obj_id,
+            frame_idx,
+            direction,
+            compute_device,
+        )?;
+        let visual_features = tracker_visual_output(&session.get_visual_features(
+            model,
+            compute_device,
+            frame_idx,
+        )?);
+        let track_output = self.tracker.track_frame(
+            &visual_features,
+            frame_idx,
+            session.num_frames(),
+            None,
+            None,
+            None,
+            None,
+            &history,
+            false,
+            matches!(direction, PropagationDirection::Backward),
+            true,
+            true,
+        )?;
+        let prompt_frame_idx = object.nearest_input_frame_idx(frame_idx, direction);
+        let mut output = tracker_state_to_object_output(
+            object.obj_id,
+            &track_output.state,
+            object.display_score,
+            prompt_frame_idx,
+            trim_memory_frame_indices(
+                track_output.memory_frame_indices.clone(),
+                config.memory_frame_count,
+            ),
+            object
+                .latest_text_prompt(frame_idx, direction)
+                .map(|(_, text)| text),
+            object.nearest_input_uses_explicit_geometry(frame_idx, direction),
+            true,
+            session.video_size(),
+        )?;
+        apply_prompt_frame_output_postprocess(&mut output, config)?;
+        if let Some(recorder) = session.debug_recorder_mut() {
+            recorder.record_first_propagation(
+                object,
+                frame_idx,
+                direction,
+                prompt_frame_idx,
+                &output,
+                &history,
+                &track_output.prompt_frame_indices,
+                &track_output.memory_frame_indices,
+            )?;
+        }
+        self.trim_past_non_cond_memory(session, object, frame_idx, direction);
+        Ok((output, track_output.state, object.display_score))
+    }
+
+    fn run_refined_tracker_prompt_frame(
+        &self,
+        config: &VideoConfig,
+        model: &Sam3ImageModel,
+        compute_device: &Device,
+        session: &mut Sam3VideoSession,
+        frame_idx: usize,
+        object: &TrackedObject,
+        prompt: &SessionPrompt,
+        direction: PropagationDirection,
+    ) -> Result<(ObjectFrameOutput, TrackerFrameState, Option<f32>)> {
+        if prompt.text.is_some() {
+            candle::bail!(
+                "SAM3 video tracker strict port currently supports correction prompts for point/box geometry only; text refinement lands in a later step."
+            );
+        }
+        self.ensure_history_states_have_memory(
+            model,
+            compute_device,
+            session,
+            object,
+            frame_idx,
+            direction,
+        )?;
+        let history = if self.tracker.config().predictor.use_stateless_refinement {
+            BTreeMap::new()
+        } else {
+            self.history_on_compute_device(
+                session,
+                object.obj_id,
+                frame_idx,
+                direction,
+                compute_device,
+            )?
+        };
+        let visual = tracker_visual_output(&session.get_visual_features(
+            model,
+            compute_device,
+            frame_idx,
+        )?);
+        let prompt = truncate_prompt_for_encoder(prompt, config.max_point_num_in_prompt_enc);
+        let tracker_input_extent = self.tracker.config().image_size as f64;
+        let point_coords = match prompt.points.as_ref() {
+            Some(points) => {
+                let mut data = Vec::with_capacity(points.len() * 2);
+                for (x, y) in points {
+                    data.push(*x);
+                    data.push(*y);
+                }
+                Some(
+                    Tensor::from_vec(data, (1, points.len(), 2), compute_device)?
+                        .affine(tracker_input_extent, 0.0)?,
+                )
+            }
+            None => None,
+        };
+        let point_labels = prompt
+            .point_labels
+            .as_ref()
+            .map(|labels| {
+                Tensor::from_vec(
+                    labels.iter().map(|label| *label as f32).collect(),
+                    (1, labels.len()),
+                    compute_device,
+                )
+            })
+            .transpose()?;
+        let boxes_xyxy = match prompt.boxes.as_ref() {
+            Some(boxes) if !boxes.is_empty() => Some(
+                boxes_cxcywh_to_xyxy_tensor(boxes, compute_device)?
+                    .affine(tracker_input_extent, 0.0)?,
+            ),
+            _ => None,
+        };
+        let prev_mask_input =
+            self.previous_frame_low_res_mask_input(object, frame_idx, compute_device)?;
+        let is_cond_frame = self.correction_frame_is_cond_frame();
+        let mut tracker_state = self
+            .tracker
+            .track_frame(
+                &visual,
+                frame_idx,
+                session.num_frames(),
+                point_coords.as_ref(),
+                point_labels.as_ref(),
+                boxes_xyxy.as_ref(),
+                prev_mask_input.as_ref(),
+                &history,
+                is_cond_frame,
+                matches!(direction, PropagationDirection::Backward),
+                self.tracker.config().predictor.use_prev_mem_frame,
+                false,
+            )?
+            .state;
+        tracker_state = self.attach_state_memory(
+            &visual,
+            &tracker_state,
+            prompt
+                .boxes
+                .as_ref()
+                .map(|boxes| boxes.is_empty())
+                .unwrap_or(true),
+        )?;
+        let mut output = tracker_state_to_object_output(
+            object.obj_id,
+            &tracker_state,
+            object.display_score.or(Some(1.0)),
+            Some(frame_idx),
+            Vec::new(),
+            prompt.text.clone(),
+            prompt.has_geometry(),
+            false,
+            session.video_size(),
+        )?;
+        output.presence_scores = None;
+        apply_prompt_frame_output_postprocess(&mut output, config)?;
+        Ok((output, tracker_state, object.display_score.or(Some(1.0))))
+    }
+
+    fn run_refined_mask_prompt_frame(
+        &self,
+        config: &VideoConfig,
+        model: &Sam3ImageModel,
+        compute_device: &Device,
+        session: &mut Sam3VideoSession,
+        frame_idx: usize,
+        object: &TrackedObject,
+        mask_prompt: &Tensor,
+        direction: PropagationDirection,
+    ) -> Result<(ObjectFrameOutput, TrackerFrameState, Option<f32>)> {
+        self.ensure_history_states_have_memory(
+            model,
+            compute_device,
+            session,
+            object,
+            frame_idx,
+            direction,
+        )?;
+        let history = if self.tracker.config().predictor.use_stateless_refinement {
+            BTreeMap::new()
+        } else {
+            self.history_on_compute_device(
+                session,
+                object.obj_id,
+                frame_idx,
+                direction,
+                compute_device,
+            )?
+        };
+        let visual = tracker_visual_output(&session.get_visual_features(
+            model,
+            compute_device,
+            frame_idx,
+        )?);
+        let video_mask =
+            resize_mask_prompt_to_video(mask_prompt, session.video_size(), compute_device)?
+                .ge(0.5f32)?
+                .to_dtype(DType::F32)?;
+        let tracker_mask = resize_mask_prompt_to_tracker_input(
+            mask_prompt,
+            self.tracker.input_mask_size(),
+            compute_device,
+        )?
+        .ge(0.5f32)?
+        .to_dtype(DType::F32)?;
+        let is_cond_frame = self.correction_frame_is_cond_frame();
+        let mut tracker_state = self
+            .tracker
+            .track_frame(
+                &visual,
+                frame_idx,
+                session.num_frames(),
+                None,
+                None,
+                None,
+                Some(&tracker_mask),
+                &history,
+                is_cond_frame,
+                matches!(direction, PropagationDirection::Backward),
+                self.tracker.config().predictor.use_prev_mem_frame,
+                false,
+            )?
+            .state;
+        tracker_state = self.attach_state_memory(&visual, &tracker_state, false)?;
+        let mut output = mask_prompt_to_object_output(
+            object.obj_id,
+            &video_mask,
+            &tracker_state,
+            Some(frame_idx),
+            session.video_size(),
+        )?;
+        apply_prompt_frame_output_postprocess(&mut output, config)?;
+        let display_score = output.score_value().ok();
+        Ok((output, tracker_state, display_score))
+    }
+
     fn get_visual_prompt(
         &self,
         object: &TrackedObject,
@@ -1573,8 +2141,9 @@ impl Sam3VideoTrackerCore<'_> {
         prompt: &SessionPrompt,
     ) -> Result<(SessionPrompt, bool)> {
         let box_count = prompt.boxes.as_ref().map(Vec::len).unwrap_or(0);
-        let is_new_visual_prompt =
-            box_count > 0 && !object.has_inference_history && !object.frame_outputs.contains_key(&frame_idx);
+        let is_new_visual_prompt = box_count > 0
+            && !object.has_inference_history
+            && !object.frame_outputs.contains_key(&frame_idx);
         if !is_new_visual_prompt {
             return Ok((prompt.clone(), false));
         }
@@ -1604,7 +2173,8 @@ impl Sam3VideoTrackerCore<'_> {
     ) -> Result<(ObjectFrameOutput, TrackerFrameState, Option<f32>)> {
         let visual_features = session.get_visual_features(model, compute_device, frame_idx)?;
         let tracker_visual_features = tracker_visual_output(&visual_features);
-        let (visual_prompt, used_visual_prompt) = self.get_visual_prompt(object, frame_idx, prompt)?;
+        let (visual_prompt, used_visual_prompt) =
+            self.get_visual_prompt(object, frame_idx, prompt)?;
         let used_visual_text_prompt = used_visual_prompt && prompt.text.is_none();
         let geometry_prompt = session_prompt_to_geometry(&visual_prompt, compute_device)?;
         let geometry_encoding = if geometry_prompt.is_empty() {
@@ -1614,11 +2184,16 @@ impl Sam3VideoTrackerCore<'_> {
         };
         let text_encoding = match prompt.text.as_ref() {
             Some(text) => Some(session.cached_text_encoding(model, text, compute_device)?),
-            None if used_visual_prompt => Some(session.cached_text_encoding(model, "visual", compute_device)?),
+            None if used_visual_prompt => {
+                Some(session.cached_text_encoding(model, "visual", compute_device)?)
+            }
             None => None,
         };
-        let encoded_prompt = combine_encoded_prompts(text_encoding.as_ref(), geometry_encoding.as_ref())?
-            .ok_or_else(|| candle::Error::Msg("visual prompt path produced no encoded prompt".to_owned()))?;
+        let encoded_prompt =
+            combine_encoded_prompts(text_encoding.as_ref(), geometry_encoding.as_ref())?
+                .ok_or_else(|| {
+                    candle::Error::Msg("visual prompt path produced no encoded prompt".to_owned())
+                })?;
         let grounding = ground_from_encoded_prompt(model, &visual_features, &encoded_prompt)?;
         let detector_output = grounding_to_object_output(
             object.obj_id,
@@ -1639,7 +2214,8 @@ impl Sam3VideoTrackerCore<'_> {
                 &detector_output,
             )?;
         }
-        let mut tracker_mask_input = normalize_video_mask_prompt(&grounding.mask_logits, compute_device)?;
+        let mut tracker_mask_input =
+            normalize_video_mask_prompt(&grounding.mask_logits, compute_device)?;
         let (_, _, height, width) = tracker_mask_input.dims4()?;
         let tracker_input_size = self.tracker.input_mask_size();
         if height != tracker_input_size || width != tracker_input_size {
@@ -1650,20 +2226,23 @@ impl Sam3VideoTrackerCore<'_> {
             )?;
         }
         let tracker_mask_input = tracker_mask_input.gt(0f64)?.to_dtype(DType::F32)?;
-        let tracker_state = self.tracker.track_frame(
-            &tracker_visual_features,
-            frame_idx,
-            session.num_frames(),
-            None,
-            None,
-            None,
-            Some(&tracker_mask_input),
-            &BTreeMap::new(),
-            true,
-            false,
-            true,
-            false,
-        )?.state;
+        let tracker_state = self
+            .tracker
+            .track_frame(
+                &tracker_visual_features,
+                frame_idx,
+                session.num_frames(),
+                None,
+                None,
+                None,
+                Some(&tracker_mask_input),
+                &BTreeMap::new(),
+                true,
+                false,
+                true,
+                false,
+            )?
+            .state;
         let detector_score = detector_output.score_value()?;
         let mut seed_output = tracker_state_to_object_output(
             object.obj_id,
@@ -1702,8 +2281,11 @@ impl Sam3VideoTrackerCore<'_> {
         prompt: &SessionPrompt,
         direction: PropagationDirection,
     ) -> Result<(ObjectFrameOutput, TrackerFrameState, Option<f32>)> {
-        let visual_features =
-            tracker_visual_output(&session.get_visual_features(model, compute_device, frame_idx)?);
+        let visual_features = tracker_visual_output(&session.get_visual_features(
+            model,
+            compute_device,
+            frame_idx,
+        )?);
         let prompt = truncate_prompt_for_encoder(prompt, config.max_point_num_in_prompt_enc);
         let tracker_input_extent = self.tracker.config().image_size as f64;
         let point_coords = match prompt.points.as_ref() {
@@ -1723,7 +2305,13 @@ impl Sam3VideoTrackerCore<'_> {
         let point_labels = prompt
             .point_labels
             .as_ref()
-            .map(|labels| Tensor::from_vec(labels.iter().map(|label| *label as f32).collect(), (1, labels.len()), compute_device))
+            .map(|labels| {
+                Tensor::from_vec(
+                    labels.iter().map(|label| *label as f32).collect(),
+                    (1, labels.len()),
+                    compute_device,
+                )
+            })
             .transpose()?;
         let boxes_xyxy = match prompt.boxes.as_ref() {
             Some(boxes) if !boxes.is_empty() => Some(
@@ -1732,20 +2320,23 @@ impl Sam3VideoTrackerCore<'_> {
             ),
             _ => None,
         };
-        let tracker_state = self.tracker.track_frame(
-            &visual_features,
-            frame_idx,
-            session.num_frames(),
-            point_coords.as_ref(),
-            point_labels.as_ref(),
-            boxes_xyxy.as_ref(),
-            None,
-            &BTreeMap::new(),
-            true,
-            false,
-            false,
-            false,
-        )?.state;
+        let tracker_state = self
+            .tracker
+            .track_frame(
+                &visual_features,
+                frame_idx,
+                session.num_frames(),
+                point_coords.as_ref(),
+                point_labels.as_ref(),
+                boxes_xyxy.as_ref(),
+                None,
+                &BTreeMap::new(),
+                true,
+                false,
+                false,
+                false,
+            )?
+            .state;
         let mut output = tracker_state_to_object_output(
             object.obj_id,
             &tracker_state,
@@ -1783,11 +2374,15 @@ impl Sam3VideoTrackerCore<'_> {
         mask_prompt: &Tensor,
         direction: PropagationDirection,
     ) -> Result<(ObjectFrameOutput, TrackerFrameState, Option<f32>)> {
-        let visual_features =
-            tracker_visual_output(&session.get_visual_features(model, compute_device, frame_idx)?);
-        let video_mask = resize_mask_prompt_to_video(mask_prompt, session.video_size(), compute_device)?
-            .ge(0.5f32)?
-            .to_dtype(DType::F32)?;
+        let visual_features = tracker_visual_output(&session.get_visual_features(
+            model,
+            compute_device,
+            frame_idx,
+        )?);
+        let video_mask =
+            resize_mask_prompt_to_video(mask_prompt, session.video_size(), compute_device)?
+                .ge(0.5f32)?
+                .to_dtype(DType::F32)?;
         let tracker_mask = resize_mask_prompt_to_tracker_input(
             mask_prompt,
             self.tracker.input_mask_size(),
@@ -1795,20 +2390,23 @@ impl Sam3VideoTrackerCore<'_> {
         )?
         .ge(0.5f32)?
         .to_dtype(DType::F32)?;
-        let tracker_state = self.tracker.track_frame(
-            &visual_features,
-            frame_idx,
-            session.num_frames(),
-            None,
-            None,
-            None,
-            Some(&tracker_mask),
-            &BTreeMap::new(),
-            true,
-            false,
-            true,
-            false,
-        )?.state;
+        let tracker_state = self
+            .tracker
+            .track_frame(
+                &visual_features,
+                frame_idx,
+                session.num_frames(),
+                None,
+                None,
+                None,
+                Some(&tracker_mask),
+                &BTreeMap::new(),
+                true,
+                false,
+                true,
+                false,
+            )?
+            .state;
         let mut output = mask_prompt_to_object_output(
             object.obj_id,
             &video_mask,
@@ -1851,6 +2449,12 @@ impl Sam3VideoTrackerCore<'_> {
         _output_threshold: f32,
     ) -> Result<VideoFrameOutput> {
         let obj_ids: Vec<u32> = session.tracked_objects.keys().copied().collect();
+        let predictor_config = &self.tracker.config().predictor;
+        let latest_session_input_frame = session
+            .tracked_objects
+            .values()
+            .filter_map(|object| object.nearest_input_frame_idx(frame_idx, direction))
+            .max();
         let mut frame_objects = Vec::new();
         for obj_id in obj_ids {
             if let Some(cached) = session
@@ -1870,7 +2474,9 @@ impl Sam3VideoTrackerCore<'_> {
                 (
                     object.prompt_frames.get(&frame_idx).cloned(),
                     object.mask_prompt_frames.get(&frame_idx).cloned(),
-                    object.has_inference_history || !object.frame_outputs.is_empty() || !object.tracker_states.is_empty(),
+                    object.has_inference_history
+                        || !object.frame_outputs.is_empty()
+                        || !object.tracker_states.is_empty(),
                     object.is_active_for_frame(frame_idx, direction),
                 )
             };
@@ -1879,27 +2485,47 @@ impl Sam3VideoTrackerCore<'_> {
             };
             let seed_result = if let Some(mask_prompt) = mask_prompt {
                 if has_history {
-                    candle::bail!(
-                        "SAM3 video tracker strict port currently supports initial mask prompts only; refinement/correction lands in a later step."
-                    );
+                    Some(self.run_refined_mask_prompt_frame(
+                        _config,
+                        model,
+                        compute_device,
+                        session,
+                        frame_idx,
+                        &object_snapshot,
+                        &mask_prompt,
+                        direction,
+                    )?)
+                } else {
+                    Some(self.run_mask_prompt_seed_frame(
+                        _config,
+                        model,
+                        compute_device,
+                        session,
+                        frame_idx,
+                        &object_snapshot,
+                        &mask_prompt,
+                        direction,
+                    )?)
                 }
-                Some(self.run_mask_prompt_seed_frame(
-                    _config,
-                    model,
-                    compute_device,
-                    session,
-                    frame_idx,
-                    &object_snapshot,
-                    &mask_prompt,
-                    direction,
-                )?)
             } else if let Some(prompt) = prompt {
                 if has_history {
-                    candle::bail!(
-                        "SAM3 video tracker strict port currently supports prompt-frame seeding only; refinement/correction lands in a later step."
-                    );
-                }
-                if prompt.text.is_some() || prompt.boxes.as_ref().map(|boxes| !boxes.is_empty()).unwrap_or(false) {
+                    Some(self.run_refined_tracker_prompt_frame(
+                        _config,
+                        model,
+                        compute_device,
+                        session,
+                        frame_idx,
+                        &object_snapshot,
+                        &prompt,
+                        direction,
+                    )?)
+                } else if prompt.text.is_some()
+                    || prompt
+                        .boxes
+                        .as_ref()
+                        .map(|boxes| !boxes.is_empty())
+                        .unwrap_or(false)
+                {
                     Some(self.run_visual_prompt_seed_frame(
                         _config,
                         model,
@@ -1923,12 +2549,35 @@ impl Sam3VideoTrackerCore<'_> {
                     )?)
                 }
             } else {
+                let own_latest_input_frame = object_snapshot.nearest_input_frame_idx(frame_idx, direction);
+                let can_extend_uninteracted_multi_object = predictor_config.clear_non_cond_mem_for_multi_obj
+                    && session.tracked_objects.len() > 1
+                    && latest_session_input_frame.zip(own_latest_input_frame).map_or(false, |(session_latest, own_latest)| session_latest > own_latest)
+                    && match direction {
+                        PropagationDirection::Forward | PropagationDirection::Both => {
+                            frame_idx > object_snapshot.last_updated_frame
+                        }
+                        PropagationDirection::Backward => {
+                            frame_idx < object_snapshot.last_updated_frame
+                        }
+                    };
                 if is_active {
-                    candle::bail!(
-                        "SAM3 video tracker strict port currently supports prompt frames only; memory-conditioned propagation lands in a later step."
-                    );
+                    if can_extend_uninteracted_multi_object {
+                        None
+                    } else {
+                        Some(self.run_propagated_frame(
+                            _config,
+                            model,
+                            compute_device,
+                            session,
+                            frame_idx,
+                            &object_snapshot,
+                            direction,
+                        )?)
+                    }
+                } else {
+                    None
                 }
-                None
             };
             let Some((output, tracker_state, display_score)) = seed_result else {
                 continue;
@@ -2291,8 +2940,9 @@ fn load_jpeg_frame_blob_via_pillow(
     image_std: [f32; 3],
     expected_video_size: ImageSize,
 ) -> Result<FrameBlob> {
-    let python = find_pillow_python()
-        .ok_or_else(|| candle::Error::Msg("no Pillow-capable python interpreter found".to_owned()))?;
+    let python = find_pillow_python().ok_or_else(|| {
+        candle::Error::Msg("no Pillow-capable python interpreter found".to_owned())
+    })?;
     let script = r#"
 import struct
 import sys
@@ -2355,9 +3005,12 @@ sys.stdout.buffer.write(raw)
     }
     let image = Tensor::from_vec(raw.to_vec(), (image_size, image_size, 3), &Device::Cpu)?
         .permute((2, 0, 1))?;
-    let normalized =
-        normalize_image_for_sam3(&(image.to_dtype(DType::F32)?.unsqueeze(0)? / 255.)?, image_mean, image_std)?
-            .squeeze(0)?;
+    let normalized = normalize_image_for_sam3(
+        &(image.to_dtype(DType::F32)?.unsqueeze(0)? / 255.)?,
+        image_mean,
+        image_std,
+    )?
+    .squeeze(0)?;
     Ok(FrameBlob {
         data: normalized.flatten_all()?.to_vec1::<f32>()?,
         frame_size: ImageSize::square(image_size),
@@ -2370,11 +3023,13 @@ fn find_pillow_python() -> Option<PathBuf> {
         candidates.push(path);
     }
     candidates.push(PathBuf::from(".venv/bin/python"));
-    candidates.push(PathBuf::from("/home/dnorthover/ChengCode/candle_sam3/.venv/bin/python"));
+    candidates.push(PathBuf::from(
+        "/home/dnorthover/ChengCode/candle_sam3/.venv/bin/python",
+    ));
     candidates.push(PathBuf::from("python3"));
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.is_absolute() || candidate.exists() || candidate == Path::new("python3"))
+    candidates.into_iter().find(|candidate| {
+        candidate.is_absolute() || candidate.exists() || candidate == Path::new("python3")
+    })
 }
 
 fn frame_blob_from_rgb_image(
@@ -2418,25 +3073,24 @@ fn frame_blob_from_rgb_image_with_filter(
         );
     }
 
-    let resized = if expected_video_size.height == image_size && expected_video_size.width == image_size {
-        image
-    } else {
-        image::imageops::resize(
-            &image,
-            image_size as u32,
-            image_size as u32,
-            resize_filter,
-        )
-    };
+    let resized =
+        if expected_video_size.height == image_size && expected_video_size.width == image_size {
+            image
+        } else {
+            image::imageops::resize(&image, image_size as u32, image_size as u32, resize_filter)
+        };
     let image = Tensor::from_vec(
         resized.into_raw(),
         (image_size, image_size, 3),
         &Device::Cpu,
     )?
     .permute((2, 0, 1))?;
-    let normalized =
-        normalize_image_for_sam3(&(image.to_dtype(DType::F32)?.unsqueeze(0)? / 255.)?, image_mean, image_std)?
-            .squeeze(0)?;
+    let normalized = normalize_image_for_sam3(
+        &(image.to_dtype(DType::F32)?.unsqueeze(0)? / 255.)?,
+        image_mean,
+        image_std,
+    )?
+    .squeeze(0)?;
     Ok(FrameBlob {
         data: normalized.flatten_all()?.to_vec1::<f32>()?,
         frame_size: ImageSize::square(image_size),
@@ -2918,7 +3572,12 @@ fn binary_mask_logits(mask: &Tensor) -> Result<Tensor> {
 }
 
 fn canonicalize_single_score_tensor(tensor: &Tensor) -> Result<Tensor> {
-    let value = tensor.flatten_all()?.to_vec1::<f32>()?.into_iter().next().unwrap_or(0.0);
+    let value = tensor
+        .flatten_all()?
+        .to_vec1::<f32>()?
+        .into_iter()
+        .next()
+        .unwrap_or(0.0);
     Tensor::from_vec(vec![value], (1,), tensor.device())
 }
 
@@ -2936,7 +3595,9 @@ fn mask_prompt_to_object_output(
         mask_logits,
         masks: masks.clone(),
         boxes_xyxy: mask_to_normalized_xyxy(&masks)?,
-        scores: canonicalize_single_score_tensor(&candle_nn::ops::sigmoid(&tracker_state.object_score_logits)?)?,
+        scores: canonicalize_single_score_tensor(&candle_nn::ops::sigmoid(
+            &tracker_state.object_score_logits,
+        )?)?,
         presence_scores: None,
         prompt_frame_idx,
         memory_frame_indices: Vec::new(),
@@ -2969,7 +3630,7 @@ fn tensor_to_mask_probs_2d(tensor: &Tensor) -> Result<Vec<Vec<f32>>> {
         4 => tensor.i((0, 0))?,
         rank => candle::bail!("expected mask tensor rank 2/3/4, got {rank}"),
     };
-    tensor.to_vec2::<f32>()
+    tensor.to_dtype(DType::F32)?.to_vec2::<f32>()
 }
 
 fn count_foreground_pixels(mask_probs: &[Vec<f32>], threshold: f32) -> usize {
@@ -3397,6 +4058,7 @@ fn build_processing_order(
     direction: PropagationDirection,
     start_frame_idx: Option<usize>,
     max_frame_num_to_track: Option<usize>,
+    always_start_from_first_ann_frame: bool,
 ) -> Result<Vec<usize>> {
     let seed_frames = session.prompt_frames();
     if seed_frames.is_empty() {
@@ -3404,8 +4066,16 @@ fn build_processing_order(
     }
     let num_frames = session.num_frames();
     let start_frame_idx = match start_frame_idx {
-        Some(frame_idx) => frame_idx,
+        Some(frame_idx) if !always_start_from_first_ann_frame => frame_idx,
         None => match direction {
+            PropagationDirection::Forward | PropagationDirection::Both => {
+                *seed_frames.iter().next().expect("seed frames checked")
+            }
+            PropagationDirection::Backward => {
+                *seed_frames.iter().next_back().expect("seed frames checked")
+            }
+        },
+        Some(_) => match direction {
             PropagationDirection::Forward | PropagationDirection::Both => {
                 *seed_frames.iter().next().expect("seed frames checked")
             }
@@ -3439,7 +4109,7 @@ mod tests {
     use super::*;
     use candle::Tensor;
     use candle_nn::VarBuilder;
-    use image::{ImageBuffer, Rgb, RgbImage};
+    use image::{GrayImage, ImageBuffer, Luma, Rgb, RgbImage};
 
     use crate::models::sam3::{
         Config, DecoderConfig, EncoderConfig, GeometryConfig, ImageConfig, NeckConfig,
@@ -3562,19 +4232,135 @@ mod tests {
         })
     }
 
+    fn tracker_config_with_reference_runtime_overrides(bundle: Option<&str>) -> Result<Sam3TrackerConfig> {
+        let mut config = Sam3TrackerConfig::from_sam3_config(&Config::default());
+        let Some(bundle) = bundle else {
+            return Ok(config);
+        };
+        let manifest = load_reference_internal_manifest(bundle)?;
+        let tracker_config = manifest["tracker_config"].as_object().ok_or_else(|| {
+            candle::Error::Msg("reference manifest missing tracker_config".to_owned())
+        })?;
+        let predictor_config = manifest["predictor_config"].as_object().ok_or_else(|| {
+            candle::Error::Msg("reference manifest missing predictor_config".to_owned())
+        })?;
+
+        if let Some(value) = tracker_config
+            .get("use_memory_selection")
+            .and_then(|value| value.as_bool())
+        {
+            config.use_memory_selection = value;
+        }
+        if let Some(value) = tracker_config
+            .get("memory_temporal_stride_for_eval")
+            .and_then(|value| value.as_u64())
+        {
+            config.memory_temporal_stride_for_eval = value as usize;
+        }
+        if let Some(value) = tracker_config
+            .get("max_obj_ptrs_in_encoder")
+            .and_then(|value| value.as_u64())
+        {
+            config.max_obj_ptrs_in_encoder = value as usize;
+        }
+        if let Some(value) = tracker_config
+            .get("max_cond_frames_in_attn")
+            .and_then(|value| value.as_u64())
+        {
+            config.max_cond_frames_in_attn = value as usize;
+        }
+        if let Some(value) = tracker_config
+            .get("keep_first_cond_frame")
+            .and_then(|value| value.as_bool())
+        {
+            config.keep_first_cond_frame = value;
+        }
+        if let Some(value) = tracker_config
+            .get("trim_past_non_cond_mem_for_eval")
+            .and_then(|value| value.as_bool())
+        {
+            config.predictor.trim_past_non_cond_mem_for_eval = value;
+        }
+        if let Some(value) = tracker_config
+            .get("offload_output_to_cpu_for_eval")
+            .and_then(|value| value.as_bool())
+        {
+            config.predictor.offload_output_to_cpu_for_eval = value;
+        }
+        if let Some(value) = tracker_config
+            .get("forward_backbone_per_frame_for_eval")
+            .and_then(|value| value.as_bool())
+        {
+            config.predictor.forward_backbone_per_frame_for_eval = value;
+        }
+        if let Some(value) = predictor_config
+            .get("clear_non_cond_mem_around_input")
+            .and_then(|value| value.as_bool())
+        {
+            config.predictor.clear_non_cond_mem_around_input = value;
+        }
+        if let Some(value) = predictor_config
+            .get("clear_non_cond_mem_for_multi_obj")
+            .and_then(|value| value.as_bool())
+        {
+            config.predictor.clear_non_cond_mem_for_multi_obj = value;
+        }
+        if let Some(value) = predictor_config
+            .get("always_start_from_first_ann_frame")
+            .and_then(|value| value.as_bool())
+        {
+            config.predictor.always_start_from_first_ann_frame = value;
+        }
+        if let Some(value) = predictor_config
+            .get("iter_use_prev_mask_pred")
+            .and_then(|value| value.as_bool())
+        {
+            config.predictor.iter_use_prev_mask_pred = value;
+        }
+        if let Some(value) = predictor_config
+            .get("add_all_frames_to_correct_as_cond")
+            .and_then(|value| value.as_bool())
+        {
+            config.predictor.add_all_frames_to_correct_as_cond = value;
+        }
+        if let Some(value) = predictor_config
+            .get("use_prev_mem_frame")
+            .and_then(|value| value.as_bool())
+        {
+            config.predictor.use_prev_mem_frame = value;
+        }
+        if let Some(value) = predictor_config
+            .get("use_stateless_refinement")
+            .and_then(|value| value.as_bool())
+        {
+            config.predictor.use_stateless_refinement = value;
+        }
+        if let Some(value) = predictor_config
+            .get("refinement_detector_cond_frame_removal_window")
+            .and_then(|value| value.as_u64())
+        {
+            config.predictor.refinement_detector_cond_frame_removal_window = value as usize;
+        }
+        Ok(config)
+    }
+
     fn load_runtime_models_from_checkpoint(
+        bundle: Option<&str>,
     ) -> Result<Option<(Sam3ImageModel, Sam3TrackerModel, Device)>> {
         let Some(checkpoint_path) = sam3_test_checkpoint_path() else {
             return Ok(None);
         };
         let device = Device::Cpu;
         let config = Config::default();
-        let checkpoint = crate::models::sam3::checkpoint::Sam3CheckpointSource::upstream_pth(
-            checkpoint_path,
-        );
-        let model = Sam3ImageModel::from_checkpoint_source(&config, &checkpoint, DType::F32, &device)?;
-        let tracker =
-            Sam3TrackerModel::from_checkpoint_source(&config, &checkpoint, DType::F32, &device)?;
+        let checkpoint =
+            crate::models::sam3::checkpoint::Sam3CheckpointSource::upstream_pth(checkpoint_path);
+        let model =
+            Sam3ImageModel::from_checkpoint_source(&config, &checkpoint, DType::F32, &device)?;
+        let tracker_config = tracker_config_with_reference_runtime_overrides(bundle)?;
+        let tracker = Sam3TrackerModel::new(
+            &tracker_config,
+            checkpoint.load_tracker_var_builder(DType::F32, &device)?,
+        )?;
         Ok(Some((model, tracker, device)))
     }
 
@@ -3600,8 +4386,9 @@ mod tests {
         }
     }
 
-    fn load_reference_frame0_output(
+    fn load_reference_frame_output(
         bundle: &str,
+        frame_idx: usize,
     ) -> Result<(Vec<f32>, f32, PathBuf)> {
         let bundle_dir = reference_bundle_dir(bundle);
         let value: serde_json::Value =
@@ -3609,28 +4396,36 @@ mod tests {
                 .map_err(|err| candle::Error::Msg(err.to_string()))?;
         let frames = match &value {
             serde_json::Value::Array(frames) => frames,
-            serde_json::Value::Object(_) => value["frames"]
-                .as_array()
-                .ok_or_else(|| {
-                    candle::Error::Msg("reference video results missing frames array".to_owned())
-                })?,
+            serde_json::Value::Object(_) => value["frames"].as_array().ok_or_else(|| {
+                candle::Error::Msg("reference video results missing frames array".to_owned())
+            })?,
             _ => {
                 candle::bail!("reference video results must be an array or object with frames")
             }
         };
-        let frame0 = frames
+        let frame = frames
             .iter()
-            .find(|frame| frame["frame_idx"].as_u64() == Some(0))
-            .ok_or_else(|| candle::Error::Msg("reference video results missing frame 0".to_owned()))?;
-        let objects = frame0["objects"]
-            .as_array()
-            .ok_or_else(|| candle::Error::Msg("reference frame 0 missing objects array".to_owned()))?;
+            .find(|frame| frame["frame_idx"].as_u64() == Some(frame_idx as u64))
+            .ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "reference video results missing frame {}",
+                    frame_idx
+                ))
+            })?;
+        let objects = frame["objects"].as_array().ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "reference frame {} missing objects array",
+                frame_idx
+            ))
+        })?;
         let object = &objects[0];
         let boxes = object["boxes_xyxy"]
             .as_array()
             .and_then(|boxes| boxes.first())
             .and_then(|first| first.as_array())
-            .ok_or_else(|| candle::Error::Msg("reference frame 0 missing boxes_xyxy".to_owned()))?
+            .ok_or_else(|| {
+                candle::Error::Msg(format!("reference frame {} missing boxes_xyxy", frame_idx))
+            })?
             .iter()
             .map(|value| value.as_f64().unwrap_or(0.0) as f32)
             .collect::<Vec<_>>();
@@ -3638,22 +4433,132 @@ mod tests {
             .as_array()
             .and_then(|scores| scores.first())
             .and_then(|value| value.as_f64())
-            .ok_or_else(|| candle::Error::Msg("reference frame 0 missing score".to_owned()))? as f32;
-        let mask_path = object["mask_path"]
-            .as_str()
-            .ok_or_else(|| candle::Error::Msg("reference frame 0 missing mask_path".to_owned()))?;
+            .ok_or_else(|| {
+                candle::Error::Msg(format!("reference frame {} missing score", frame_idx))
+            })? as f32;
+        let mask_path = object["mask_path"].as_str().ok_or_else(|| {
+            candle::Error::Msg(format!("reference frame {} missing mask_path", frame_idx))
+        })?;
         Ok((boxes, score, bundle_dir.join(mask_path)))
+    }
+
+    fn load_reference_object_frame_output(
+        bundle: &str,
+        frame_idx: usize,
+        obj_id: u32,
+    ) -> Result<(Vec<f32>, f32, PathBuf)> {
+        let bundle_dir = reference_bundle_dir(bundle);
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(bundle_dir.join("video_results.json"))?)
+                .map_err(|err| candle::Error::Msg(err.to_string()))?;
+        let frames = match &value {
+            serde_json::Value::Array(frames) => frames,
+            serde_json::Value::Object(_) => value["frames"].as_array().ok_or_else(|| {
+                candle::Error::Msg("reference video results missing frames array".to_owned())
+            })?,
+            _ => {
+                candle::bail!("reference video results must be an array or object with frames")
+            }
+        };
+        let frame = frames
+            .iter()
+            .find(|frame| frame["frame_idx"].as_u64() == Some(frame_idx as u64))
+            .ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "reference video results missing frame {}",
+                    frame_idx
+                ))
+            })?;
+        let objects = frame["objects"].as_array().ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "reference frame {} missing objects array",
+                frame_idx
+            ))
+        })?;
+        let object = objects
+            .iter()
+            .find(|object| object["obj_id"].as_u64() == Some(obj_id as u64))
+            .ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "reference frame {} missing obj_id {}",
+                    frame_idx, obj_id
+                ))
+            })?;
+        let boxes = object["boxes_xyxy"]
+            .as_array()
+            .and_then(|boxes| boxes.first())
+            .and_then(|first| first.as_array())
+            .ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "reference frame {} obj_id {} missing boxes_xyxy",
+                    frame_idx, obj_id
+                ))
+            })?
+            .iter()
+            .map(|value| value.as_f64().unwrap_or(0.0) as f32)
+            .collect::<Vec<_>>();
+        let score = object["scores"]
+            .as_array()
+            .and_then(|scores| scores.first())
+            .and_then(|value| value.as_f64())
+            .ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "reference frame {} obj_id {} missing score",
+                    frame_idx, obj_id
+                ))
+            })? as f32;
+        let mask_path = object["mask_path"].as_str().ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "reference frame {} obj_id {} missing mask_path",
+                frame_idx, obj_id
+            ))
+        })?;
+        Ok((boxes, score, bundle_dir.join(mask_path)))
+    }
+
+    fn load_reference_frame_indices(bundle: &str) -> Result<Vec<usize>> {
+        let bundle_dir = reference_bundle_dir(bundle);
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(bundle_dir.join("video_results.json"))?)
+                .map_err(|err| candle::Error::Msg(err.to_string()))?;
+        let frames = match &value {
+            serde_json::Value::Array(frames) => frames,
+            serde_json::Value::Object(_) => value["frames"].as_array().ok_or_else(|| {
+                candle::Error::Msg("reference video results missing frames array".to_owned())
+            })?,
+            _ => {
+                candle::bail!("reference video results must be an array or object with frames")
+            }
+        };
+        Ok(frames
+            .iter()
+            .filter(|frame| {
+                frame["objects"]
+                    .as_array()
+                    .map(|objects| !objects.is_empty())
+                    .unwrap_or(false)
+            })
+            .filter_map(|frame| frame["frame_idx"].as_u64())
+            .map(|frame_idx| frame_idx as usize)
+            .collect())
+    }
+
+    fn load_reference_frame0_output(bundle: &str) -> Result<(Vec<f32>, f32, PathBuf)> {
+        load_reference_frame_output(bundle, 0)
     }
 
     fn load_reference_box_prompt(bundle: &str) -> Result<(f32, f32, f32, f32)> {
         let bundle_dir = reference_bundle_dir(bundle);
-        let value: serde_json::Value = serde_json::from_slice(&fs::read(bundle_dir.join("reference.json"))?)
-            .map_err(|err| candle::Error::Msg(err.to_string()))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(bundle_dir.join("reference.json"))?)
+                .map_err(|err| candle::Error::Msg(err.to_string()))?;
         let boxes = value["boxes_cxcywh_normalized"]
             .as_array()
             .and_then(|boxes| boxes.first())
             .and_then(|first| first.as_array())
-            .ok_or_else(|| candle::Error::Msg("reference bundle missing boxes_cxcywh_normalized".to_owned()))?;
+            .ok_or_else(|| {
+                candle::Error::Msg("reference bundle missing boxes_cxcywh_normalized".to_owned())
+            })?;
         Ok((
             boxes[0].as_f64().unwrap_or(0.0) as f32,
             boxes[1].as_f64().unwrap_or(0.0) as f32,
@@ -3664,14 +4569,15 @@ mod tests {
 
     fn load_reference_mask_prompt_box_xyxy(bundle: &str) -> Result<(f32, f32, f32, f32)> {
         let bundle_dir = reference_bundle_dir(bundle);
-        let value: serde_json::Value = serde_json::from_slice(&fs::read(bundle_dir.join("reference.json"))?)
-            .map_err(|err| candle::Error::Msg(err.to_string()))?;
-        let actions = value["scenario"]["actions"]
-            .as_array()
-            .ok_or_else(|| candle::Error::Msg("reference bundle missing scenario actions".to_owned()))?;
-        let mask = actions[0]["mask"]["box_xyxy"]
-            .as_array()
-            .ok_or_else(|| candle::Error::Msg("reference mask scenario missing box_xyxy".to_owned()))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(bundle_dir.join("reference.json"))?)
+                .map_err(|err| candle::Error::Msg(err.to_string()))?;
+        let actions = value["scenario"]["actions"].as_array().ok_or_else(|| {
+            candle::Error::Msg("reference bundle missing scenario actions".to_owned())
+        })?;
+        let mask = actions[0]["mask"]["box_xyxy"].as_array().ok_or_else(|| {
+            candle::Error::Msg("reference mask scenario missing box_xyxy".to_owned())
+        })?;
         Ok((
             mask[0].as_f64().unwrap_or(0.0) as f32,
             mask[1].as_f64().unwrap_or(0.0) as f32,
@@ -3681,29 +4587,46 @@ mod tests {
     }
 
     fn load_reference_point_prompt(bundle: &str) -> Result<(Vec<(f32, f32)>, Vec<u32>)> {
+        load_reference_point_prompt_on_frame(bundle, 0)
+    }
+
+    fn load_reference_point_prompt_on_frame(
+        bundle: &str,
+        frame_idx: usize,
+    ) -> Result<(Vec<(f32, f32)>, Vec<u32>)> {
         let bundle_dir = reference_bundle_dir(bundle);
         let value: serde_json::Value =
             serde_json::from_slice(&fs::read(bundle_dir.join("reference.json"))?)
                 .map_err(|err| candle::Error::Msg(err.to_string()))?;
-        let actions = value["scenario"]["actions"]
-            .as_array()
-            .ok_or_else(|| candle::Error::Msg("reference bundle missing scenario actions".to_owned()))?;
+        let actions = value["scenario"]["actions"].as_array().ok_or_else(|| {
+            candle::Error::Msg("reference bundle missing scenario actions".to_owned())
+        })?;
         let add_prompt = actions
             .iter()
-            .find(|action| action["type"].as_str() == Some("add_prompt"))
-            .ok_or_else(|| candle::Error::Msg("reference bundle missing add_prompt action".to_owned()))?;
+            .find(|action| {
+                action["type"].as_str() == Some("add_prompt")
+                    && action["frame_idx"].as_u64() == Some(frame_idx as u64)
+            })
+            .ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "reference bundle missing add_prompt action for frame {}",
+                    frame_idx
+                ))
+            })?;
         let points = add_prompt["points_xy_normalized"]
             .as_array()
-            .ok_or_else(|| candle::Error::Msg("reference point scenario missing points_xy_normalized".to_owned()))?
+            .ok_or_else(|| {
+                candle::Error::Msg(
+                    "reference point scenario missing points_xy_normalized".to_owned(),
+                )
+            })?
             .iter()
             .map(|point| {
-                let point = point
-                    .as_array()
-                    .ok_or_else(|| {
-                        candle::Error::Msg(
-                            "reference point scenario contains a malformed point".to_owned(),
-                        )
-                    })?;
+                let point = point.as_array().ok_or_else(|| {
+                    candle::Error::Msg(
+                        "reference point scenario contains a malformed point".to_owned(),
+                    )
+                })?;
                 Ok((
                     point[0].as_f64().unwrap_or(0.0) as f32,
                     point[1].as_f64().unwrap_or(0.0) as f32,
@@ -3712,7 +4635,9 @@ mod tests {
             .collect::<Result<Vec<_>>>()?;
         let labels = add_prompt["point_labels"]
             .as_array()
-            .ok_or_else(|| candle::Error::Msg("reference point scenario missing point_labels".to_owned()))?
+            .ok_or_else(|| {
+                candle::Error::Msg("reference point scenario missing point_labels".to_owned())
+            })?
             .iter()
             .map(|value| value.as_u64().unwrap_or(0) as u32)
             .collect::<Vec<_>>();
@@ -3730,9 +4655,9 @@ mod tests {
         bundle: &str,
     ) -> Result<()> {
         let manifest = load_reference_internal_manifest(bundle)?;
-        let predictor_config = manifest["predictor_config"]
-            .as_object()
-            .ok_or_else(|| candle::Error::Msg("reference manifest missing predictor_config".to_owned()))?;
+        let predictor_config = manifest["predictor_config"].as_object().ok_or_else(|| {
+            candle::Error::Msg("reference manifest missing predictor_config".to_owned())
+        })?;
         if let Some(fill_hole_area) = predictor_config
             .get("fill_hole_area")
             .and_then(|value| value.as_u64())
@@ -3759,14 +4684,13 @@ mod tests {
 
         let bundle_dir = reference_bundle_dir(bundle);
         let path = bundle_dir.join("debug/internal_fixtures.safetensors");
-        let tensors = unsafe { candle::safetensors::MmapedSafetensors::new(&path) }.map_err(
-            |err| {
+        let tensors =
+            unsafe { candle::safetensors::MmapedSafetensors::new(&path) }.map_err(|err| {
                 candle::Error::Msg(format!(
                     "failed to mmap reference fixtures {}: {err}",
                     path.display()
                 ))
-            },
-        )?;
+            })?;
         tensors
             .get(key)
             .map_err(|err| {
@@ -3778,7 +4702,139 @@ mod tests {
             .load(&Device::Cpu)
     }
 
-    fn assert_tensor_close(label: &str, actual: &Tensor, expected: &Tensor, atol: f32) -> Result<()> {
+    fn load_reference_internal_record(
+        bundle: &str,
+        stage: &str,
+        frame_idx: usize,
+    ) -> Result<serde_json::Value> {
+        let records = load_reference_internal_records(bundle, stage, frame_idx)?;
+        records.into_iter().next().ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "reference manifest missing {stage} record for frame {frame_idx}"
+            ))
+        })
+    }
+
+    fn load_reference_internal_records(
+        bundle: &str,
+        stage: &str,
+        frame_idx: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let manifest = load_reference_internal_manifest(bundle)?;
+        Ok(manifest["records"]
+            .as_array()
+            .ok_or_else(|| candle::Error::Msg("reference manifest missing records".to_owned()))?
+            .iter()
+            .filter(|record| {
+                record["stage"].as_str() == Some(stage)
+                    && record["frame_idx"].as_u64() == Some(frame_idx as u64)
+            })
+            .cloned()
+            .collect())
+    }
+
+    fn load_reference_internal_record_matching<F>(
+        bundle: &str,
+        stage: &str,
+        frame_idx: usize,
+        predicate: F,
+    ) -> Result<serde_json::Value>
+    where
+        F: Fn(&serde_json::Value) -> bool,
+    {
+        load_reference_internal_records(bundle, stage, frame_idx)?
+            .into_iter()
+            .find(predicate)
+            .ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "reference manifest missing matching {stage} record for frame {frame_idx}"
+                ))
+            })
+    }
+
+    fn load_reference_internal_record_matching_last<F>(
+        bundle: &str,
+        stage: &str,
+        frame_idx: usize,
+        predicate: F,
+    ) -> Result<serde_json::Value>
+    where
+        F: Fn(&serde_json::Value) -> bool,
+    {
+        load_reference_internal_records(bundle, stage, frame_idx)?
+            .into_iter()
+            .rev()
+            .find(predicate)
+            .ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "reference manifest missing last matching {stage} record for frame {frame_idx}"
+                ))
+            })
+    }
+
+    fn load_reference_track_step_frame_output(
+        bundle: &str,
+        frame_idx: usize,
+        video_size: ImageSize,
+    ) -> Result<(Vec<f32>, f32, Tensor)> {
+        let record = load_reference_internal_record(bundle, "track_step", frame_idx)?;
+        let tensor_keys = record["tensor_keys"].as_object().ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "reference track_step frame {frame_idx} missing tensor_keys"
+            ))
+        })?;
+        let high_res_key = tensor_keys
+            .get("track_step_output.pred_masks_high_res")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "reference track_step frame {frame_idx} missing pred_masks_high_res key"
+                ))
+            })?;
+        let object_score_key = tensor_keys
+            .get("track_step_output.object_score_logits")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "reference track_step frame {frame_idx} missing object_score_logits key"
+                ))
+            })?;
+        let mask_logits = load_reference_internal_tensor(bundle, high_res_key)?;
+        let resized_logits = resize_mask_logits_to_video(&mask_logits, video_size)?;
+        let masks = candle_nn::ops::sigmoid(&resized_logits)?;
+        let boxes = mask_to_normalized_xyxy(&masks)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let presence_score =
+            candle_nn::ops::sigmoid(&load_reference_internal_tensor(bundle, object_score_key)?)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .into_iter()
+                .next()
+                .unwrap_or(0.0);
+        Ok((boxes, presence_score, masks))
+    }
+
+    fn json_usize_vec(value: &serde_json::Value, key: &str) -> Result<Vec<usize>> {
+        value[key]
+            .as_array()
+            .ok_or_else(|| candle::Error::Msg(format!("missing `{key}` array")))?
+            .iter()
+            .map(|entry| {
+                entry.as_u64().map(|value| value as usize).ok_or_else(|| {
+                    candle::Error::Msg(format!("malformed `{key}` entry in reference metadata"))
+                })
+            })
+            .collect()
+    }
+
+    fn assert_tensor_close(
+        label: &str,
+        actual: &Tensor,
+        expected: &Tensor,
+        atol: f32,
+    ) -> Result<()> {
         if actual.shape() != expected.shape() {
             candle::bail!(
                 "{label} shape mismatch: actual {:?}, expected {:?}",
@@ -3844,6 +4900,42 @@ mod tests {
         })
     }
 
+    fn binary_mask_iou_tensor(actual: &Tensor, expected: &Tensor) -> Result<f32> {
+        let actual = tensor_to_mask_probs_2d(actual)?;
+        let expected = tensor_to_mask_probs_2d(expected)?;
+        if actual.len() != expected.len()
+            || actual.first().map(Vec::len).unwrap_or(0)
+                != expected.first().map(Vec::len).unwrap_or(0)
+        {
+            candle::bail!(
+                "mask size mismatch when computing IoU from tensors: actual={}x{}, expected={}x{}",
+                actual.len(),
+                actual.first().map(Vec::len).unwrap_or(0),
+                expected.len(),
+                expected.first().map(Vec::len).unwrap_or(0)
+            );
+        }
+        let mut intersection = 0usize;
+        let mut union = 0usize;
+        for (actual_row, expected_row) in actual.iter().zip(expected.iter()) {
+            for (actual_value, expected_value) in actual_row.iter().zip(expected_row.iter()) {
+                let actual_fg = *actual_value >= 0.5;
+                let expected_fg = *expected_value >= 0.5;
+                if actual_fg && expected_fg {
+                    intersection += 1;
+                }
+                if actual_fg || expected_fg {
+                    union += 1;
+                }
+            }
+        }
+        Ok(if union == 0 {
+            1.0
+        } else {
+            intersection as f32 / union as f32
+        })
+    }
+
     fn assert_boxes_close(actual: &[f32], expected: &[f32], atol: f32) {
         assert_eq!(actual.len(), expected.len());
         for (idx, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
@@ -3852,6 +4944,194 @@ mod tests {
                 "box component {idx} mismatch: actual={actual}, expected={expected}, atol={atol}"
             );
         }
+    }
+
+    fn box_mismatch_message(actual: &[f32], expected: &[f32], atol: f32) -> Option<String> {
+        if actual.len() != expected.len() {
+            return Some(format!(
+                "box length mismatch: actual={}, expected={}",
+                actual.len(),
+                expected.len()
+            ));
+        }
+        for (idx, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            if (actual - expected).abs() > atol {
+                return Some(format!(
+                    "box component {idx} mismatch: actual={actual}, expected={expected}, atol={atol}"
+                ));
+            }
+        }
+        None
+    }
+
+    fn mask_tensor_to_binary_image(mask: &Tensor) -> Result<GrayImage> {
+        let mask_probs = tensor_to_mask_probs_2d(mask)?;
+        let height = mask_probs.len() as u32;
+        let width = mask_probs.first().map(Vec::len).unwrap_or(0) as u32;
+        let mut image = GrayImage::new(width, height);
+        for (y, row) in mask_probs.iter().enumerate() {
+            for (x, value) in row.iter().enumerate() {
+                let pixel = if *value >= 0.5 { 255u8 } else { 0u8 };
+                image.put_pixel(x as u32, y as u32, Luma([pixel]));
+            }
+        }
+        Ok(image)
+    }
+
+    fn save_binary_mask_png(path: &Path, mask: &Tensor) -> Result<()> {
+        mask_tensor_to_binary_image(mask)?
+            .save(path)
+            .map_err(|err| candle::Error::Msg(format!("failed to save {}: {err}", path.display())))
+    }
+
+    fn maybe_tensor_shape(tensor: Option<&Tensor>) -> Option<Vec<usize>> {
+        tensor.map(|tensor| tensor.shape().dims().to_vec())
+    }
+
+    fn maybe_single_tensor_value(tensor: Option<&Tensor>) -> Result<Option<f32>> {
+        match tensor {
+            Some(tensor) => Ok(Some(
+                tensor
+                    .flatten_all()?
+                    .to_vec1::<f32>()?
+                    .into_iter()
+                    .next()
+                    .unwrap_or(0.0),
+            )),
+            None => Ok(None),
+        }
+    }
+
+    fn dump_correction_failure_context(
+        bundle: &str,
+        actual8: &ObjectFrameOutput,
+        actual9: &ObjectFrameOutput,
+        expected_boxes8: &[f32],
+        expected_score8: f32,
+        expected_mask_path8: &Path,
+        expected_boxes9: &[f32],
+        expected_score9: f32,
+        expected_mask_path9: &Path,
+        frame8_state: &TrackerFrameState,
+        correction_track_step: &serde_json::Value,
+        correction_forward: &serde_json::Value,
+        prepare_record: &serde_json::Value,
+        failures: &[String],
+        mask_iou8: f32,
+        mask_iou9: f32,
+    ) -> Result<PathBuf> {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| candle::Error::Msg(format!("time went backwards: {err}")))?
+            .as_millis();
+        let out_dir = PathBuf::from("/tmp/sam3_test_failures")
+            .join(format!("{}_{}", bundle, stamp));
+        fs::create_dir_all(&out_dir).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to create correction failure directory {}: {err}",
+                out_dir.display()
+            ))
+        })?;
+
+        save_binary_mask_png(&out_dir.join("actual_frame8_mask.png"), &actual8.masks)?;
+        save_binary_mask_png(&out_dir.join("actual_frame9_mask.png"), &actual9.masks)?;
+        fs::copy(expected_mask_path8, out_dir.join("expected_frame8_mask.png")).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to copy {}: {err}",
+                expected_mask_path8.display()
+            ))
+        })?;
+        fs::copy(expected_mask_path9, out_dir.join("expected_frame9_mask.png")).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to copy {}: {err}",
+                expected_mask_path9.display()
+            ))
+        })?;
+
+        let summary = serde_json::json!({
+            "bundle": bundle,
+            "failures": failures,
+            "frame8": {
+                "actual_boxes_xyxy": actual8.boxes_xyxy.flatten_all()?.to_vec1::<f32>()?,
+                "expected_boxes_xyxy": expected_boxes8,
+                "actual_score": actual8.score_value()?,
+                "expected_score": expected_score8,
+                "actual_presence_score": maybe_single_tensor_value(actual8.presence_scores.as_ref())?,
+                "memory_frame_indices": actual8.memory_frame_indices,
+                "mask_iou": mask_iou8,
+            },
+            "frame9": {
+                "actual_boxes_xyxy": actual9.boxes_xyxy.flatten_all()?.to_vec1::<f32>()?,
+                "expected_boxes_xyxy": expected_boxes9,
+                "actual_score": actual9.score_value()?,
+                "expected_score": expected_score9,
+                "actual_presence_score": maybe_single_tensor_value(actual9.presence_scores.as_ref())?,
+                "memory_frame_indices": actual9.memory_frame_indices,
+                "mask_iou": mask_iou9,
+            },
+            "frame8_state": {
+                "is_cond_frame": frame8_state.is_cond_frame,
+                "maskmem_features_present": frame8_state.maskmem_features.is_some(),
+                "maskmem_features_shape": maybe_tensor_shape(frame8_state.maskmem_features.as_ref()),
+                "maskmem_pos_enc_present": frame8_state.maskmem_pos_enc.is_some(),
+                "maskmem_pos_enc_shape": maybe_tensor_shape(frame8_state.maskmem_pos_enc.as_ref()),
+                "object_score_logits": frame8_state.object_score_logits.flatten_all()?.to_vec1::<f32>()?,
+            },
+            "reference_internal_records": {
+                "correction_track_step": correction_track_step,
+                "correction_forward_sam_heads": correction_forward,
+                "frame9_prepare_memory_conditioned_features": prepare_record,
+            }
+        });
+        fs::write(
+            out_dir.join("summary.json"),
+            serde_json::to_vec_pretty(&summary)
+                .map_err(|err| candle::Error::Msg(format!("failed to serialize summary: {err}")))?,
+        )
+        .map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to write correction failure summary in {}: {err}",
+                out_dir.display()
+            ))
+        })?;
+        Ok(out_dir)
+    }
+
+    fn dump_simple_correction_failure_json(
+        bundle: &str,
+        phase: &str,
+        details: &serde_json::Value,
+    ) -> Result<PathBuf> {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| candle::Error::Msg(format!("time went backwards: {err}")))?
+            .as_millis();
+        let out_dir = PathBuf::from("/tmp/sam3_test_failures")
+            .join(format!("{}_{}", bundle, stamp));
+        fs::create_dir_all(&out_dir).map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to create correction failure directory {}: {err}",
+                out_dir.display()
+            ))
+        })?;
+        fs::write(
+            out_dir.join(format!("{phase}.json")),
+            serde_json::to_vec_pretty(details)
+                .map_err(|err| candle::Error::Msg(format!("failed to serialize summary: {err}")))?,
+        )
+        .map_err(|err| {
+            candle::Error::Msg(format!(
+                "failed to write simple correction failure dump in {}: {err}",
+                out_dir.display()
+            ))
+        })?;
+        Ok(out_dir)
     }
 
     fn normalized_box_xyxy_to_mask_tensor(
@@ -4090,6 +5370,57 @@ mod tests {
     }
 
     #[test]
+    fn predictor_allows_explicit_reference_object_ids_for_new_objects() -> Result<()> {
+        let device = Device::Cpu;
+        let model = tiny_model(&device)?;
+        let tracker = tiny_tracker(&device)?;
+        let frames = vec![
+            Tensor::zeros((3, 56, 56), DType::F32, &device)?,
+            Tensor::zeros((3, 56, 56), DType::F32, &device)?,
+        ];
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        let session_id =
+            predictor.start_session_from_tensors(frames, VideoSessionOptions::default())?;
+
+        let obj_a = predictor.add_prompt(
+            &session_id,
+            0,
+            SessionPrompt {
+                text: None,
+                points: Some(vec![(0.2, 0.3)]),
+                point_labels: Some(vec![1]),
+                boxes: None,
+                box_labels: None,
+            },
+            Some(1),
+            true,
+            true,
+        )?;
+        let obj_b = predictor.add_prompt(
+            &session_id,
+            0,
+            SessionPrompt {
+                text: None,
+                points: Some(vec![(0.4, 0.5)]),
+                point_labels: Some(vec![1]),
+                boxes: None,
+                box_labels: None,
+            },
+            Some(2),
+            true,
+            true,
+        )?;
+
+        assert_eq!(obj_a, 1);
+        assert_eq!(obj_b, 2);
+        let session = predictor.sessions.get(&session_id).expect("session exists");
+        assert!(session.tracked_objects.contains_key(&1));
+        assert!(session.tracked_objects.contains_key(&2));
+        assert_eq!(session.next_obj_id, 3);
+        Ok(())
+    }
+
+    #[test]
     fn propagation_emits_directional_frames_and_stays_lazy() -> Result<()> {
         let device = Device::Cpu;
         let model = tiny_model(&device)?;
@@ -4140,6 +5471,7 @@ mod tests {
                 forward_options.direction,
                 forward_options.start_frame_idx,
                 forward_options.max_frame_num_to_track,
+                false,
             )?,
             vec![1, 2, 3]
         );
@@ -4149,6 +5481,7 @@ mod tests {
                 backward_options.direction,
                 backward_options.start_frame_idx,
                 backward_options.max_frame_num_to_track,
+                false,
             )?,
             vec![1, 0]
         );
@@ -4157,6 +5490,275 @@ mod tests {
         assert_eq!(obj_id, 0);
         assert_eq!(stats.tracked_objects, 1);
         assert!(stats.cached_feature_entries <= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn processing_order_can_start_from_first_annotated_frame() -> Result<()> {
+        let device = Device::Cpu;
+        let model = tiny_model(&device)?;
+        let tracker = tiny_tracker(&device)?;
+        let frames = vec![
+            Tensor::zeros((3, 56, 56), DType::F32, &device)?,
+            Tensor::zeros((3, 56, 56), DType::F32, &device)?,
+            Tensor::zeros((3, 56, 56), DType::F32, &device)?,
+            Tensor::zeros((3, 56, 56), DType::F32, &device)?,
+        ];
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        let session_id =
+            predictor.start_session_from_tensors(frames, VideoSessionOptions::default())?;
+        predictor.add_prompt(
+            &session_id,
+            1,
+            SessionPrompt {
+                text: None,
+                points: None,
+                point_labels: None,
+                boxes: Some(vec![(0.5, 0.5, 0.3, 0.3)]),
+                box_labels: Some(vec![1]),
+            },
+            None,
+            true,
+            true,
+        )?;
+        let session = predictor
+            .sessions
+            .get(&session_id)
+            .expect("session should exist");
+        assert_eq!(
+            build_processing_order(
+                session,
+                PropagationDirection::Forward,
+                Some(3),
+                Some(2),
+                true
+            )?,
+            vec![1, 2, 3]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_updates_preserve_current_history_and_invalidate_future_outputs() -> Result<()> {
+        let device = Device::Cpu;
+        let model = tiny_model(&device)?;
+        let tracker = tiny_tracker(&device)?;
+        let frames = vec![
+            Tensor::zeros((3, 56, 56), DType::F32, &device)?,
+            Tensor::zeros((3, 56, 56), DType::F32, &device)?,
+            Tensor::zeros((3, 56, 56), DType::F32, &device)?,
+        ];
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        let session_id =
+            predictor.start_session_from_tensors(frames, VideoSessionOptions::default())?;
+        let obj_id = predictor.add_prompt(
+            &session_id,
+            0,
+            SessionPrompt {
+                text: None,
+                points: Some(vec![(0.2, 0.3)]),
+                point_labels: Some(vec![1]),
+                boxes: None,
+                box_labels: None,
+            },
+            None,
+            true,
+            true,
+        )?;
+        let state = TrackerFrameState {
+            low_res_masks: Tensor::zeros((1, 1, 16, 16), DType::F32, &device)?,
+            high_res_masks: Tensor::zeros((1, 1, 64, 64), DType::F32, &device)?,
+            iou_scores: Tensor::zeros((1, 1), DType::F32, &device)?,
+            obj_ptr: Tensor::zeros((1, tracker.config().hidden_dim), DType::F32, &device)?,
+            object_score_logits: Tensor::zeros((1, 1), DType::F32, &device)?,
+            maskmem_features: Some(Tensor::zeros(
+                (1, tracker.config().memory_dim, 4, 4),
+                DType::F32,
+                &device,
+            )?),
+            maskmem_pos_enc: Some(Tensor::zeros(
+                (1, tracker.config().memory_dim, 4, 4),
+                DType::F32,
+                &device,
+            )?),
+            is_cond_frame: false,
+        };
+        let output = ObjectFrameOutput {
+            obj_id,
+            mask_logits: Tensor::zeros((1, 1, 64, 64), DType::F32, &device)?,
+            masks: Tensor::zeros((1, 1, 64, 64), DType::F32, &device)?,
+            boxes_xyxy: Tensor::zeros((1, 4), DType::F32, &device)?,
+            scores: Tensor::from_vec(vec![1.0f32], (1,), &device)?,
+            presence_scores: None,
+            prompt_frame_idx: Some(0),
+            memory_frame_indices: Vec::new(),
+            text_prompt: None,
+            used_explicit_geometry: true,
+            reused_previous_output: false,
+        };
+        {
+            let session = predictor
+                .sessions
+                .get_mut(&session_id)
+                .expect("session exists");
+            let tracked = session
+                .tracked_objects
+                .get_mut(&obj_id)
+                .expect("tracked object exists");
+            for frame_idx in 0..=2 {
+                tracked.frame_outputs.insert(frame_idx, output.clone());
+                tracked.tracker_states.insert(frame_idx, state.clone());
+                session
+                    .frame_outputs
+                    .entry(frame_idx)
+                    .or_default()
+                    .insert(obj_id, output.clone());
+            }
+        }
+
+        predictor.add_prompt(
+            &session_id,
+            1,
+            SessionPrompt {
+                text: None,
+                points: Some(vec![(0.4, 0.5)]),
+                point_labels: Some(vec![1]),
+                boxes: None,
+                box_labels: None,
+            },
+            Some(obj_id),
+            false,
+            true,
+        )?;
+
+        let session = predictor.sessions.get(&session_id).expect("session exists");
+        let tracked = session
+            .tracked_objects
+            .get(&obj_id)
+            .expect("tracked object exists");
+        assert!(tracked.frame_outputs.contains_key(&0));
+        assert!(tracked.frame_outputs.contains_key(&1));
+        assert!(!tracked.frame_outputs.contains_key(&2));
+        assert!(tracked.tracker_states.contains_key(&0));
+        assert!(tracked.tracker_states.contains_key(&1));
+        assert!(!tracked.tracker_states.contains_key(&2));
+        assert!(session
+            .frame_outputs
+            .get(&0)
+            .and_then(|outputs| outputs.get(&obj_id))
+            .is_some());
+        assert!(session
+            .frame_outputs
+            .get(&1)
+            .and_then(|outputs| outputs.get(&obj_id))
+            .is_none());
+        assert!(session
+            .frame_outputs
+            .get(&2)
+            .and_then(|outputs| outputs.get(&obj_id))
+            .is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn clear_non_cond_mem_around_input_respects_multi_object_flag() -> Result<()> {
+        let device = Device::Cpu;
+        let model = tiny_model(&device)?;
+
+        let build_state_with_memory = |tracker: &Sam3TrackerModel| -> Result<TrackerFrameState> {
+            Ok(TrackerFrameState {
+                low_res_masks: Tensor::zeros((1, 1, 16, 16), DType::F32, &device)?,
+                high_res_masks: Tensor::zeros((1, 1, 64, 64), DType::F32, &device)?,
+                iou_scores: Tensor::zeros((1, 1), DType::F32, &device)?,
+                obj_ptr: Tensor::zeros((1, tracker.config().hidden_dim), DType::F32, &device)?,
+                object_score_logits: Tensor::zeros((1, 1), DType::F32, &device)?,
+                maskmem_features: Some(Tensor::zeros(
+                    (1, tracker.config().memory_dim, 4, 4),
+                    DType::F32,
+                    &device,
+                )?),
+                maskmem_pos_enc: Some(Tensor::zeros(
+                    (1, tracker.config().memory_dim, 4, 4),
+                    DType::F32,
+                    &device,
+                )?),
+                is_cond_frame: false,
+            })
+        };
+
+        for clear_multi_obj in [false, true] {
+            let mut tracker_config =
+                Sam3TrackerConfig::from_sam3_config(&tiny_segmentation_config());
+            tracker_config.predictor.clear_non_cond_mem_around_input = true;
+            tracker_config.predictor.clear_non_cond_mem_for_multi_obj = clear_multi_obj;
+            let tracker =
+                Sam3TrackerModel::new(&tracker_config, VarBuilder::zeros(DType::F32, &device))?;
+            let tracker_core = Sam3VideoTrackerCore::new(&tracker);
+            let frames = vec![
+                Tensor::zeros((3, 56, 56), DType::F32, &device)?,
+                Tensor::zeros((3, 56, 56), DType::F32, &device)?,
+                Tensor::zeros((3, 56, 56), DType::F32, &device)?,
+            ];
+            let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+            let session_id =
+                predictor.start_session_from_tensors(frames, VideoSessionOptions::default())?;
+            let obj_a = predictor.add_prompt(
+                &session_id,
+                0,
+                SessionPrompt {
+                    text: None,
+                    points: Some(vec![(0.2, 0.3)]),
+                    point_labels: Some(vec![1]),
+                    boxes: None,
+                    box_labels: None,
+                },
+                None,
+                true,
+                true,
+            )?;
+            let obj_b = predictor.add_prompt(
+                &session_id,
+                0,
+                SessionPrompt {
+                    text: None,
+                    points: Some(vec![(0.7, 0.6)]),
+                    point_labels: Some(vec![1]),
+                    boxes: None,
+                    box_labels: None,
+                },
+                None,
+                true,
+                true,
+            )?;
+            {
+                let session = predictor
+                    .sessions
+                    .get_mut(&session_id)
+                    .expect("session exists");
+                for obj_id in [obj_a, obj_b] {
+                    let tracked = session
+                        .tracked_objects
+                        .get_mut(&obj_id)
+                        .expect("tracked object exists");
+                    tracked.tracker_states.insert(1, build_state_with_memory(&tracker)?);
+                }
+                tracker_core.clear_non_cond_mem_around_input(session, 1);
+            }
+            let session = predictor.sessions.get(&session_id).expect("session exists");
+            for obj_id in [obj_a, obj_b] {
+                let state = session
+                    .tracked_objects
+                    .get(&obj_id)
+                    .and_then(|object| object.tracker_states.get(&1))
+                    .expect("tracker state should exist");
+                assert_eq!(
+                    state.maskmem_features.is_none(),
+                    clear_multi_obj,
+                    "clear_non_cond_mem_for_multi_obj={clear_multi_obj} should {}clear obj_id {obj_id} state",
+                    if clear_multi_obj { "" } else { "not " }
+                );
+            }
+        }
         Ok(())
     }
 
@@ -4467,7 +6069,9 @@ mod tests {
     #[test]
     #[ignore = "diagnostic for direct-tracker visual feature parity"]
     fn video_frame0_visual_features_match_single_click_point_fixture_bundle() -> Result<()> {
-        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint()? else {
+        let Some((model, tracker, device)) =
+            load_runtime_models_from_checkpoint(Some("reference_video_point_debug_single_click"))?
+        else {
             return Ok(());
         };
         let bundle = "reference_video_point_debug_single_click";
@@ -4475,7 +6079,10 @@ mod tests {
         let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
         let session_id = predictor.start_session(source, VideoSessionOptions::default())?;
         let (preprocessed_image, visual, raw_visual) = {
-            let session = predictor.sessions.get_mut(&session_id).expect("session exists");
+            let session = predictor
+                .sessions
+                .get_mut(&session_id)
+                .expect("session exists");
             let image = session.get_frame(0, &device)?.unsqueeze(0)?;
             let raw_visual = session.get_visual_features(&model, &device, 0)?;
             let visual = tracker_visual_output(&raw_visual);
@@ -4483,9 +6090,9 @@ mod tests {
         };
 
         let manifest = load_reference_internal_manifest(bundle)?;
-        let records = manifest["records"]
-            .as_array()
-            .ok_or_else(|| candle::Error::Msg("single-click manifest missing records".to_owned()))?;
+        let records = manifest["records"].as_array().ok_or_else(|| {
+            candle::Error::Msg("single-click manifest missing records".to_owned())
+        })?;
         let get_image_feature_record = records.iter().find(|record| {
             record["frame_idx"].as_u64() == Some(0)
                 && record["stage"].as_str() == Some("get_image_feature")
@@ -4532,7 +6139,10 @@ mod tests {
                 })?;
                 (
                     Tensor::zeros(preprocessed_image.shape(), DType::F32, &Device::Cpu)?,
-                    load_reference_internal_tensor(bundle, keys["backbone_features"].as_str().unwrap())?,
+                    load_reference_internal_tensor(
+                        bundle,
+                        keys["backbone_features"].as_str().unwrap(),
+                    )?,
                     load_reference_internal_tensor(
                         bundle,
                         keys["high_res_features.0"].as_str().unwrap(),
@@ -4556,12 +6166,16 @@ mod tests {
         let tracker_backbone = visual.backbone_fpn[2].to_device(&Device::Cpu)?;
         let tracker_backbone_diff = tensor_max_abs_diff(&tracker_backbone, &expected_backbone)?;
         if tracker_backbone_diff > 1e-3 {
-            let primary_backbone_diff =
-                tensor_max_abs_diff(&raw_visual.backbone_fpn[2].to_device(&Device::Cpu)?, &expected_backbone)?;
+            let primary_backbone_diff = tensor_max_abs_diff(
+                &raw_visual.backbone_fpn[2].to_device(&Device::Cpu)?,
+                &expected_backbone,
+            )?;
             let sam2_backbone_diff = raw_visual
                 .sam2_backbone_fpn
                 .as_ref()
-                .map(|levels| tensor_max_abs_diff(&levels[2].to_device(&Device::Cpu)?, &expected_backbone))
+                .map(|levels| {
+                    tensor_max_abs_diff(&levels[2].to_device(&Device::Cpu)?, &expected_backbone)
+                })
                 .transpose()?;
             candle::bail!(
                 "single-click tracker backbone feature mismatch: tracker_diff={tracker_backbone_diff:.6}, primary_diff={primary_backbone_diff:.6}, sam2_diff={:.6}",
@@ -4587,21 +6201,26 @@ mod tests {
 
     #[test]
     #[ignore = "diagnostic for video preprocessing filter parity"]
-    fn video_frame0_preprocess_filter_diagnostics_against_single_click_fixture_bundle() -> Result<()> {
+    fn video_frame0_preprocess_filter_diagnostics_against_single_click_fixture_bundle() -> Result<()>
+    {
         let bundle = "reference_video_point_debug_single_click";
         let manifest = load_reference_internal_manifest(bundle)?;
-        let records = manifest["records"]
-            .as_array()
-            .ok_or_else(|| candle::Error::Msg("single-click manifest missing records".to_owned()))?;
+        let records = manifest["records"].as_array().ok_or_else(|| {
+            candle::Error::Msg("single-click manifest missing records".to_owned())
+        })?;
         let record = records
             .iter()
             .find(|record| {
                 record["frame_idx"].as_u64() == Some(0)
                     && record["stage"].as_str() == Some("get_image_feature")
             })
-            .ok_or_else(|| candle::Error::Msg("missing single-click get_image_feature record".to_owned()))?;
+            .ok_or_else(|| {
+                candle::Error::Msg("missing single-click get_image_feature record".to_owned())
+            })?;
         let keys = record["tensor_keys"].as_object().ok_or_else(|| {
-            candle::Error::Msg("single-click get_image_feature record missing tensor keys".to_owned())
+            candle::Error::Msg(
+                "single-click get_image_feature record missing tensor keys".to_owned(),
+            )
         })?;
         let expected_image =
             load_reference_internal_tensor(bundle, keys["image"].as_str().unwrap())?;
@@ -4639,18 +6258,22 @@ mod tests {
             let diff = tensor_max_abs_diff(&actual, &expected_image)?;
             lines.push(format!("{label}: {diff:.6}"));
         }
-        candle::bail!("single-click preprocess filter diagnostics -> {}", lines.join(", "));
+        candle::bail!(
+            "single-click preprocess filter diagnostics -> {}",
+            lines.join(", ")
+        );
     }
 
     #[test]
     fn video_process_frame_matches_visual_box_reference_bundle_frame0() -> Result<()> {
-        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint()? else {
+        let bundle = "reference_video_box_debug";
+        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint(Some(bundle))?
+        else {
             return Ok(());
         };
         let Some(tokenizer_path) = sam3_test_tokenizer_path() else {
             return Ok(());
         };
-        let bundle = "reference_video_box_debug";
         let source = VideoSource::from_path(reference_input_frames_dir(bundle))?;
         let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
         apply_reference_predictor_runtime_overrides(&mut predictor, bundle)?;
@@ -4679,7 +6302,10 @@ mod tests {
         let tracker_core = Sam3VideoTrackerCore::new(&tracker);
         let video_config = predictor.video_config.clone();
         let output = {
-            let session = predictor.sessions.get_mut(&session_id).expect("session exists");
+            let session = predictor
+                .sessions
+                .get_mut(&session_id)
+                .expect("session exists");
             tracker_core.process_frame(
                 &model,
                 &device,
@@ -4706,10 +6332,7 @@ mod tests {
             "frame-0 box score mismatch: actual={actual_score}, expected={expected_score}"
         );
         let mask_iou = binary_mask_iou(&actual.masks, &expected_mask_path)?;
-        assert!(
-            mask_iou >= 0.97,
-            "frame-0 box mask IoU too low: {mask_iou}"
-        );
+        assert!(mask_iou >= 0.97, "frame-0 box mask IoU too low: {mask_iou}");
         Ok(())
     }
 
@@ -4720,10 +6343,144 @@ mod tests {
         )
     }
 
+    #[test]
+    #[ignore = "checkpoint-backed Step 6 frame-1 parity; slow on CPU"]
+    fn video_process_frame_matches_single_click_point_reference_bundle_frame1() -> Result<()> {
+        let bundle = "reference_video_point_debug_single_click";
+        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint(Some(bundle))?
+        else {
+            return Ok(());
+        };
+        let source = VideoSource::from_path(reference_input_frames_dir(bundle))?;
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        apply_reference_predictor_runtime_overrides(&mut predictor, bundle)?;
+        let session_id = predictor.start_session(source, VideoSessionOptions::default())?;
+        let (points, point_labels) = load_reference_point_prompt(bundle)?;
+        let obj_id = predictor.add_prompt(
+            &session_id,
+            0,
+            SessionPrompt {
+                text: None,
+                points: Some(points),
+                point_labels: Some(point_labels),
+                boxes: None,
+                box_labels: None,
+            },
+            None,
+            true,
+            true,
+        )?;
+        let tracker_core = Sam3VideoTrackerCore::new(&tracker);
+        let video_config = predictor.video_config.clone();
+        {
+            let session = predictor
+                .sessions
+                .get_mut(&session_id)
+                .expect("session exists");
+            let _ = tracker_core.process_frame(
+                &model,
+                &device,
+                &video_config,
+                session,
+                0,
+                PropagationDirection::Forward,
+                VIDEO_DEBUG_MASK_THRESHOLD,
+            )?;
+        }
+        let output = {
+            let session = predictor
+                .sessions
+                .get_mut(&session_id)
+                .expect("session exists");
+            tracker_core.process_frame(
+                &model,
+                &device,
+                &video_config,
+                session,
+                1,
+                PropagationDirection::Forward,
+                VIDEO_DEBUG_MASK_THRESHOLD,
+            )?
+        };
+        assert_eq!(output.frame_idx, 1);
+        assert_eq!(output.objects.len(), 1);
+        let actual = &output.objects[0];
+        let expected_display_score = load_reference_frame0_output(bundle)?.1;
+        let video_size = match actual.masks.rank() {
+            2 => {
+                let (height, width) = actual.masks.dims2()?;
+                ImageSize::new(height, width)
+            }
+            3 => {
+                let (_channels, height, width) = actual.masks.dims3()?;
+                ImageSize::new(height, width)
+            }
+            4 => {
+                let (_batch, _channels, height, width) = actual.masks.dims4()?;
+                ImageSize::new(height, width)
+            }
+            rank => candle::bail!("expected propagated mask rank 2, 3, or 4, got {}", rank),
+        };
+        let (expected_boxes, expected_presence_score, expected_masks) =
+            load_reference_track_step_frame_output(bundle, 1, video_size)?;
+        assert_boxes_close(
+            &actual.boxes_xyxy.flatten_all()?.to_vec1::<f32>()?,
+            &expected_boxes,
+            0.05,
+        );
+        let actual_score = actual.score_value()?;
+        assert!(
+            (actual_score - expected_display_score).abs() <= 0.02,
+            "frame-1 point score mismatch: actual={actual_score}, expected={expected_display_score}"
+        );
+        let actual_presence_score = actual
+            .presence_scores
+            .as_ref()
+            .expect("propagated point output should preserve presence score")
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .into_iter()
+            .next()
+            .unwrap_or(0.0);
+        assert!(
+            (actual_presence_score - expected_presence_score).abs() <= 0.02,
+            "frame-1 point presence score mismatch: actual={actual_presence_score}, expected={expected_presence_score}"
+        );
+        let mask_iou = binary_mask_iou_tensor(&actual.masks, &expected_masks)?;
+        assert!(
+            mask_iou >= 0.97,
+            "frame-1 point mask IoU too low: {mask_iou}"
+        );
+        let prepare_record =
+            load_reference_internal_record(bundle, "prepare_memory_conditioned_features", 1)?;
+        let expected_prompt_frame_indices = json_usize_vec(
+            &prepare_record["metadata"],
+            "selected_conditioning_frame_indices",
+        )?;
+        let expected_memory_frame_indices =
+            json_usize_vec(&prepare_record["metadata"], "selected_memory_frame_indices")?;
+        assert_eq!(
+            actual.prompt_frame_idx,
+            expected_prompt_frame_indices.last().copied()
+        );
+        assert_eq!(actual.memory_frame_indices, expected_memory_frame_indices);
+        let preflight_state = predictor
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.tracked_objects.get(&obj_id))
+            .and_then(|object| object.tracker_states.get(&0))
+            .expect("prompt-frame tracker state should exist after propagation");
+        assert!(preflight_state.maskmem_features.is_some());
+        assert!(preflight_state.maskmem_pos_enc.is_some());
+        Ok(())
+    }
+
     fn assert_video_process_frame_matches_point_reference_bundle_frame0(
         bundle: &str,
     ) -> Result<()> {
-        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint()? else {
+        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint(Some(bundle))?
+        else {
             return Ok(());
         };
         let source = VideoSource::from_path(reference_input_frames_dir(bundle))?;
@@ -4748,7 +6505,10 @@ mod tests {
         let tracker_core = Sam3VideoTrackerCore::new(&tracker);
         let video_config = predictor.video_config.clone();
         let output = {
-            let session = predictor.sessions.get_mut(&session_id).expect("session exists");
+            let session = predictor
+                .sessions
+                .get_mut(&session_id)
+                .expect("session exists");
             tracker_core.process_frame(
                 &model,
                 &device,
@@ -4790,6 +6550,325 @@ mod tests {
         Ok(())
     }
 
+    struct CorrectionBundleExpectations {
+        frame8_has_mask_inputs: bool,
+        frame8_use_prev_mem_frame: bool,
+        frame9_cond_contains_frame8: bool,
+    }
+
+    fn assert_video_process_frame_matches_correction_click_reference_bundle_frames_8_and_9(
+        bundle: &str,
+        expectations: CorrectionBundleExpectations,
+    ) -> Result<()> {
+        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint(Some(bundle))?
+        else {
+            return Ok(());
+        };
+        let source = VideoSource::from_path(reference_input_frames_dir(bundle))?;
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        apply_reference_predictor_runtime_overrides(&mut predictor, bundle)?;
+        let session_id = predictor.start_session(source, VideoSessionOptions::default())?;
+        let (initial_points, initial_labels) = load_reference_point_prompt_on_frame(bundle, 0)?;
+        let obj_id = predictor.add_prompt(
+            &session_id,
+            0,
+            SessionPrompt {
+                text: None,
+                points: Some(initial_points),
+                point_labels: Some(initial_labels),
+                boxes: None,
+                box_labels: None,
+            },
+            None,
+            true,
+            true,
+        )?;
+        predictor.propagate_in_video(
+            &session_id,
+            PropagationOptions {
+                direction: PropagationDirection::Forward,
+                start_frame_idx: Some(0),
+                max_frame_num_to_track: Some(9),
+                output_prob_threshold: None,
+            },
+        )?;
+        let (correction_points, correction_labels) =
+            load_reference_point_prompt_on_frame(bundle, 8)?;
+        predictor.add_prompt(
+            &session_id,
+            8,
+            SessionPrompt {
+                text: None,
+                points: Some(correction_points),
+                point_labels: Some(correction_labels),
+                boxes: None,
+                box_labels: None,
+            },
+            Some(obj_id),
+            false,
+            true,
+        )?;
+        let tracker_core = Sam3VideoTrackerCore::new(&tracker);
+        let video_config = predictor.video_config.clone();
+        let frame8 = {
+            let session = predictor
+                .sessions
+                .get_mut(&session_id)
+                .expect("session exists");
+            tracker_core.process_frame(
+                &model,
+                &device,
+                &video_config,
+                session,
+                8,
+                PropagationDirection::Forward,
+                VIDEO_DEBUG_MASK_THRESHOLD,
+            )?
+        };
+        if frame8.objects.len() != 1 {
+            let dump_note = match dump_simple_correction_failure_json(
+                bundle,
+                "frame8_object_count_mismatch",
+                &serde_json::json!({
+                    "bundle": bundle,
+                    "frame_idx": 8,
+                    "expected_object_count": 1,
+                    "actual_object_count": frame8.objects.len(),
+                }),
+            ) {
+                Ok(path) => format!("failure dump: {}", path.display()),
+                Err(err) => format!("failed to write failure dump: {err}"),
+            };
+            candle::bail!(
+                "frame-8 correction object count mismatch for {bundle}: actual={}, expected=1\n{}",
+                frame8.objects.len(),
+                dump_note
+            );
+        }
+        let actual8 = &frame8.objects[0];
+        let (expected_boxes8, expected_score8, expected_mask_path8) =
+            load_reference_frame_output(bundle, 8)?;
+        let actual_boxes8 = actual8.boxes_xyxy.flatten_all()?.to_vec1::<f32>()?;
+        let actual_score8 = actual8.score_value()?;
+        let mask_iou8 = binary_mask_iou(&actual8.masks, &expected_mask_path8)?;
+        let correction_track_step = load_reference_internal_record_matching(
+            bundle,
+            "track_step",
+            8,
+            |record| record["metadata"]["run_mem_encoder"].as_bool() == Some(false),
+        )?;
+        assert_eq!(
+            correction_track_step["metadata"]["use_prev_mem_frame"].as_bool(),
+            Some(expectations.frame8_use_prev_mem_frame),
+            "frame-8 correction use_prev_mem_frame mismatch for {bundle}"
+        );
+        let correction_forward = load_reference_internal_record_matching(
+            bundle,
+            "forward_sam_heads",
+            8,
+            |record| record["metadata"]["has_point_inputs"].as_bool() == Some(true),
+        )?;
+        assert_eq!(
+            correction_forward["metadata"]["has_mask_inputs"].as_bool(),
+            Some(expectations.frame8_has_mask_inputs),
+            "frame-8 correction mask-input expectation mismatch for {bundle}"
+        );
+        let frame8_state = match predictor
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.tracked_objects.get(&obj_id))
+            .and_then(|object| object.tracker_states.get(&8))
+        {
+            Some(state) => state.clone(),
+            None => {
+                let tracker_state_keys = predictor
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|session| session.tracked_objects.get(&obj_id))
+                    .map(|object| object.tracker_states.keys().copied().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let dump_note = match dump_simple_correction_failure_json(
+                    bundle,
+                    "frame8_missing_tracker_state",
+                    &serde_json::json!({
+                        "bundle": bundle,
+                        "frame_idx": 8,
+                        "obj_id": obj_id,
+                        "tracker_state_keys": tracker_state_keys,
+                    }),
+                ) {
+                    Ok(path) => format!("failure dump: {}", path.display()),
+                    Err(err) => format!("failed to write failure dump: {err}"),
+                };
+                candle::bail!(
+                    "corrected frame 8 state should be stored for {bundle}\n{}",
+                    dump_note
+                );
+            }
+        };
+
+        let frame9 = {
+            let session = predictor
+                .sessions
+                .get_mut(&session_id)
+                .expect("session exists");
+            tracker_core.process_frame(
+                &model,
+                &device,
+                &video_config,
+                session,
+                9,
+                PropagationDirection::Forward,
+                VIDEO_DEBUG_MASK_THRESHOLD,
+            )?
+        };
+        if frame9.objects.len() != 1 {
+            let dump_note = match dump_simple_correction_failure_json(
+                bundle,
+                "frame9_object_count_mismatch",
+                &serde_json::json!({
+                    "bundle": bundle,
+                    "frame_idx": 9,
+                    "expected_object_count": 1,
+                    "actual_object_count": frame9.objects.len(),
+                }),
+            ) {
+                Ok(path) => format!("failure dump: {}", path.display()),
+                Err(err) => format!("failed to write failure dump: {err}"),
+            };
+            candle::bail!(
+                "frame-9 correction object count mismatch for {bundle}: actual={}, expected=1\n{}",
+                frame9.objects.len(),
+                dump_note
+            );
+        }
+        let actual9 = &frame9.objects[0];
+        let (expected_boxes9, expected_score9, expected_mask_path9) =
+            load_reference_frame_output(bundle, 9)?;
+        let actual_boxes9 = actual9.boxes_xyxy.flatten_all()?.to_vec1::<f32>()?;
+        let actual_score9 = actual9.score_value()?;
+        let mask_iou9 = binary_mask_iou(&actual9.masks, &expected_mask_path9)?;
+        let prepare_record = load_reference_internal_record_matching_last(
+            bundle,
+            "prepare_memory_conditioned_features",
+            9,
+            |_| true,
+        )?;
+        let selected_cond = json_usize_vec(
+            &prepare_record["metadata"],
+            "selected_conditioning_frame_indices",
+        )?;
+        let expected_memory_frame_indices =
+            json_usize_vec(&prepare_record["metadata"], "selected_memory_frame_indices")?;
+        let mut failures = Vec::new();
+        if let Some(message) = box_mismatch_message(&actual_boxes8, &expected_boxes8, 0.04) {
+            failures.push(format!("frame-8 correction box mismatch for {bundle}: {message}"));
+        }
+        if (actual_score8 - expected_score8).abs() > 0.03 {
+            failures.push(format!(
+                "frame-8 correction score mismatch for {bundle}: actual={actual_score8}, expected={expected_score8}"
+            ));
+        }
+        if mask_iou8 < 0.95 {
+            failures.push(format!(
+                "frame-8 correction mask IoU too low for {bundle}: {mask_iou8}"
+            ));
+        }
+        if correction_track_step["metadata"]["use_prev_mem_frame"].as_bool()
+            != Some(expectations.frame8_use_prev_mem_frame)
+        {
+            failures.push(format!(
+                "frame-8 correction use_prev_mem_frame mismatch for {bundle}: actual={:?}, expected={}",
+                correction_track_step["metadata"]["use_prev_mem_frame"].as_bool(),
+                expectations.frame8_use_prev_mem_frame
+            ));
+        }
+        if correction_forward["metadata"]["has_mask_inputs"].as_bool()
+            != Some(expectations.frame8_has_mask_inputs)
+        {
+            failures.push(format!(
+                "frame-8 correction mask-input expectation mismatch for {bundle}: actual={:?}, expected={}",
+                correction_forward["metadata"]["has_mask_inputs"].as_bool(),
+                expectations.frame8_has_mask_inputs
+            ));
+        }
+        if frame8_state.is_cond_frame != expectations.frame9_cond_contains_frame8 {
+            failures.push(format!(
+                "frame-8 corrected state conditioning expectation mismatch for {bundle}: actual={}, expected={}",
+                frame8_state.is_cond_frame,
+                expectations.frame9_cond_contains_frame8
+            ));
+        }
+        if frame8_state.maskmem_features.is_none() {
+            failures.push(format!(
+                "frame-8 corrected state missing maskmem_features for {bundle}"
+            ));
+        }
+        if frame8_state.maskmem_pos_enc.is_none() {
+            failures.push(format!(
+                "frame-8 corrected state missing maskmem_pos_enc for {bundle}"
+            ));
+        }
+        if let Some(message) = box_mismatch_message(&actual_boxes9, &expected_boxes9, 0.05) {
+            failures.push(format!(
+                "frame-9 correction propagation box mismatch for {bundle}: {message}"
+            ));
+        }
+        if (actual_score9 - expected_score9).abs() > 0.03 {
+            failures.push(format!(
+                "frame-9 correction propagation score mismatch for {bundle}: actual={actual_score9}, expected={expected_score9}"
+            ));
+        }
+        if mask_iou9 < 0.95 {
+            failures.push(format!(
+                "frame-9 correction propagation mask IoU too low for {bundle}: {mask_iou9}"
+            ));
+        }
+        if selected_cond.contains(&8) != expectations.frame9_cond_contains_frame8 {
+            failures.push(format!(
+                "frame-9 conditioning selection mismatch for {bundle}: actual={selected_cond:?}, expected_contains_frame8={}",
+                expectations.frame9_cond_contains_frame8
+            ));
+        }
+        if actual9.memory_frame_indices != expected_memory_frame_indices {
+            failures.push(format!(
+                "frame-9 memory_frame_indices mismatch for {bundle}: actual={:?}, expected={:?}",
+                actual9.memory_frame_indices,
+                expected_memory_frame_indices
+            ));
+        }
+        if !failures.is_empty() {
+            let dump_result = dump_correction_failure_context(
+                bundle,
+                actual8,
+                actual9,
+                &expected_boxes8,
+                expected_score8,
+                &expected_mask_path8,
+                &expected_boxes9,
+                expected_score9,
+                &expected_mask_path9,
+                &frame8_state,
+                &correction_track_step,
+                &correction_forward,
+                &prepare_record,
+                &failures,
+                mask_iou8,
+                mask_iou9,
+            );
+            let dump_note = match dump_result {
+                Ok(path) => format!("failure dump: {}", path.display()),
+                Err(err) => format!("failed to write failure dump: {err}"),
+            };
+            candle::bail!(
+                "correction reference mismatch for {bundle}\n{}\n{}",
+                failures.join("\n"),
+                dump_note
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn video_process_frame_matches_multi_click_point_reference_bundle_frame0() -> Result<()> {
         assert_video_process_frame_matches_point_reference_bundle_frame0(
@@ -4806,10 +6885,11 @@ mod tests {
 
     #[test]
     fn video_process_frame_matches_mask_prompt_reference_bundle_frame0() -> Result<()> {
-        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint()? else {
+        let bundle = "reference_video_mask_debug";
+        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint(Some(bundle))?
+        else {
             return Ok(());
         };
-        let bundle = "reference_video_mask_debug";
         let source = VideoSource::from_path(reference_input_frames_dir(bundle))?;
         let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
         apply_reference_predictor_runtime_overrides(&mut predictor, bundle)?;
@@ -4828,7 +6908,10 @@ mod tests {
         let tracker_core = Sam3VideoTrackerCore::new(&tracker);
         let video_config = predictor.video_config.clone();
         let output = {
-            let session = predictor.sessions.get_mut(&session_id).expect("session exists");
+            let session = predictor
+                .sessions
+                .get_mut(&session_id)
+                .expect("session exists");
             tracker_core.process_frame(
                 &model,
                 &device,
@@ -4855,10 +6938,499 @@ mod tests {
             "frame-0 mask score mismatch: actual={actual_score}, expected={expected_score}"
         );
         let mask_iou = binary_mask_iou(&actual.masks, &expected_mask_path)?;
-        assert!(
-            mask_iou >= 0.97,
-            "frame-0 mask IoU too low: {mask_iou}"
+        assert!(mask_iou >= 0.97, "frame-0 mask IoU too low: {mask_iou}");
+        Ok(())
+    }
+
+    #[test]
+    fn video_process_frame_matches_correction_click_reference_bundle_frames_8_and_9() -> Result<()>
+    {
+        assert_video_process_frame_matches_correction_click_reference_bundle_frames_8_and_9(
+            "reference_video_correction_click_debug",
+            CorrectionBundleExpectations {
+                frame8_has_mask_inputs: true,
+                frame8_use_prev_mem_frame: false,
+                frame9_cond_contains_frame8: true,
+            },
+        )
+    }
+
+    #[test]
+    fn video_process_frame_matches_correction_click_no_prev_mask_reference_bundle_frames_8_and_9(
+    ) -> Result<()> {
+        assert_video_process_frame_matches_correction_click_reference_bundle_frames_8_and_9(
+            "reference_video_correction_click_no_prev_mask_pred_debug",
+            CorrectionBundleExpectations {
+                frame8_has_mask_inputs: false,
+                frame8_use_prev_mem_frame: false,
+                frame9_cond_contains_frame8: true,
+            },
+        )
+    }
+
+    #[test]
+    fn video_process_frame_matches_correction_click_prev_mem_reference_bundle_frames_8_and_9(
+    ) -> Result<()> {
+        assert_video_process_frame_matches_correction_click_reference_bundle_frames_8_and_9(
+            "reference_video_correction_click_prev_mem_debug",
+            CorrectionBundleExpectations {
+                frame8_has_mask_inputs: true,
+                frame8_use_prev_mem_frame: true,
+                frame9_cond_contains_frame8: true,
+            },
+        )
+    }
+
+    #[test]
+    fn video_process_frame_matches_correction_click_stateless_refinement_reference_bundle_frames_8_and_9(
+    ) -> Result<()> {
+        assert_video_process_frame_matches_correction_click_reference_bundle_frames_8_and_9(
+            "reference_video_correction_click_stateless_refinement_debug",
+            CorrectionBundleExpectations {
+                frame8_has_mask_inputs: true,
+                frame8_use_prev_mem_frame: false,
+                frame9_cond_contains_frame8: true,
+            },
+        )
+    }
+
+    #[test]
+    fn video_process_frame_matches_correction_click_no_clear_mem_reference_bundle_frames_8_and_9(
+    ) -> Result<()> {
+        assert_video_process_frame_matches_correction_click_reference_bundle_frames_8_and_9(
+            "reference_video_correction_click_no_clear_mem_debug",
+            CorrectionBundleExpectations {
+                frame8_has_mask_inputs: true,
+                frame8_use_prev_mem_frame: false,
+                frame9_cond_contains_frame8: true,
+            },
+        )
+    }
+
+    #[test]
+    fn video_process_frame_matches_correction_click_not_all_frames_cond_reference_bundle_frames_8_and_9(
+    ) -> Result<()> {
+        assert_video_process_frame_matches_correction_click_reference_bundle_frames_8_and_9(
+            "reference_video_correction_click_not_all_frames_cond_debug",
+            CorrectionBundleExpectations {
+                frame8_has_mask_inputs: true,
+                frame8_use_prev_mem_frame: false,
+                frame9_cond_contains_frame8: false,
+            },
+        )
+    }
+
+    #[test]
+    fn correction_reference_helper_uses_post_correction_frame9_record() -> Result<()> {
+        let prepare_record = load_reference_internal_record_matching_last(
+            "reference_video_correction_click_debug",
+            "prepare_memory_conditioned_features",
+            9,
+            |_| true,
+        )?;
+        assert_eq!(
+            json_usize_vec(&prepare_record["metadata"], "selected_conditioning_frame_indices")?,
+            vec![0, 8]
         );
+        let prepare_record = load_reference_internal_record_matching_last(
+            "reference_video_correction_click_not_all_frames_cond_debug",
+            "prepare_memory_conditioned_features",
+            9,
+            |_| true,
+        )?;
+        assert_eq!(
+            json_usize_vec(&prepare_record["metadata"], "selected_conditioning_frame_indices")?,
+            vec![0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn video_process_frame_matches_multi_object_reference_bundle_frames_0_and_1() -> Result<()> {
+        let bundle = "reference_video_multi_object_debug";
+        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint(Some(bundle))?
+        else {
+            return Ok(());
+        };
+        let source = VideoSource::from_path(reference_input_frames_dir(bundle))?;
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        apply_reference_predictor_runtime_overrides(&mut predictor, bundle)?;
+        let session_id = predictor.start_session(source, VideoSessionOptions::default())?;
+        predictor.add_prompt(
+            &session_id,
+            0,
+            SessionPrompt {
+                text: None,
+                points: Some(vec![(0.57, 0.70)]),
+                point_labels: Some(vec![1]),
+                boxes: None,
+                box_labels: None,
+            },
+            Some(1),
+            true,
+            true,
+        )?;
+        predictor.add_prompt(
+            &session_id,
+            0,
+            SessionPrompt {
+                text: None,
+                points: Some(vec![(0.34, 0.68)]),
+                point_labels: Some(vec![1]),
+                boxes: None,
+                box_labels: None,
+            },
+            Some(2),
+            true,
+            true,
+        )?;
+        let tracker_core = Sam3VideoTrackerCore::new(&tracker);
+        let video_config = predictor.video_config.clone();
+        for frame_idx in [0usize, 1usize] {
+            let output = {
+                let session = predictor
+                    .sessions
+                    .get_mut(&session_id)
+                    .expect("session exists");
+                tracker_core.process_frame(
+                    &model,
+                    &device,
+                    &video_config,
+                    session,
+                    frame_idx,
+                    PropagationDirection::Forward,
+                    VIDEO_DEBUG_MASK_THRESHOLD,
+                )?
+            };
+            assert_eq!(output.objects.len(), 2);
+            for obj_id in [1u32, 2u32] {
+                let actual = output
+                    .objects
+                    .iter()
+                    .find(|object| object.obj_id == obj_id)
+                    .expect("multi-object output should contain both objects");
+                let (expected_boxes, expected_score, expected_mask_path) =
+                    load_reference_object_frame_output(bundle, frame_idx, obj_id)?;
+                assert_boxes_close(
+                    &actual.boxes_xyxy.flatten_all()?.to_vec1::<f32>()?,
+                    &expected_boxes,
+                    0.05,
+                );
+                let actual_score = actual.score_value()?;
+                assert!(
+                    (actual_score - expected_score).abs() <= 0.03,
+                    "multi-object frame {frame_idx} obj_id {obj_id} score mismatch: actual={actual_score}, expected={expected_score}"
+                );
+                let mask_iou = binary_mask_iou(&actual.masks, &expected_mask_path)?;
+                assert!(
+                    mask_iou >= 0.95,
+                    "multi-object frame {frame_idx} obj_id {obj_id} mask IoU too low: {mask_iou}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn video_process_frame_matches_multi_object_clear_mem_reference_bundle_frames_8_to_10(
+    ) -> Result<()> {
+        let bundle = "reference_video_multi_object_clear_mem_debug";
+        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint(Some(bundle))?
+        else {
+            return Ok(());
+        };
+        let source = VideoSource::from_path(reference_input_frames_dir(bundle))?;
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        apply_reference_predictor_runtime_overrides(&mut predictor, bundle)?;
+        let session_id = predictor.start_session(source, VideoSessionOptions::default())?;
+        predictor.add_prompt(
+            &session_id,
+            0,
+            SessionPrompt {
+                text: None,
+                points: Some(vec![(0.57, 0.70)]),
+                point_labels: Some(vec![1]),
+                boxes: None,
+                box_labels: None,
+            },
+            Some(1),
+            true,
+            true,
+        )?;
+        predictor.add_prompt(
+            &session_id,
+            0,
+            SessionPrompt {
+                text: None,
+                points: Some(vec![(0.34, 0.68)]),
+                point_labels: Some(vec![1]),
+                boxes: None,
+                box_labels: None,
+            },
+            Some(2),
+            true,
+            true,
+        )?;
+        predictor.propagate_in_video(
+            &session_id,
+            PropagationOptions {
+                direction: PropagationDirection::Forward,
+                start_frame_idx: Some(0),
+                max_frame_num_to_track: Some(9),
+                output_prob_threshold: None,
+            },
+        )?;
+        let (correction_points, correction_labels) =
+            load_reference_point_prompt_on_frame(bundle, 8)?;
+        predictor.add_prompt(
+            &session_id,
+            8,
+            SessionPrompt {
+                text: None,
+                points: Some(correction_points),
+                point_labels: Some(correction_labels),
+                boxes: None,
+                box_labels: None,
+            },
+            Some(1),
+            false,
+            true,
+        )?;
+        let tracker_core = Sam3VideoTrackerCore::new(&tracker);
+        let video_config = predictor.video_config.clone();
+        for frame_idx in [8usize, 9usize] {
+            let output = {
+                let session = predictor
+                    .sessions
+                    .get_mut(&session_id)
+                    .expect("session exists");
+                tracker_core.process_frame(
+                    &model,
+                    &device,
+                    &video_config,
+                    session,
+                    frame_idx,
+                    PropagationDirection::Forward,
+                    VIDEO_DEBUG_MASK_THRESHOLD,
+                )?
+            };
+            assert_eq!(output.objects.len(), 2);
+            for obj_id in [1u32, 2u32] {
+                let actual = output
+                    .objects
+                    .iter()
+                    .find(|object| object.obj_id == obj_id)
+                    .expect("multi-object clear-mem output should contain both objects");
+                let (expected_boxes, expected_score, expected_mask_path) =
+                    load_reference_object_frame_output(bundle, frame_idx, obj_id)?;
+                assert_boxes_close(
+                    &actual.boxes_xyxy.flatten_all()?.to_vec1::<f32>()?,
+                    &expected_boxes,
+                    0.05,
+                );
+                let actual_score = actual.score_value()?;
+                assert!(
+                    (actual_score - expected_score).abs() <= 0.03,
+                    "multi-object clear-mem frame {frame_idx} obj_id {obj_id} score mismatch: actual={actual_score}, expected={expected_score}"
+                );
+                let mask_iou = binary_mask_iou(&actual.masks, &expected_mask_path)?;
+                assert!(
+                    mask_iou >= 0.95,
+                    "multi-object clear-mem frame {frame_idx} obj_id {obj_id} mask IoU too low: {mask_iou}"
+                );
+            }
+        }
+
+        let frame10 = {
+            let session = predictor
+                .sessions
+                .get_mut(&session_id)
+                .expect("session exists");
+            tracker_core.process_frame(
+                &model,
+                &device,
+                &video_config,
+                session,
+                10,
+                PropagationDirection::Forward,
+                VIDEO_DEBUG_MASK_THRESHOLD,
+            )?
+        };
+        let actual_obj_ids = frame10
+            .objects
+            .iter()
+            .map(|object| object.obj_id)
+            .collect::<Vec<_>>();
+        assert_eq!(actual_obj_ids, vec![1]);
+        let (expected_boxes10, expected_score10, expected_mask_path10) =
+            load_reference_object_frame_output(bundle, 10, 1)?;
+        let actual10 = &frame10.objects[0];
+        assert_boxes_close(
+            &actual10.boxes_xyxy.flatten_all()?.to_vec1::<f32>()?,
+            &expected_boxes10,
+            0.05,
+        );
+        let actual_score10 = actual10.score_value()?;
+        assert!(
+            (actual_score10 - expected_score10).abs() <= 0.03,
+            "multi-object clear-mem frame 10 obj_id 1 score mismatch: actual={actual_score10}, expected={expected_score10}"
+        );
+        let mask_iou10 = binary_mask_iou(&actual10.masks, &expected_mask_path10)?;
+        assert!(
+            mask_iou10 >= 0.95,
+            "multi-object clear-mem frame 10 obj_id 1 mask IoU too low: {mask_iou10}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn video_process_frame_matches_reverse_reference_bundle_frames_20_and_19() -> Result<()> {
+        let bundle = "reference_video_reverse_propagation_debug";
+        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint(Some(bundle))?
+        else {
+            return Ok(());
+        };
+        let source = VideoSource::from_path(reference_input_frames_dir(bundle))?;
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        apply_reference_predictor_runtime_overrides(&mut predictor, bundle)?;
+        let session_id = predictor.start_session(source, VideoSessionOptions::default())?;
+        predictor.add_prompt(
+            &session_id,
+            20,
+            SessionPrompt {
+                text: None,
+                points: Some(vec![(0.61, 0.69)]),
+                point_labels: Some(vec![1]),
+                boxes: None,
+                box_labels: None,
+            },
+            Some(1),
+            true,
+            true,
+        )?;
+        let tracker_core = Sam3VideoTrackerCore::new(&tracker);
+        let video_config = predictor.video_config.clone();
+        for frame_idx in [20usize, 19usize] {
+            let output = {
+                let session = predictor
+                    .sessions
+                    .get_mut(&session_id)
+                    .expect("session exists");
+                tracker_core.process_frame(
+                    &model,
+                    &device,
+                    &video_config,
+                    session,
+                    frame_idx,
+                    PropagationDirection::Backward,
+                    VIDEO_DEBUG_MASK_THRESHOLD,
+                )?
+            };
+            assert_eq!(output.objects.len(), 1);
+            let actual = &output.objects[0];
+            let (expected_boxes, expected_score, expected_mask_path) =
+                load_reference_object_frame_output(bundle, frame_idx, 1)?;
+            assert_boxes_close(
+                &actual.boxes_xyxy.flatten_all()?.to_vec1::<f32>()?,
+                &expected_boxes,
+                0.05,
+            );
+            let actual_score = actual.score_value()?;
+            assert!(
+                (actual_score - expected_score).abs() <= 0.03,
+                "reverse frame {frame_idx} score mismatch: actual={actual_score}, expected={expected_score}"
+            );
+            let mask_iou = binary_mask_iou(&actual.masks, &expected_mask_path)?;
+            assert!(
+                mask_iou >= 0.95,
+                "reverse frame {frame_idx} mask IoU too low: {mask_iou}"
+            );
+        }
+        let prepare_record = load_reference_internal_record(bundle, "prepare_memory_conditioned_features", 19)?;
+        let expected_memory_frame_indices =
+            json_usize_vec(&prepare_record["metadata"], "selected_memory_frame_indices")?;
+        let expected_cond_frame_indices =
+            json_usize_vec(&prepare_record["metadata"], "selected_conditioning_frame_indices")?;
+        let frame19 = predictor
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.frame_outputs.get(&19))
+            .and_then(|outputs| outputs.get(&1))
+            .expect("reverse frame 19 output should be cached");
+        assert_eq!(frame19.prompt_frame_idx, expected_cond_frame_indices.last().copied());
+        assert_eq!(frame19.memory_frame_indices, expected_memory_frame_indices);
+        Ok(())
+    }
+
+    #[test]
+    fn video_propagation_can_start_from_first_annotation_reference_bundle() -> Result<()> {
+        let bundle = "reference_video_start_from_first_ann_debug";
+        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint(Some(bundle))?
+        else {
+            return Ok(());
+        };
+        let source = VideoSource::from_path(reference_input_frames_dir(bundle))?;
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        apply_reference_predictor_runtime_overrides(&mut predictor, bundle)?;
+        let session_id = predictor.start_session(source, VideoSessionOptions::default())?;
+        let (points, point_labels) = load_reference_point_prompt_on_frame(bundle, 5)?;
+        predictor.add_prompt(
+            &session_id,
+            5,
+            SessionPrompt {
+                text: None,
+                points: Some(points),
+                point_labels: Some(point_labels),
+                boxes: None,
+                box_labels: None,
+            },
+            None,
+            true,
+            true,
+        )?;
+        let output = predictor.propagate_in_video(
+            &session_id,
+            PropagationOptions {
+                direction: PropagationDirection::Forward,
+                start_frame_idx: Some(12),
+                max_frame_num_to_track: Some(18),
+                output_prob_threshold: None,
+            },
+        )?;
+        let actual_indices = output
+            .frames
+            .iter()
+            .map(|frame| frame.frame_idx)
+            .collect::<Vec<_>>();
+        let expected_indices = load_reference_frame_indices(bundle)?;
+        assert_eq!(actual_indices, expected_indices);
+        assert_eq!(actual_indices.first().copied(), Some(5));
+        for frame_idx in [5usize, 12usize] {
+            let frame = output
+                .frames
+                .iter()
+                .find(|frame| frame.frame_idx == frame_idx)
+                .expect("expected propagated frame to be present");
+            assert_eq!(frame.objects.len(), 1);
+            let actual = &frame.objects[0];
+            let (expected_boxes, expected_score, expected_mask_path) =
+                load_reference_object_frame_output(bundle, frame_idx, 1)?;
+            assert_boxes_close(
+                &actual.boxes_xyxy.flatten_all()?.to_vec1::<f32>()?,
+                &expected_boxes,
+                0.05,
+            );
+            let actual_score = actual.score_value()?;
+            assert!(
+                (actual_score - expected_score).abs() <= 0.03,
+                "start-from-first-ann frame {frame_idx} score mismatch: actual={actual_score}, expected={expected_score}"
+            );
+            let mask_iou = binary_mask_iou(&actual.masks, &expected_mask_path)?;
+            assert!(
+                mask_iou >= 0.95,
+                "start-from-first-ann frame {frame_idx} mask IoU too low: {mask_iou}"
+            );
+        }
         Ok(())
     }
 
@@ -4870,6 +7442,125 @@ mod tests {
             vec![1, 2, 3, 4, 5, 6]
         );
         assert_eq!(trim_memory_frame_indices(vec![3, 4], 6), vec![3, 4]);
+    }
+
+    #[test]
+    fn video_trim_past_non_cond_memory_clears_only_old_maskmem() -> Result<()> {
+        let device = Device::Cpu;
+        let mut tracker_config = Sam3TrackerConfig::from_sam3_config(&tiny_segmentation_config());
+        tracker_config.predictor.trim_past_non_cond_mem_for_eval = true;
+        tracker_config.use_memory_selection = true;
+        tracker_config.max_obj_ptrs_in_encoder = 1;
+        let tracker =
+            Sam3TrackerModel::new(&tracker_config, VarBuilder::zeros(DType::F32, &device))?;
+        let tracker_core = Sam3VideoTrackerCore::new(&tracker);
+        let model = tiny_model(&device)?;
+        let frames = vec![Tensor::zeros((3, 56, 56), DType::F32, &device)?];
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        let session_id =
+            predictor.start_session_from_tensors(frames, VideoSessionOptions::default())?;
+        let obj_id = predictor.add_prompt(
+            &session_id,
+            0,
+            SessionPrompt {
+                text: None,
+                points: Some(vec![(0.5, 0.5)]),
+                point_labels: Some(vec![1]),
+                boxes: None,
+                box_labels: None,
+            },
+            None,
+            true,
+            true,
+        )?;
+        let state_with_memory = |is_cond_frame: bool| -> Result<TrackerFrameState> {
+            Ok(TrackerFrameState {
+                low_res_masks: Tensor::zeros((1, 1, 16, 16), DType::F32, &device)?,
+                high_res_masks: Tensor::zeros((1, 1, 64, 64), DType::F32, &device)?,
+                iou_scores: Tensor::zeros((1, 1), DType::F32, &device)?,
+                obj_ptr: Tensor::zeros((1, tracker.config().hidden_dim), DType::F32, &device)?,
+                object_score_logits: Tensor::zeros((1, 1), DType::F32, &device)?,
+                maskmem_features: Some(Tensor::zeros(
+                    (1, tracker.config().memory_dim, 4, 4),
+                    DType::F32,
+                    &device,
+                )?),
+                maskmem_pos_enc: Some(Tensor::zeros(
+                    (1, tracker.config().memory_dim, 4, 4),
+                    DType::F32,
+                    &device,
+                )?),
+                is_cond_frame,
+            })
+        };
+        {
+            let session = predictor
+                .sessions
+                .get_mut(&session_id)
+                .expect("session exists");
+            let tracked = session
+                .tracked_objects
+                .get_mut(&obj_id)
+                .expect("tracked object exists");
+            tracked.tracker_states.insert(4, state_with_memory(false)?);
+            tracked.tracker_states.insert(17, state_with_memory(false)?);
+            tracked.tracker_states.insert(22, state_with_memory(false)?);
+            tracked.tracker_states.insert(23, state_with_memory(false)?);
+            tracked.tracker_states.insert(10, state_with_memory(true)?);
+            let snapshot = tracked.clone();
+            tracker_core.trim_past_non_cond_memory(
+                session,
+                &snapshot,
+                24,
+                PropagationDirection::Forward,
+            );
+        }
+        let tracked = predictor
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.tracked_objects.get(&obj_id))
+            .expect("tracked object exists after trim");
+        assert!(tracked
+            .tracker_states
+            .get(&4)
+            .expect("far-old non-cond frame exists")
+            .maskmem_features
+            .is_none());
+        assert!(tracked
+            .tracker_states
+            .get(&4)
+            .expect("far-old non-cond frame exists")
+            .maskmem_pos_enc
+            .is_none());
+        assert!(tracked
+            .tracker_states
+            .get(&17)
+            .expect("memory-window non-cond frame exists")
+            .maskmem_features
+            .is_none());
+        assert!(tracked
+            .tracker_states
+            .get(&10)
+            .expect("conditioning frame exists")
+            .maskmem_features
+            .is_some());
+        assert!(tracked
+            .tracker_states
+            .get(&23)
+            .expect("recent non-cond frame exists")
+            .maskmem_features
+            .is_some());
+        assert_eq!(
+            tracked
+                .tracker_states
+                .get(&4)
+                .expect("far-old non-cond frame exists")
+                .obj_ptr
+                .shape()
+                .dims(),
+            &[1, tracker.config().hidden_dim]
+        );
+        Ok(())
     }
 
     #[test]
