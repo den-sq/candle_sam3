@@ -766,6 +766,295 @@ pub struct VideoOutput {
     pub frames: Vec<VideoFrameOutput>,
 }
 
+#[derive(Debug, Clone)]
+struct TemporalDisambiguationObjectState {
+    first_frame_idx: usize,
+    unmatched_frame_indices: Vec<usize>,
+    consecutive_det_num: usize,
+    confirmed: bool,
+    removed: bool,
+    last_occluded_frame: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TemporalDisambiguationState {
+    hotstart_removed_obj_ids: BTreeSet<u32>,
+    unconfirmed_obj_ids_per_frame: BTreeMap<usize, BTreeSet<u32>>,
+    object_states: BTreeMap<u32, TemporalDisambiguationObjectState>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TemporalDisambiguationFrameMetadata {
+    removed_obj_ids: BTreeSet<u32>,
+    suppressed_obj_ids: BTreeSet<u32>,
+    unconfirmed_obj_ids: BTreeSet<u32>,
+    matched_obj_ids: BTreeSet<u32>,
+    unmatched_obj_ids: BTreeSet<u32>,
+}
+
+impl TemporalDisambiguationState {
+    fn ensure_object(&mut self, object: &TrackedObject) {
+        self.object_states
+            .entry(object.obj_id)
+            .or_insert_with(|| TemporalDisambiguationObjectState {
+                first_frame_idx: object.creation_frame,
+                unmatched_frame_indices: Vec::new(),
+                consecutive_det_num: 0,
+                confirmed: false,
+                removed: false,
+                last_occluded_frame: None,
+            });
+    }
+
+    fn ensure_object_id(&mut self, obj_id: u32, first_frame_idx: usize) {
+        self.object_states
+            .entry(obj_id)
+            .or_insert_with(|| TemporalDisambiguationObjectState {
+                first_frame_idx,
+                unmatched_frame_indices: Vec::new(),
+                consecutive_det_num: 0,
+                confirmed: false,
+                removed: false,
+                last_occluded_frame: None,
+            });
+    }
+
+    fn seed_prompt_frame_confirmation(
+        &mut self,
+        session: &Sam3VideoSession,
+        frame_idx: usize,
+        direction: PropagationDirection,
+        confirmation_threshold: usize,
+    ) {
+        if confirmation_threshold == 0 {
+            return;
+        }
+        for object in session.tracked_objects.values() {
+            if !object.is_active_for_frame(frame_idx, direction) || !object.has_prompt_on_frame(frame_idx)
+            {
+                continue;
+            }
+            self.ensure_object(object);
+            if let Some(state) = self.object_states.get_mut(&object.obj_id) {
+                state.consecutive_det_num = state.consecutive_det_num.max(1);
+                if state.consecutive_det_num >= confirmation_threshold {
+                    state.confirmed = true;
+                }
+            }
+        }
+    }
+
+    fn record_unmatched_outputs(
+        &mut self,
+        session: &Sam3VideoSession,
+        frame_idx: usize,
+        unmatched_obj_ids: &BTreeSet<u32>,
+        direction: PropagationDirection,
+        hotstart_delay: usize,
+        hotstart_unmatch_thresh: usize,
+    ) {
+        if hotstart_delay == 0 || hotstart_unmatch_thresh == 0 {
+            return;
+        }
+        for object in session.tracked_objects.values() {
+            if object.is_active_for_frame(frame_idx, direction) {
+                self.ensure_object(object);
+            }
+        }
+        for obj_id in unmatched_obj_ids.iter().copied() {
+            let Some(state) = self.object_states.get_mut(&obj_id) else {
+                continue;
+            };
+            if state.removed {
+                continue;
+            }
+            state.unmatched_frame_indices.push(frame_idx);
+            if state.unmatched_frame_indices.len() < hotstart_unmatch_thresh {
+                continue;
+            }
+            let hotstart_diff = match direction {
+                PropagationDirection::Backward => frame_idx as isize + hotstart_delay as isize,
+                PropagationDirection::Forward | PropagationDirection::Both => {
+                    frame_idx as isize - hotstart_delay as isize
+                }
+            };
+            let is_within_hotstart = match direction {
+                PropagationDirection::Backward => state.first_frame_idx as isize <= hotstart_diff,
+                PropagationDirection::Forward | PropagationDirection::Both => {
+                    state.first_frame_idx as isize > hotstart_diff
+                }
+            };
+            if is_within_hotstart {
+                state.removed = true;
+                self.hotstart_removed_obj_ids.insert(obj_id);
+            }
+        }
+    }
+
+    fn hidden_obj_ids(&self) -> &BTreeSet<u32> {
+        &self.hotstart_removed_obj_ids
+    }
+
+    fn record_confirmation_status(
+        &mut self,
+        session: &Sam3VideoSession,
+        frame_idx: usize,
+        direction: PropagationDirection,
+        matched_obj_ids: &BTreeSet<u32>,
+        confirmation_threshold: usize,
+    ) {
+        if confirmation_threshold == 0 {
+            return;
+        }
+        let mut unconfirmed_obj_ids = BTreeSet::new();
+        for object in session.tracked_objects.values() {
+            if !object.is_active_for_frame(frame_idx, direction) {
+                continue;
+            }
+            self.ensure_object(object);
+            let Some(state) = self.object_states.get_mut(&object.obj_id) else {
+                continue;
+            };
+            if state.removed {
+                continue;
+            }
+            if matched_obj_ids.contains(&object.obj_id) {
+                state.consecutive_det_num = state.consecutive_det_num.saturating_add(1);
+            } else {
+                state.consecutive_det_num = 0;
+            }
+            if state.consecutive_det_num >= confirmation_threshold {
+                state.confirmed = true;
+            }
+            if !state.confirmed {
+                unconfirmed_obj_ids.insert(object.obj_id);
+            }
+        }
+        self.unconfirmed_obj_ids_per_frame
+            .insert(frame_idx, unconfirmed_obj_ids);
+    }
+
+    fn unconfirmed_obj_ids_for_yield_frame(
+        &self,
+        yield_frame_idx: usize,
+        direction: PropagationDirection,
+        num_frames: usize,
+        confirmation_threshold: usize,
+    ) -> BTreeSet<u32> {
+        if confirmation_threshold <= 1 || num_frames == 0 {
+            return BTreeSet::new();
+        }
+        let delay = confirmation_threshold - 1;
+        let status_frame_idx = match direction {
+            PropagationDirection::Backward => yield_frame_idx.saturating_sub(delay),
+            PropagationDirection::Forward | PropagationDirection::Both => {
+                (yield_frame_idx + delay).min(num_frames.saturating_sub(1))
+            }
+        };
+        self.unconfirmed_obj_ids_per_frame
+            .get(&status_frame_idx)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn record_recent_occlusion_suppression(
+        &mut self,
+        output: &VideoFrameOutput,
+        frame_idx: usize,
+        direction: PropagationDirection,
+        overlap_threshold: f32,
+        newly_removed_obj_ids: &BTreeSet<u32>,
+    ) -> Result<BTreeSet<u32>> {
+        if output.objects.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let mut suppressed_obj_ids = BTreeSet::new();
+        if overlap_threshold > 0.0 && output.objects.len() > 1 {
+            let object_ids = output
+                .objects
+                .iter()
+                .map(|object| object.obj_id)
+                .collect::<Vec<_>>();
+            let mask_planes = output
+                .objects
+                .iter()
+                .map(|object| mask_to_bool_plane(&object.mask_logits, 0.0))
+                .collect::<Result<Vec<_>>>()?;
+            let last_occluded = object_ids
+                .iter()
+                .map(|obj_id| {
+                    if newly_removed_obj_ids.contains(obj_id) {
+                        Some(100_000usize)
+                    } else {
+                        self.object_states
+                            .get(obj_id)
+                            .and_then(|state| state.last_occluded_frame)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let reverse = matches!(direction, PropagationDirection::Backward);
+            for i in 0..object_ids.len() {
+                for j in (i + 1)..object_ids.len() {
+                    let iou = binary_planes_iou(&mask_planes[i], &mask_planes[j]);
+                    if iou < overlap_threshold {
+                        continue;
+                    }
+                    let last_i = last_occluded[i];
+                    let last_j = last_occluded[j];
+                    let suppress_i = if reverse {
+                        match (last_i, last_j) {
+                            (Some(i_occ), Some(j_occ)) => i_occ < j_occ,
+                            _ => false,
+                        }
+                    } else {
+                        match (last_i, last_j) {
+                            (Some(i_occ), Some(j_occ)) => i_occ > j_occ,
+                            _ => false,
+                        }
+                    };
+                    let suppress_j = if reverse {
+                        match (last_i, last_j) {
+                            (Some(i_occ), Some(j_occ)) => j_occ < i_occ,
+                            _ => false,
+                        }
+                    } else {
+                        match (last_i, last_j) {
+                            (Some(i_occ), Some(j_occ)) => j_occ > i_occ,
+                            _ => false,
+                        }
+                    };
+                    if suppress_i {
+                        suppressed_obj_ids.insert(object_ids[i]);
+                    }
+                    if suppress_j {
+                        suppressed_obj_ids.insert(object_ids[j]);
+                    }
+                }
+            }
+            for object in &output.objects {
+                self.ensure_object_id(object.obj_id, frame_idx);
+                if let Some(state) = self.object_states.get_mut(&object.obj_id) {
+                    let is_occluded = !mask_has_foreground(&object.mask_logits, 0.0)?;
+                    if is_occluded || suppressed_obj_ids.contains(&object.obj_id) {
+                        state.last_occluded_frame = Some(frame_idx);
+                    }
+                }
+            }
+        } else {
+            for object in &output.objects {
+                self.ensure_object_id(object.obj_id, frame_idx);
+                if let Some(state) = self.object_states.get_mut(&object.obj_id) {
+                    let is_occluded = !mask_has_foreground(&object.mask_logits, 0.0)?;
+                    if is_occluded {
+                        state.last_occluded_frame = Some(frame_idx);
+                    }
+                }
+            }
+        }
+        Ok(suppressed_obj_ids)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionCacheStats {
     pub loaded_frame_count: usize,
@@ -781,6 +1070,8 @@ pub struct TrackedObject {
     pub last_updated_frame: usize,
     pub display_score: Option<f32>,
     pub has_inference_history: bool,
+    pub confirmation_consecutive_frames: usize,
+    pub confirmation_confirmed: bool,
     pub prompt_frames: BTreeMap<usize, SessionPrompt>,
     pub mask_prompt_frames: BTreeMap<usize, Tensor>,
     pub frame_outputs: BTreeMap<usize, ObjectFrameOutput>,
@@ -795,6 +1086,8 @@ impl TrackedObject {
             last_updated_frame: creation_frame,
             display_score: None,
             has_inference_history: false,
+            confirmation_consecutive_frames: 0,
+            confirmation_confirmed: false,
             prompt_frames: BTreeMap::new(),
             mask_prompt_frames: BTreeMap::new(),
             frame_outputs: BTreeMap::new(),
@@ -967,6 +1260,28 @@ impl TrackedObject {
                 .collect(),
         }
     }
+
+    fn record_confirmation_activity(
+        &mut self,
+        has_detectable_output: bool,
+        threshold: usize,
+    ) -> bool {
+        if self.confirmation_confirmed {
+            if !has_detectable_output {
+                self.confirmation_consecutive_frames = 0;
+            }
+            return true;
+        }
+        self.confirmation_consecutive_frames = if has_detectable_output {
+            self.confirmation_consecutive_frames.saturating_add(1)
+        } else {
+            0
+        };
+        if self.confirmation_consecutive_frames >= threshold.max(1) {
+            self.confirmation_confirmed = true;
+        }
+        self.confirmation_confirmed
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1041,6 +1356,7 @@ pub struct Sam3VideoSession {
     tracked_objects: BTreeMap<u32, TrackedObject>,
     next_obj_id: u32,
     frame_outputs: BTreeMap<usize, BTreeMap<u32, ObjectFrameOutput>>,
+    temporal_disambiguation_metadata: BTreeMap<usize, TemporalDisambiguationFrameMetadata>,
     feature_cache: HashMap<usize, VisualBackboneOutput>,
     feature_cache_order: VecDeque<usize>,
     text_cache: HashMap<String, CachedTextPrompt>,
@@ -1076,6 +1392,7 @@ impl Sam3VideoSession {
             tracked_objects: BTreeMap::new(),
             next_obj_id: 0,
             frame_outputs: BTreeMap::new(),
+            temporal_disambiguation_metadata: BTreeMap::new(),
             feature_cache: HashMap::new(),
             feature_cache_order: VecDeque::new(),
             text_cache: HashMap::new(),
@@ -1123,6 +1440,10 @@ impl Sam3VideoSession {
 
     fn debug_recorder_mut(&mut self) -> Option<&mut VideoDebugRecorder> {
         self.debug_recorder.as_mut()
+    }
+
+    fn clear_temporal_disambiguation_metadata(&mut self) {
+        self.temporal_disambiguation_metadata.clear();
     }
 
     fn allocate_object(&mut self, creation_frame: usize) -> u32 {
@@ -1257,6 +1578,7 @@ impl Sam3VideoSession {
         self.tracked_objects.clear();
         self.next_obj_id = 0;
         self.frame_outputs.clear();
+        self.temporal_disambiguation_metadata.clear();
         self.feature_cache.clear();
         self.feature_cache_order.clear();
         self.text_cache.clear();
@@ -1271,6 +1593,7 @@ impl Sam3VideoSession {
         self.feature_cache.clear();
         self.feature_cache_order.clear();
         self.frame_outputs.clear();
+        self.temporal_disambiguation_metadata.clear();
         self.tracked_objects.clear();
         self.text_cache.clear();
         self.debug_recorder = None;
@@ -1555,7 +1878,28 @@ impl<'a> Sam3VideoPredictor<'a> {
         let output_threshold = options
             .output_prob_threshold
             .unwrap_or(self.video_config.score_threshold);
-        for frame_idx in processing_order {
+        let predictor_config = &self.tracker_core.tracker.config().predictor;
+        let hotstart_delay = predictor_config.hotstart_delay;
+        let hotstart_unmatch_thresh = predictor_config.hotstart_unmatch_thresh;
+        let recent_occlusion_suppression_threshold =
+            predictor_config.suppress_overlapping_based_on_recent_occlusion_threshold;
+        let confirmation_threshold = if predictor_config.masklet_confirmation_enable {
+            predictor_config.masklet_confirmation_consecutive_det_thresh
+        } else {
+            0
+        };
+        let mut temporal_disambiguation_state = TemporalDisambiguationState::default();
+        session.clear_temporal_disambiguation_metadata();
+        if let Some(start_frame_idx) = processing_order.first().copied() {
+            temporal_disambiguation_state.seed_prompt_frame_confirmation(
+                session,
+                start_frame_idx,
+                options.direction,
+                confirmation_threshold,
+            );
+        }
+        let mut hotstart_buffer = VecDeque::new();
+        for (order_idx, frame_idx) in processing_order.iter().copied().enumerate() {
             session.prefetch_for_frame(frame_idx, options.direction)?;
             let output = self.tracker_core.process_frame(
                 self.model,
@@ -1566,7 +1910,128 @@ impl<'a> Sam3VideoPredictor<'a> {
                 options.direction,
                 output_threshold,
             )?;
-            on_frame(&output)?;
+            let mut matched_obj_ids = output
+                .objects
+                .iter()
+                .filter(|object| {
+                    session
+                        .tracked_objects
+                        .get(&object.obj_id)
+                        .map(|tracked| tracked.has_prompt_on_frame(frame_idx))
+                        .unwrap_or(false)
+                })
+                .map(|object| object.obj_id)
+                .collect::<BTreeSet<_>>();
+            if confirmation_threshold > 0 {
+                matched_obj_ids.extend(self.tracker_core.collect_text_detector_matched_obj_ids(
+                    self.model,
+                    self.device,
+                    session,
+                    frame_idx,
+                    options.direction,
+                    &output,
+                )?);
+            }
+            temporal_disambiguation_state.record_confirmation_status(
+                session,
+                frame_idx,
+                options.direction,
+                &matched_obj_ids,
+                confirmation_threshold,
+            );
+            let unmatched_obj_ids = output
+                .objects
+                .iter()
+                .map(|object| object.obj_id)
+                .filter(|obj_id| !matched_obj_ids.contains(obj_id))
+                .collect::<BTreeSet<_>>();
+            let previous_removed_obj_ids = temporal_disambiguation_state.hidden_obj_ids().clone();
+            let is_last_frame = order_idx + 1 == processing_order.len();
+            let mut yield_list = Vec::new();
+            if hotstart_delay > 0 {
+                temporal_disambiguation_state.record_unmatched_outputs(
+                    session,
+                    frame_idx,
+                    &unmatched_obj_ids,
+                    options.direction,
+                    hotstart_delay,
+                    hotstart_unmatch_thresh,
+                );
+                let frame_has_prompt_input = session.prompt_frames().contains(&frame_idx);
+                if frame_has_prompt_input {
+                    yield_list.push(output);
+                } else {
+                    hotstart_buffer.push_back(output);
+                    if is_last_frame {
+                        yield_list.extend(hotstart_buffer.drain(..));
+                    } else if hotstart_buffer.len() >= hotstart_delay {
+                        if let Some(oldest) = hotstart_buffer.pop_front() {
+                            yield_list.push(oldest);
+                        }
+                    }
+                }
+            } else {
+                yield_list.push(output);
+            }
+            let current_removed_obj_ids = temporal_disambiguation_state.hidden_obj_ids().clone();
+            let newly_removed_obj_ids = current_removed_obj_ids
+                .difference(&previous_removed_obj_ids)
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let current_suppressed_obj_ids = temporal_disambiguation_state
+                .record_recent_occlusion_suppression(
+                    yield_list.last().unwrap_or_else(|| {
+                        hotstart_buffer
+                            .back()
+                            .expect("output should be in yield list or hotstart buffer")
+                    }),
+                    frame_idx,
+                    options.direction,
+                    recent_occlusion_suppression_threshold,
+                    &newly_removed_obj_ids,
+                )?;
+            let mut current_unconfirmed_obj_ids = temporal_disambiguation_state
+                .unconfirmed_obj_ids_per_frame
+                .get(&frame_idx)
+                .cloned()
+                .unwrap_or_default();
+            current_unconfirmed_obj_ids
+                .retain(|obj_id| !current_removed_obj_ids.contains(obj_id));
+            session.temporal_disambiguation_metadata.insert(
+                frame_idx,
+                TemporalDisambiguationFrameMetadata {
+                    removed_obj_ids: current_removed_obj_ids,
+                    suppressed_obj_ids: current_suppressed_obj_ids,
+                    unconfirmed_obj_ids: current_unconfirmed_obj_ids,
+                    matched_obj_ids: matched_obj_ids.clone(),
+                    unmatched_obj_ids: unmatched_obj_ids.clone(),
+                },
+            );
+            for yielded in yield_list {
+                let is_prompt_frame = session.prompt_frames().contains(&yielded.frame_idx);
+                if hotstart_delay > 0 && is_prompt_frame {
+                    on_frame(&yielded)?;
+                    continue;
+                }
+                let mut hidden_obj_ids = temporal_disambiguation_state.hidden_obj_ids().clone();
+                hidden_obj_ids.extend(
+                    temporal_disambiguation_state
+                        .unconfirmed_obj_ids_for_yield_frame(
+                            yielded.frame_idx,
+                            options.direction,
+                            session.num_frames(),
+                            confirmation_threshold,
+                        ),
+                );
+                if let Some(frame_metadata) =
+                    session.temporal_disambiguation_metadata.get(&yielded.frame_idx)
+                {
+                    hidden_obj_ids.extend(frame_metadata.suppressed_obj_ids.iter().copied());
+                }
+                let filtered = filter_video_frame_output(&yielded, &hidden_obj_ids);
+                persist_visible_frame_output(session, &filtered)?;
+                on_frame(&filtered)?;
+            }
             session.evict_for_frame(frame_idx, options.direction);
         }
         Ok(())
@@ -2438,6 +2903,144 @@ impl Sam3VideoTrackerCore<'_> {
         Ok((output, tracker_state, display_score))
     }
 
+    fn postprocess_output(
+        &self,
+        config: &VideoConfig,
+        session: &mut Sam3VideoSession,
+        results: &[(u32, ObjectFrameOutput, TrackerFrameState, Option<f32>)],
+        output_threshold: f32,
+        removed_obj_ids: Option<&[u32]>,
+        suppressed_obj_ids: Option<&[u32]>,
+        unconfirmed_obj_ids: Option<&[u32]>,
+    ) -> Result<Vec<ObjectFrameOutput>> {
+        if results.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let predictor_config = &self.tracker.config().predictor;
+        let confirmation_threshold = predictor_config.masklet_confirmation_consecutive_det_thresh;
+        let mut hidden_obj_ids = BTreeSet::new();
+        if let Some(obj_ids) = removed_obj_ids {
+            hidden_obj_ids.extend(obj_ids.iter().copied());
+        }
+        if let Some(obj_ids) = suppressed_obj_ids {
+            hidden_obj_ids.extend(obj_ids.iter().copied());
+        }
+        if let Some(obj_ids) = unconfirmed_obj_ids {
+            hidden_obj_ids.extend(obj_ids.iter().copied());
+        }
+        let mut visible_outputs = Vec::new();
+        let mut visible_scores = Vec::new();
+        let use_local_confirmation_gate =
+            predictor_config.masklet_confirmation_enable && config.hotstart_delay == 0;
+
+        for (obj_id, output, state, _) in results.iter() {
+            if hidden_obj_ids.contains(obj_id) {
+                continue;
+            }
+            let has_detectable_output = object_has_detectable_output(output, output_threshold)?;
+            let is_confirmed = if use_local_confirmation_gate {
+                let object = session.tracked_objects.get_mut(obj_id).ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "unknown obj_id {} while updating postprocess confirmation state",
+                        obj_id
+                    ))
+                })?;
+                object.record_confirmation_activity(has_detectable_output, confirmation_threshold)
+            } else {
+                true
+            };
+            if !mask_has_foreground(&output.masks, output_threshold)? {
+                continue;
+            }
+            if !is_confirmed {
+                hidden_obj_ids.insert(*obj_id);
+                continue;
+            }
+            visible_outputs.push(output.clone());
+            visible_scores.push(if output.presence_scores.is_some() {
+                object_presence_score(output)?
+            } else {
+                tracker_state_presence_score(state)?
+            });
+        }
+
+        let visible_outputs = if config.non_overlap_masks_for_output {
+            apply_object_wise_non_overlapping_constraints(
+                &visible_outputs,
+                &visible_scores,
+                output_threshold,
+            )?
+        } else {
+            visible_outputs
+                .into_iter()
+                .map(|output| {
+                    let plane = mask_to_bool_plane(&output.masks, output_threshold)?;
+                    rebuild_object_output_from_binary_plane(&output, &plane)
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        let mut final_outputs = Vec::new();
+        for output in visible_outputs {
+            if mask_has_foreground(&output.masks, output_threshold)? {
+                final_outputs.push(output);
+            } else {
+                hidden_obj_ids.insert(output.obj_id);
+            }
+        }
+
+        Ok(final_outputs)
+    }
+
+    fn collect_text_detector_matched_obj_ids(
+        &self,
+        model: &Sam3ImageModel,
+        compute_device: &Device,
+        session: &mut Sam3VideoSession,
+        frame_idx: usize,
+        direction: PropagationDirection,
+        frame_output: &VideoFrameOutput,
+    ) -> Result<BTreeSet<u32>> {
+        const ASSOCIATION_IOU_THRESHOLD: f32 = 0.5;
+        let mut matched = BTreeSet::new();
+        if frame_output.objects.is_empty() {
+            return Ok(matched);
+        }
+        let visual_features = session.get_visual_features(model, compute_device, frame_idx)?;
+        for output in frame_output.objects.iter() {
+            let Some(object) = session.tracked_objects.get(&output.obj_id) else {
+                continue;
+            };
+            let Some((_prompt_frame_idx, text_prompt)) =
+                object.latest_text_prompt(frame_idx, direction)
+            else {
+                continue;
+            };
+            let text_encoding = session.cached_text_encoding(model, &text_prompt, compute_device)?;
+            let encoded_prompt = combine_encoded_prompts(Some(&text_encoding), None)?.ok_or_else(
+                || candle::Error::Msg("text detector path produced no encoded prompt".to_owned()),
+            )?;
+            let grounding = ground_from_encoded_prompt(model, &visual_features, &encoded_prompt)?;
+            let detector_output = grounding_to_object_output(
+                output.obj_id,
+                &grounding,
+                Some(frame_idx),
+                Vec::new(),
+                Some(text_prompt),
+                false,
+                false,
+                session.video_size(),
+            )?;
+            let detector_plane = mask_to_bool_plane(&detector_output.masks, VIDEO_DEBUG_MASK_THRESHOLD)?;
+            let tracker_plane = mask_to_bool_plane(&output.masks, VIDEO_DEBUG_MASK_THRESHOLD)?;
+            if binary_planes_iou(&detector_plane, &tracker_plane) >= ASSOCIATION_IOU_THRESHOLD {
+                matched.insert(output.obj_id);
+            }
+        }
+        Ok(matched)
+    }
+
     fn process_frame(
         &self,
         model: &Sam3ImageModel,
@@ -2446,7 +3049,7 @@ impl Sam3VideoTrackerCore<'_> {
         session: &mut Sam3VideoSession,
         frame_idx: usize,
         direction: PropagationDirection,
-        _output_threshold: f32,
+        output_threshold: f32,
     ) -> Result<VideoFrameOutput> {
         let obj_ids: Vec<u32> = session.tracked_objects.keys().copied().collect();
         let predictor_config = &self.tracker.config().predictor;
@@ -2455,7 +3058,7 @@ impl Sam3VideoTrackerCore<'_> {
             .values()
             .filter_map(|object| object.nearest_input_frame_idx(frame_idx, direction))
             .max();
-        let mut frame_objects = Vec::new();
+        let mut pending_results = Vec::new();
         for obj_id in obj_ids {
             if let Some(cached) = session
                 .frame_outputs
@@ -2463,7 +3066,36 @@ impl Sam3VideoTrackerCore<'_> {
                 .and_then(|frame_outputs| frame_outputs.get(&obj_id))
                 .cloned()
             {
-                frame_objects.push(cached.to_storage_device(compute_device)?);
+                pending_results.push((
+                    obj_id,
+                    cached.to_storage_device(compute_device)?,
+                    session
+                        .tracked_objects
+                        .get(&obj_id)
+                        .and_then(|object| object.tracker_states.get(&frame_idx))
+                        .cloned()
+                        .ok_or_else(|| {
+                            candle::Error::Msg(format!(
+                                "cached output for obj_id {} on frame {} missing tracker state",
+                                obj_id, frame_idx
+                            ))
+                        })?,
+                    session
+                        .tracked_objects
+                        .get(&obj_id)
+                        .and_then(|object| object.display_score),
+                ));
+                continue;
+            }
+            if session
+                .tracked_objects
+                .get(&obj_id)
+                .map(|object| {
+                    object.tracker_states.contains_key(&frame_idx)
+                        && !object.frame_outputs.contains_key(&frame_idx)
+                })
+                .unwrap_or(false)
+            {
                 continue;
             }
             let (prompt, mask_prompt, has_history, is_active) = {
@@ -2582,24 +3214,43 @@ impl Sam3VideoTrackerCore<'_> {
             let Some((output, tracker_state, display_score)) = seed_result else {
                 continue;
             };
+            pending_results.push((obj_id, output, tracker_state, display_score));
+        }
 
-            let output_storage = output.to_storage_device(session.storage_device())?;
+        let frame_objects = self.postprocess_output(
+            _config,
+            session,
+            &pending_results,
+            output_threshold,
+            None,
+            None,
+            None,
+        )?;
+        let mut stored_outputs = BTreeMap::new();
+        for output in frame_objects.iter() {
+            stored_outputs.insert(output.obj_id, output.to_storage_device(session.storage_device())?);
+        }
+        if stored_outputs.is_empty() {
+            session.frame_outputs.remove(&frame_idx);
+        } else {
+            session.frame_outputs.insert(frame_idx, stored_outputs.clone());
+        }
+
+        for (obj_id, _output, tracker_state, display_score) in pending_results {
             let tracker_storage = move_tracker_state(&tracker_state, session.storage_device())?;
-            session
-                .frame_outputs
-                .entry(frame_idx)
-                .or_default()
-                .insert(obj_id, output_storage.clone());
             if let Some(object) = session.tracked_objects.get_mut(&obj_id) {
-                object.frame_outputs.insert(frame_idx, output_storage);
                 object.tracker_states.insert(frame_idx, tracker_storage);
                 object.has_inference_history = true;
                 object.last_updated_frame = frame_idx;
                 if let Some(display_score) = display_score {
                     object.display_score = Some(display_score);
                 }
+                if let Some(stored_output) = stored_outputs.get(&obj_id) {
+                    object.frame_outputs.insert(frame_idx, stored_output.clone());
+                } else {
+                    object.frame_outputs.remove(&frame_idx);
+                }
             }
-            frame_objects.push(output);
         }
         Ok(VideoFrameOutput {
             frame_idx,
@@ -3745,6 +4396,150 @@ fn apply_prompt_frame_output_postprocess(
     Ok(())
 }
 
+fn object_presence_score(output: &ObjectFrameOutput) -> Result<f32> {
+    if let Some(presence_scores) = output.presence_scores.as_ref() {
+        Ok(presence_scores
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .into_iter()
+            .next()
+            .unwrap_or(0.0))
+    } else {
+        output.score_value()
+    }
+}
+
+fn tracker_state_presence_score(state: &TrackerFrameState) -> Result<f32> {
+    Ok(candle_nn::ops::sigmoid(&state.object_score_logits)?
+        .flatten_all()?
+        .to_vec1::<f32>()?
+        .into_iter()
+        .next()
+        .unwrap_or(0.0))
+}
+
+fn mask_to_bool_plane(mask: &Tensor, threshold: f32) -> Result<Vec<Vec<bool>>> {
+    Ok(tensor_to_mask_probs_2d(mask)?
+        .into_iter()
+        .map(|row| row.into_iter().map(|value| value >= threshold).collect())
+        .collect())
+}
+
+fn mask_has_foreground(mask: &Tensor, threshold: f32) -> Result<bool> {
+    Ok(mask_to_bool_plane(mask, threshold)?
+        .into_iter()
+        .flatten()
+        .any(|value| value))
+}
+
+fn object_has_detectable_output(output: &ObjectFrameOutput, threshold: f32) -> Result<bool> {
+    Ok(mask_has_foreground(&output.masks, threshold)? && object_presence_score(output)? > 0.0)
+}
+
+fn binary_planes_iou(actual: &[Vec<bool>], expected: &[Vec<bool>]) -> f32 {
+    if actual.is_empty() || expected.is_empty() {
+        return 0.0;
+    }
+    let height = actual.len().min(expected.len());
+    let width = actual
+        .first()
+        .map(Vec::len)
+        .unwrap_or(0)
+        .min(expected.first().map(Vec::len).unwrap_or(0));
+    let mut intersection = 0usize;
+    let mut union = 0usize;
+    for y in 0..height {
+        for x in 0..width {
+            let a = actual[y][x];
+            let b = expected[y][x];
+            if a && b {
+                intersection += 1;
+            }
+            if a || b {
+                union += 1;
+            }
+        }
+    }
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f32 / union as f32
+    }
+}
+
+fn rebuild_object_output_from_binary_plane(
+    output: &ObjectFrameOutput,
+    plane: &[Vec<bool>],
+) -> Result<ObjectFrameOutput> {
+    let height = plane.len();
+    let width = plane.first().map(Vec::len).unwrap_or(0);
+    let data = plane
+        .iter()
+        .flat_map(|row| row.iter().map(|value| if *value { 1.0f32 } else { 0.0f32 }))
+        .collect::<Vec<_>>();
+    let binary_mask = Tensor::from_vec(data, (1, height, width), output.masks.device())?;
+    Ok(ObjectFrameOutput {
+        obj_id: output.obj_id,
+        mask_logits: binary_mask.clone(),
+        masks: binary_mask.clone(),
+        boxes_xyxy: mask_to_normalized_xyxy(&binary_mask)?,
+        scores: output.scores.clone(),
+        presence_scores: output.presence_scores.clone(),
+        prompt_frame_idx: output.prompt_frame_idx,
+        memory_frame_indices: output.memory_frame_indices.clone(),
+        text_prompt: output.text_prompt.clone(),
+        used_explicit_geometry: output.used_explicit_geometry,
+        reused_previous_output: output.reused_previous_output,
+    })
+}
+
+fn apply_object_wise_non_overlapping_constraints(
+    outputs: &[ObjectFrameOutput],
+    scores: &[f32],
+    threshold: f32,
+) -> Result<Vec<ObjectFrameOutput>> {
+    if outputs.len() <= 1 {
+        return Ok(outputs.to_vec());
+    }
+    let mut planes = outputs
+        .iter()
+        .map(|output| mask_to_bool_plane(&output.masks, threshold))
+        .collect::<Result<Vec<_>>>()?;
+    let height = planes.first().map(Vec::len).unwrap_or(0);
+    let width = planes
+        .first()
+        .and_then(|plane| plane.first().map(Vec::len))
+        .unwrap_or(0);
+    for row in 0..height {
+        for col in 0..width {
+            let mut winner = None;
+            let mut winner_score = f32::NEG_INFINITY;
+            for (idx, plane) in planes.iter().enumerate() {
+                if !plane[row][col] {
+                    continue;
+                }
+                let score = scores[idx];
+                if winner.is_none() || score >= winner_score {
+                    winner = Some(idx);
+                    winner_score = score;
+                }
+            }
+            if let Some(winner_idx) = winner {
+                for (idx, plane) in planes.iter_mut().enumerate() {
+                    if idx != winner_idx {
+                        plane[row][col] = false;
+                    }
+                }
+            }
+        }
+    }
+    outputs
+        .iter()
+        .zip(planes.iter())
+        .map(|(output, plane)| rebuild_object_output_from_binary_plane(output, plane))
+        .collect()
+}
+
 fn session_prompt_to_geometry(prompt: &SessionPrompt, device: &Device) -> Result<GeometryPrompt> {
     let mut geometry_prompt = GeometryPrompt::default();
 
@@ -4051,6 +4846,51 @@ fn grounding_to_object_output(
         used_explicit_geometry,
         reused_previous_output,
     })
+}
+
+fn filter_video_frame_output(
+    frame_output: &VideoFrameOutput,
+    hidden_obj_ids: &BTreeSet<u32>,
+) -> VideoFrameOutput {
+    if hidden_obj_ids.is_empty() {
+        return frame_output.clone();
+    }
+    VideoFrameOutput {
+        frame_idx: frame_output.frame_idx,
+        objects: frame_output
+            .objects
+            .iter()
+            .filter(|object| !hidden_obj_ids.contains(&object.obj_id))
+            .cloned()
+            .collect(),
+    }
+}
+
+fn persist_visible_frame_output(
+    session: &mut Sam3VideoSession,
+    frame_output: &VideoFrameOutput,
+) -> Result<()> {
+    let mut stored_outputs = BTreeMap::new();
+    for output in frame_output.objects.iter() {
+        stored_outputs.insert(output.obj_id, output.to_storage_device(session.storage_device())?);
+    }
+    if stored_outputs.is_empty() {
+        session.frame_outputs.remove(&frame_output.frame_idx);
+    } else {
+        session
+            .frame_outputs
+            .insert(frame_output.frame_idx, stored_outputs.clone());
+    }
+    for object in session.tracked_objects.values_mut() {
+        if object.tracker_states.contains_key(&frame_output.frame_idx) {
+            if let Some(output) = stored_outputs.get(&object.obj_id) {
+                object.frame_outputs.insert(frame_output.frame_idx, output.clone());
+            } else {
+                object.frame_outputs.remove(&frame_output.frame_idx);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn build_processing_order(
@@ -4552,19 +5392,47 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_slice(&fs::read(bundle_dir.join("reference.json"))?)
                 .map_err(|err| candle::Error::Msg(err.to_string()))?;
-        let boxes = value["boxes_cxcywh_normalized"]
+        let boxes = if let Some(boxes) = value["boxes_cxcywh_normalized"]
             .as_array()
             .and_then(|boxes| boxes.first())
             .and_then(|first| first.as_array())
-            .ok_or_else(|| {
-                candle::Error::Msg("reference bundle missing boxes_cxcywh_normalized".to_owned())
-            })?;
-        Ok((
+        {
+            boxes.clone()
+        } else {
+            value["scenario"]["actions"]
+                .as_array()
+                .and_then(|actions| {
+                    actions.iter().find(|action| {
+                        action["type"].as_str() == Some("add_prompt")
+                            && action["boxes_xywh"].as_array().is_some()
+                    })
+                })
+                .and_then(|action| action["boxes_xywh"].as_array())
+                .and_then(|boxes| boxes.first())
+                .and_then(|first| first.as_array())
+                .cloned()
+                .ok_or_else(|| {
+                    candle::Error::Msg(
+                        "reference bundle missing box prompt in boxes_cxcywh_normalized or scenario actions"
+                            .to_owned(),
+                    )
+                })?
+        };
+        let from_scenario_xywh = value["boxes_cxcywh_normalized"]
+            .as_array()
+            .map(|boxes| boxes.is_empty())
+            .unwrap_or(true);
+        let (x0_or_cx, y0_or_cy, w, h) = (
             boxes[0].as_f64().unwrap_or(0.0) as f32,
             boxes[1].as_f64().unwrap_or(0.0) as f32,
             boxes[2].as_f64().unwrap_or(0.0) as f32,
             boxes[3].as_f64().unwrap_or(0.0) as f32,
-        ))
+        );
+        if from_scenario_xywh {
+            Ok((x0_or_cx + w * 0.5, y0_or_cy + h * 0.5, w, h))
+        } else {
+            Ok((x0_or_cx, y0_or_cy, w, h))
+        }
     }
 
     fn load_reference_mask_prompt_box_xyxy(bundle: &str) -> Result<(f32, f32, f32, f32)> {
@@ -4814,6 +5682,45 @@ mod tests {
                 .next()
                 .unwrap_or(0.0);
         Ok((boxes, presence_score, masks))
+    }
+
+    fn load_reference_run_single_temporal_metadata_last_per_frame(
+        bundle: &str,
+    ) -> Result<BTreeMap<usize, TemporalDisambiguationFrameMetadata>> {
+        let manifest = load_reference_internal_manifest(bundle)?;
+        let records = manifest["records"]
+            .as_array()
+            .ok_or_else(|| candle::Error::Msg("reference manifest missing records".to_owned()))?;
+        let mut metadata_by_frame = BTreeMap::new();
+        for record in records.iter().filter(|record| {
+            record["stage"].as_str() == Some("run_single_frame_inference")
+                && record["frame_idx"].as_u64().is_some()
+        }) {
+            let frame_idx = record["frame_idx"].as_u64().unwrap_or(0) as usize;
+            let metadata = &record["metadata"];
+            let read_ids = |key: &str| {
+                metadata[key]
+                    .as_array()
+                    .map(|values| {
+                        values
+                            .iter()
+                            .map(|value| value.as_u64().unwrap_or(0) as u32)
+                            .collect::<BTreeSet<_>>()
+                    })
+                    .unwrap_or_default()
+            };
+            metadata_by_frame.insert(
+                frame_idx,
+                TemporalDisambiguationFrameMetadata {
+                    removed_obj_ids: read_ids("removed_obj_ids"),
+                    suppressed_obj_ids: read_ids("suppressed_obj_ids"),
+                    unconfirmed_obj_ids: read_ids("unconfirmed_obj_ids"),
+                    matched_obj_ids: BTreeSet::new(),
+                    unmatched_obj_ids: BTreeSet::new(),
+                },
+            );
+        }
+        Ok(metadata_by_frame)
     }
 
     fn json_usize_vec(value: &serde_json::Value, key: &str) -> Result<Vec<usize>> {
@@ -5179,6 +6086,53 @@ mod tests {
         })
     }
 
+    fn dummy_tracker_state_for_tests(
+        device: &Device,
+        tracker: &Sam3TrackerModel,
+    ) -> Result<TrackerFrameState> {
+        Ok(TrackerFrameState {
+            low_res_masks: Tensor::zeros((1, 1, 16, 16), DType::F32, device)?,
+            high_res_masks: Tensor::zeros((1, 1, 64, 64), DType::F32, device)?,
+            iou_scores: Tensor::zeros((1, 1), DType::F32, device)?,
+            obj_ptr: Tensor::zeros((1, tracker.config().hidden_dim), DType::F32, device)?,
+            object_score_logits: Tensor::zeros((1, 1), DType::F32, device)?,
+            maskmem_features: None,
+            maskmem_pos_enc: None,
+            is_cond_frame: false,
+        })
+    }
+
+    fn object_output_from_binary_plane(
+        device: &Device,
+        obj_id: u32,
+        plane: &[&[u8]],
+        score: f32,
+        presence_score: Option<f32>,
+    ) -> Result<ObjectFrameOutput> {
+        let height = plane.len();
+        let width = plane.first().map(|row| row.len()).unwrap_or(0);
+        let data = plane
+            .iter()
+            .flat_map(|row| row.iter().map(|value| if *value == 0 { 0.0 } else { 1.0 }))
+            .collect::<Vec<_>>();
+        let binary_mask = Tensor::from_vec(data, (1, height, width), device)?;
+        Ok(ObjectFrameOutput {
+            obj_id,
+            mask_logits: binary_mask.clone(),
+            masks: binary_mask.clone(),
+            boxes_xyxy: mask_to_normalized_xyxy(&binary_mask)?,
+            scores: Tensor::from_vec(vec![score], (1,), device)?,
+            presence_scores: presence_score
+                .map(|value| Tensor::from_vec(vec![value], (1,), device))
+                .transpose()?,
+            prompt_frame_idx: Some(0),
+            memory_frame_indices: Vec::new(),
+            text_prompt: None,
+            used_explicit_geometry: true,
+            reused_previous_output: false,
+        })
+    }
+
     fn write_test_image(path: &Path, red_value: u8) -> Result<()> {
         let mut image: RgbImage = ImageBuffer::new(4, 4);
         for pixel in image.pixels_mut() {
@@ -5199,6 +6153,248 @@ mod tests {
             }
         }
         true
+    }
+
+    #[test]
+    fn postprocess_output_applies_object_wise_non_overlap_constraints() -> Result<()> {
+        let device = Device::Cpu;
+        let tracker = tiny_tracker(&device)?;
+        let tracker_core = Sam3VideoTrackerCore::new(&tracker);
+        let model = tiny_model(&device)?;
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        let session_id = predictor.start_session_from_tensors(
+            vec![Tensor::zeros((3, 56, 56), DType::F32, &device)?],
+            VideoSessionOptions::default(),
+        )?;
+        predictor.add_prompt(
+            &session_id,
+            0,
+            SessionPrompt {
+                text: None,
+                points: Some(vec![(0.5, 0.5)]),
+                point_labels: Some(vec![1]),
+                boxes: None,
+                box_labels: None,
+            },
+            Some(1),
+            true,
+            true,
+        )?;
+        predictor.add_prompt(
+            &session_id,
+            0,
+            SessionPrompt {
+                text: None,
+                points: Some(vec![(0.6, 0.6)]),
+                point_labels: Some(vec![1]),
+                boxes: None,
+                box_labels: None,
+            },
+            Some(2),
+            true,
+            true,
+        )?;
+        let results = vec![
+            (
+                1,
+                object_output_from_binary_plane(
+                    &device,
+                    1,
+                    &[&[1, 1, 0], &[1, 1, 0], &[0, 0, 0]],
+                    0.9,
+                    Some(0.9),
+                )?,
+                dummy_tracker_state_for_tests(&device, &tracker)?,
+                Some(0.9),
+            ),
+            (
+                2,
+                object_output_from_binary_plane(
+                    &device,
+                    2,
+                    &[&[0, 1, 1], &[0, 1, 1], &[0, 0, 0]],
+                    0.4,
+                    Some(0.4),
+                )?,
+                dummy_tracker_state_for_tests(&device, &tracker)?,
+                Some(0.4),
+            ),
+        ];
+        let mut config = VideoConfig::default();
+        config.non_overlap_masks_for_output = true;
+        let outputs = tracker_core.postprocess_output(
+            &config,
+            predictor.sessions.get_mut(&session_id).expect("session exists"),
+            &results,
+            0.5,
+            None,
+            None,
+            None,
+        )?;
+        assert_eq!(outputs.len(), 2);
+        let obj1 = outputs.iter().find(|output| output.obj_id == 1).unwrap();
+        let obj2 = outputs.iter().find(|output| output.obj_id == 2).unwrap();
+        assert_eq!(count_foreground_pixels(&tensor_to_mask_probs_2d(&obj1.masks)?, 0.5), 4);
+        assert_eq!(count_foreground_pixels(&tensor_to_mask_probs_2d(&obj2.masks)?, 0.5), 2);
+        let obj2_mask = tensor_to_mask_probs_2d(&obj2.masks)?;
+        assert!(obj2_mask[0][1] < 0.5);
+        assert!(obj2_mask[1][1] < 0.5);
+        Ok(())
+    }
+
+    #[test]
+    fn postprocess_output_hides_unconfirmed_objects() -> Result<()> {
+        let device = Device::Cpu;
+        let mut tracker_config = Sam3TrackerConfig::from_sam3_config(&tiny_segmentation_config());
+        tracker_config.predictor.masklet_confirmation_enable = true;
+        tracker_config.predictor.masklet_confirmation_consecutive_det_thresh = 100;
+        let tracker =
+            Sam3TrackerModel::new(&tracker_config, VarBuilder::zeros(DType::F32, &device))?;
+        let tracker_core = Sam3VideoTrackerCore::new(&tracker);
+        let model = tiny_model(&device)?;
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        let session_id = predictor.start_session_from_tensors(
+            vec![Tensor::zeros((3, 56, 56), DType::F32, &device)?],
+            VideoSessionOptions::default(),
+        )?;
+        predictor.add_prompt(
+            &session_id,
+            0,
+            SessionPrompt {
+                text: None,
+                points: Some(vec![(0.5, 0.5)]),
+                point_labels: Some(vec![1]),
+                boxes: None,
+                box_labels: None,
+            },
+            Some(1),
+            true,
+            true,
+        )?;
+        let results = vec![(
+            1,
+            object_output_from_binary_plane(
+                &device,
+                1,
+                &[&[1, 1], &[1, 1]],
+                1.0,
+                Some(1.0),
+            )?,
+            dummy_tracker_state_for_tests(&device, &tracker)?,
+            Some(1.0),
+        )];
+        let outputs = tracker_core.postprocess_output(
+            &VideoConfig::default(),
+            predictor.sessions.get_mut(&session_id).expect("session exists"),
+            &results,
+            0.5,
+            None,
+            None,
+            None,
+        )?;
+        assert!(outputs.is_empty());
+        let tracked = predictor
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.tracked_objects.get(&1))
+            .expect("tracked object exists");
+        assert_eq!(tracked.confirmation_consecutive_frames, 1);
+        assert!(!tracked.confirmation_confirmed);
+        Ok(())
+    }
+
+    #[test]
+    fn postprocess_output_hides_removed_suppressed_and_unconfirmed_objects() -> Result<()> {
+        let device = Device::Cpu;
+        let tracker = tiny_tracker(&device)?;
+        let tracker_core = Sam3VideoTrackerCore::new(&tracker);
+        let model = tiny_model(&device)?;
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        let session_id = predictor.start_session_from_tensors(
+            vec![Tensor::zeros((3, 56, 56), DType::F32, &device)?],
+            VideoSessionOptions::default(),
+        )?;
+        for obj_id in [1u32, 2u32, 3u32, 4u32] {
+            predictor.add_prompt(
+                &session_id,
+                0,
+                SessionPrompt {
+                    text: None,
+                    points: Some(vec![(0.5, 0.5)]),
+                    point_labels: Some(vec![1]),
+                    boxes: None,
+                    box_labels: None,
+                },
+                Some(obj_id),
+                true,
+                true,
+            )?;
+        }
+        let results = vec![
+            (
+                1,
+                object_output_from_binary_plane(
+                    &device,
+                    1,
+                    &[&[1, 1], &[1, 1]],
+                    0.9,
+                    Some(0.9),
+                )?,
+                dummy_tracker_state_for_tests(&device, &tracker)?,
+                Some(0.9),
+            ),
+            (
+                2,
+                object_output_from_binary_plane(
+                    &device,
+                    2,
+                    &[&[1, 1], &[1, 1]],
+                    0.8,
+                    Some(0.8),
+                )?,
+                dummy_tracker_state_for_tests(&device, &tracker)?,
+                Some(0.8),
+            ),
+            (
+                3,
+                object_output_from_binary_plane(
+                    &device,
+                    3,
+                    &[&[1, 1], &[1, 1]],
+                    0.7,
+                    Some(0.7),
+                )?,
+                dummy_tracker_state_for_tests(&device, &tracker)?,
+                Some(0.7),
+            ),
+            (
+                4,
+                object_output_from_binary_plane(
+                    &device,
+                    4,
+                    &[&[1, 1], &[1, 1]],
+                    0.6,
+                    Some(0.6),
+                )?,
+                dummy_tracker_state_for_tests(&device, &tracker)?,
+                Some(0.6),
+            ),
+        ];
+        let outputs = tracker_core.postprocess_output(
+            &VideoConfig::default(),
+            predictor.sessions.get_mut(&session_id).expect("session exists"),
+            &results,
+            0.5,
+            Some(&[1]),
+            Some(&[2]),
+            Some(&[3]),
+        )?;
+        let actual_obj_ids = outputs
+            .iter()
+            .map(|output| output.obj_id)
+            .collect::<Vec<_>>();
+        assert_eq!(actual_obj_ids, vec![4]);
+        Ok(())
     }
 
     fn write_test_video(video_path: &Path, red_values: &[u8]) -> Result<()> {
@@ -7359,6 +8555,439 @@ mod tests {
             .expect("reverse frame 19 output should be cached");
         assert_eq!(frame19.prompt_frame_idx, expected_cond_frame_indices.last().copied());
         assert_eq!(frame19.memory_frame_indices, expected_memory_frame_indices);
+        Ok(())
+    }
+
+    fn assert_video_process_frame_matches_fill_hole_reference_bundle_frames_0_and_1(
+        bundle: &str,
+    ) -> Result<()> {
+        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint(Some(bundle))?
+        else {
+            return Ok(());
+        };
+        let Some(tokenizer_path) = sam3_test_tokenizer_path() else {
+            return Ok(());
+        };
+        let source = VideoSource::from_path(reference_input_frames_dir(bundle))?;
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        apply_reference_predictor_runtime_overrides(&mut predictor, bundle)?;
+        let session_id = predictor.start_session(
+            source,
+            VideoSessionOptions {
+                tokenizer_path: Some(tokenizer_path),
+                ..VideoSessionOptions::default()
+            },
+        )?;
+        let box_prompt = load_reference_box_prompt(bundle)?;
+        predictor.add_prompt(
+            &session_id,
+            0,
+            SessionPrompt {
+                text: None,
+                points: None,
+                point_labels: None,
+                boxes: Some(vec![box_prompt]),
+                box_labels: Some(vec![1]),
+            },
+            None,
+            true,
+            true,
+        )?;
+        let tracker_core = Sam3VideoTrackerCore::new(&tracker);
+        let video_config = predictor.video_config.clone();
+        for frame_idx in [0usize, 1usize] {
+            let output = {
+                let session = predictor
+                    .sessions
+                    .get_mut(&session_id)
+                    .expect("session exists");
+                tracker_core.process_frame(
+                    &model,
+                    &device,
+                    &video_config,
+                    session,
+                    frame_idx,
+                    PropagationDirection::Forward,
+                    VIDEO_DEBUG_MASK_THRESHOLD,
+                )?
+            };
+            assert_eq!(output.objects.len(), 1);
+            let actual = &output.objects[0];
+            let (expected_boxes, expected_score, expected_mask_path) =
+                load_reference_frame_output(bundle, frame_idx)?;
+            assert_boxes_close(
+                &actual.boxes_xyxy.flatten_all()?.to_vec1::<f32>()?,
+                &expected_boxes,
+                0.05,
+            );
+            let actual_score = actual.score_value()?;
+            assert!(
+                (actual_score - expected_score).abs() <= 0.03,
+                "fill-hole bundle {bundle} frame {frame_idx} score mismatch: actual={actual_score}, expected={expected_score}"
+            );
+            let mask_iou = binary_mask_iou(&actual.masks, &expected_mask_path)?;
+            assert!(
+                mask_iou >= 0.95,
+                "fill-hole bundle {bundle} frame {frame_idx} mask IoU too low: {mask_iou}"
+            );
+        }
+        Ok(())
+    }
+
+    fn assert_video_process_frame_matches_empty_output_reference_bundle_frames_0_and_1(
+        bundle: &str,
+    ) -> Result<()> {
+        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint(Some(bundle))?
+        else {
+            return Ok(());
+        };
+        let source = VideoSource::from_path(reference_input_frames_dir(bundle))?;
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        apply_reference_predictor_runtime_overrides(&mut predictor, bundle)?;
+        let session_id = predictor.start_session(source, VideoSessionOptions::default())?;
+        let (points, point_labels) = load_reference_point_prompt(bundle)?;
+        predictor.add_prompt(
+            &session_id,
+            0,
+            SessionPrompt {
+                text: None,
+                points: Some(points),
+                point_labels: Some(point_labels),
+                boxes: None,
+                box_labels: None,
+            },
+            Some(1),
+            true,
+            true,
+        )?;
+        let tracker_core = Sam3VideoTrackerCore::new(&tracker);
+        let video_config = predictor.video_config.clone();
+        for frame_idx in [0usize, 1usize] {
+            let output = {
+                let session = predictor
+                    .sessions
+                    .get_mut(&session_id)
+                    .expect("session exists");
+                tracker_core.process_frame(
+                    &model,
+                    &device,
+                    &video_config,
+                    session,
+                    frame_idx,
+                    PropagationDirection::Forward,
+                    VIDEO_DEBUG_MASK_THRESHOLD,
+                )?
+            };
+            assert!(
+                output.objects.is_empty(),
+                "expected no objects for {bundle} frame {frame_idx}, got {}",
+                output.objects.len()
+            );
+            let bundle_dir = reference_bundle_dir(bundle);
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(bundle_dir.join("video_results.json"))?)
+                    .map_err(|err| candle::Error::Msg(err.to_string()))?;
+            let frames = match &value {
+                serde_json::Value::Array(frames) => frames,
+                serde_json::Value::Object(_) => value["frames"].as_array().ok_or_else(|| {
+                    candle::Error::Msg(
+                        "reference video results missing frames array".to_owned(),
+                    )
+                })?,
+                _ => {
+                    candle::bail!(
+                        "reference video results must be an array or object with frames"
+                    )
+                }
+            };
+            let frame = frames
+                .iter()
+                .find(|frame| frame["frame_idx"].as_u64() == Some(frame_idx as u64))
+                .ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "reference video results missing frame {}",
+                        frame_idx
+                    ))
+                })?;
+            let objects = frame["objects"].as_array().ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "reference frame {} missing objects array",
+                    frame_idx
+                ))
+            })?;
+            assert!(
+                objects.is_empty(),
+                "reference bundle {bundle} frame {frame_idx} expected no objects, found {}",
+                objects.len()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn video_process_frame_matches_output_non_overlap_reference_bundle_frames_0_and_1(
+    ) -> Result<()> {
+        let bundle = "reference_video_output_non_overlap_debug";
+        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint(Some(bundle))?
+        else {
+            return Ok(());
+        };
+        let source = VideoSource::from_path(reference_input_frames_dir(bundle))?;
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        apply_reference_predictor_runtime_overrides(&mut predictor, bundle)?;
+        let session_id = predictor.start_session(source, VideoSessionOptions::default())?;
+        predictor.add_prompt(
+            &session_id,
+            0,
+            SessionPrompt {
+                text: None,
+                points: Some(vec![(0.57, 0.70)]),
+                point_labels: Some(vec![1]),
+                boxes: None,
+                box_labels: None,
+            },
+            Some(1),
+            true,
+            true,
+        )?;
+        predictor.add_prompt(
+            &session_id,
+            0,
+            SessionPrompt {
+                text: None,
+                points: Some(vec![(0.60, 0.70)]),
+                point_labels: Some(vec![1]),
+                boxes: None,
+                box_labels: None,
+            },
+            Some(2),
+            true,
+            true,
+        )?;
+        let tracker_core = Sam3VideoTrackerCore::new(&tracker);
+        let video_config = predictor.video_config.clone();
+        for frame_idx in [0usize, 1usize] {
+            let output = {
+                let session = predictor
+                    .sessions
+                    .get_mut(&session_id)
+                    .expect("session exists");
+                tracker_core.process_frame(
+                    &model,
+                    &device,
+                    &video_config,
+                    session,
+                    frame_idx,
+                    PropagationDirection::Forward,
+                    VIDEO_DEBUG_MASK_THRESHOLD,
+                )?
+            };
+            let actual_obj_ids = output
+                .objects
+                .iter()
+                .map(|object| object.obj_id)
+                .collect::<Vec<_>>();
+            assert_eq!(actual_obj_ids, vec![2]);
+            let actual = &output.objects[0];
+            let (expected_boxes, expected_score, expected_mask_path) =
+                load_reference_object_frame_output(bundle, frame_idx, 2)?;
+            assert_boxes_close(
+                &actual.boxes_xyxy.flatten_all()?.to_vec1::<f32>()?,
+                &expected_boxes,
+                0.05,
+            );
+            let actual_score = actual.score_value()?;
+            assert!(
+                (actual_score - expected_score).abs() <= 0.03,
+                "output-non-overlap frame {frame_idx} score mismatch: actual={actual_score}, expected={expected_score}"
+            );
+            let mask_iou = binary_mask_iou(&actual.masks, &expected_mask_path)?;
+            assert!(
+                mask_iou >= 0.95,
+                "output-non-overlap frame {frame_idx} mask IoU too low: {mask_iou}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn video_process_frame_matches_fill_hole_disabled_reference_bundle_frames_0_and_1(
+    ) -> Result<()> {
+        assert_video_process_frame_matches_fill_hole_reference_bundle_frames_0_and_1(
+            "reference_video_fill_hole_disabled_debug",
+        )
+    }
+
+    #[test]
+    fn video_process_frame_matches_fill_hole_enabled_reference_bundle_frames_0_and_1(
+    ) -> Result<()> {
+        assert_video_process_frame_matches_fill_hole_reference_bundle_frames_0_and_1(
+            "reference_video_fill_hole_enabled_debug",
+        )
+    }
+
+    #[test]
+    fn video_process_frame_matches_hidden_output_reference_bundle_frames_0_and_1() -> Result<()> {
+        assert_video_process_frame_matches_empty_output_reference_bundle_frames_0_and_1(
+            "reference_video_postprocess_hidden_obj_debug",
+        )
+    }
+
+    #[test]
+    fn video_propagation_matches_temporal_disambiguation_reference_bundle() -> Result<()> {
+        let bundle = "reference_video_box_debug_temporal_disambiguation";
+        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint(Some(bundle))?
+        else {
+            return Ok(());
+        };
+        let Some(tokenizer_path) = sam3_test_tokenizer_path() else {
+            return Ok(());
+        };
+        let source = VideoSource::from_path(reference_input_frames_dir(bundle))?;
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        apply_reference_predictor_runtime_overrides(&mut predictor, bundle)?;
+        let session_id = predictor.start_session(
+            source,
+            VideoSessionOptions {
+                tokenizer_path: Some(tokenizer_path),
+                ..VideoSessionOptions::default()
+            },
+        )?;
+        let box_prompt = load_reference_box_prompt(bundle)?;
+        predictor.add_prompt(
+            &session_id,
+            0,
+            SessionPrompt {
+                text: None,
+                points: None,
+                point_labels: None,
+                boxes: Some(vec![box_prompt]),
+                box_labels: Some(vec![1]),
+            },
+            None,
+            true,
+            true,
+        )?;
+        let output = predictor.propagate_in_video(&session_id, PropagationOptions::default())?;
+        let actual_non_empty = output
+            .frames
+            .iter()
+            .filter(|frame| !frame.objects.is_empty())
+            .map(|frame| frame.frame_idx)
+            .collect::<Vec<_>>();
+        let expected_non_empty = load_reference_frame_indices(bundle)?;
+        assert_eq!(actual_non_empty, expected_non_empty);
+        let frame0 = output
+            .frames
+            .iter()
+            .find(|frame| frame.frame_idx == 0)
+            .ok_or_else(|| candle::Error::Msg("missing propagated frame 0".to_owned()))?;
+        assert_eq!(frame0.objects.len(), 1);
+        let actual = &frame0.objects[0];
+        let (expected_boxes, expected_score, expected_mask_path) = load_reference_frame0_output(bundle)?;
+        assert_boxes_close(
+            &actual.boxes_xyxy.flatten_all()?.to_vec1::<f32>()?,
+            &expected_boxes,
+            0.05,
+        );
+        let actual_score = actual.score_value()?;
+        assert!(
+            (actual_score - expected_score).abs() <= 0.03,
+            "temporal-disambiguation frame 0 score mismatch: actual={actual_score}, expected={expected_score}"
+        );
+        let mask_iou = binary_mask_iou(&actual.masks, &expected_mask_path)?;
+        assert!(
+            mask_iou >= 0.95,
+            "temporal-disambiguation frame 0 mask IoU too low: {mask_iou}"
+        );
+        for frame_idx in [1usize, 2usize, 3usize] {
+            let frame = output
+                .frames
+                .iter()
+                .find(|frame| frame.frame_idx == frame_idx)
+                .ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "missing propagated frame {} for temporal disambiguation bundle",
+                        frame_idx
+                    ))
+                })?;
+            assert!(
+                frame.objects.is_empty(),
+                "expected no visible objects on frame {} for temporal disambiguation bundle, found {}",
+                frame_idx,
+                frame.objects.len()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn video_propagation_matches_unconfirmed_producer_reference_bundle() -> Result<()> {
+        let bundle = "reference_video_postprocess_unconfirmed_box_debug";
+        let Some((model, tracker, device)) = load_runtime_models_from_checkpoint(Some(bundle))?
+        else {
+            return Ok(());
+        };
+        let Some(tokenizer_path) = sam3_test_tokenizer_path() else {
+            return Ok(());
+        };
+        let source = VideoSource::from_path(reference_input_frames_dir(bundle))?;
+        let mut predictor = Sam3VideoPredictor::new(&model, &tracker, &device);
+        apply_reference_predictor_runtime_overrides(&mut predictor, bundle)?;
+        let session_id = predictor.start_session(
+            source,
+            VideoSessionOptions {
+                tokenizer_path: Some(tokenizer_path),
+                ..VideoSessionOptions::default()
+            },
+        )?;
+        let box_prompt = load_reference_box_prompt(bundle)?;
+        predictor.add_prompt(
+            &session_id,
+            0,
+            SessionPrompt {
+                text: None,
+                points: None,
+                point_labels: None,
+                boxes: Some(vec![box_prompt]),
+                box_labels: Some(vec![1]),
+            },
+            None,
+            true,
+            true,
+        )?;
+        let output = predictor.propagate_in_video(&session_id, PropagationOptions::default())?;
+        let actual_non_empty = output
+            .frames
+            .iter()
+            .filter(|frame| !frame.objects.is_empty())
+            .map(|frame| frame.frame_idx)
+            .collect::<Vec<_>>();
+        let expected_non_empty = load_reference_frame_indices(bundle)?;
+        assert_eq!(actual_non_empty, expected_non_empty);
+        let session = predictor.sessions.get(&session_id).ok_or_else(|| {
+            candle::Error::Msg(format!("missing session {} after propagation", session_id))
+        })?;
+        let expected_metadata = load_reference_run_single_temporal_metadata_last_per_frame(bundle)?;
+        for (frame_idx, expected) in expected_metadata {
+            let actual = session
+                .temporal_disambiguation_metadata
+                .get(&frame_idx)
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(
+                actual.removed_obj_ids, expected.removed_obj_ids,
+                "removed_obj_ids mismatch on frame {frame_idx}"
+            );
+            assert_eq!(
+                actual.suppressed_obj_ids, expected.suppressed_obj_ids,
+                "suppressed_obj_ids mismatch on frame {frame_idx}"
+            );
+            assert_eq!(
+                actual.unconfirmed_obj_ids, expected.unconfirmed_obj_ids,
+                "unconfirmed_obj_ids mismatch on frame {frame_idx}"
+            );
+        }
         Ok(())
     }
 

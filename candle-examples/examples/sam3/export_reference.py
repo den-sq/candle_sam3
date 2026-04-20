@@ -251,6 +251,23 @@ def apply_attr_overrides(target, overrides, label):
             setattr(target, key, value)
 
 
+def apply_attr_overrides_to_any(targets, overrides, label):
+    for key, value in ensure_mapping(overrides, label).items():
+        applied = False
+        last_error = None
+        for target in targets:
+            try:
+                apply_attr_overrides(target, {key: value}, label)
+                applied = True
+                break
+            except ValueError as err:
+                last_error = err
+        if not applied:
+            if last_error is not None:
+                raise last_error
+            raise ValueError(f"{label} override {key!r} could not be applied")
+
+
 def capture_tracker_runtime_config(tracker):
     config = {
         "with_backbone": getattr(tracker, "backbone", None) is not None,
@@ -312,6 +329,9 @@ def capture_predictor_runtime_config(model, tracker):
         "hotstart_delay": int(getattr(model, "hotstart_delay", 0)),
         "hotstart_unmatch_thresh": int(getattr(model, "hotstart_unmatch_thresh", 0)),
         "hotstart_dup_thresh": int(getattr(model, "hotstart_dup_thresh", 0)),
+        "suppress_overlapping_based_on_recent_occlusion_threshold": float(
+            getattr(model, "suppress_overlapping_based_on_recent_occlusion_threshold", 0.0)
+        ),
         "masklet_confirmation_enable": bool(
             getattr(model, "masklet_confirmation_enable", False)
         ),
@@ -368,7 +388,7 @@ def build_upstream_video_predictor_for_export(
     model = predictor.model
     tracker = model.tracker
     apply_attr_overrides(tracker, tracker_overrides, "tracker_overrides")
-    apply_attr_overrides(model, predictor_overrides, "predictor_overrides")
+    apply_attr_overrides_to_any((model, tracker), predictor_overrides, "predictor_overrides")
     return predictor
 
 
@@ -1296,6 +1316,9 @@ def install_video_internal_fixture_recorder(target, debug_dir: Path, capture_fra
     )
     original_tracker_add_new_objects = getattr(model, "_tracker_add_new_objects", None)
     original_det_track_one_frame = getattr(model, "_det_track_one_frame", None)
+    original_suppress_overlapping_based_on_recent_occlusion = getattr(
+        model, "_suppress_overlapping_based_on_recent_occlusion", None
+    )
     original_run_memory_encoder = tracker._run_memory_encoder
     original_prepare_memory_conditioned_features = tracker._prepare_memory_conditioned_features
     original_track_step = tracker.track_step
@@ -1316,11 +1339,66 @@ def install_video_internal_fixture_recorder(target, debug_dir: Path, capture_fra
     original_mask_decoder_forward = getattr(
         getattr(tracker, "sam_mask_decoder", None), "forward", None
     )
+    recent_occlusion_suppressed_by_frame = {}
 
     def bind_call_arguments(method, bound_self, args, kwargs):
         target = method.__func__ if hasattr(method, "__func__") else method
         signature = inspect.signature(target)
         return signature.bind_partial(bound_self, *args, **kwargs).arguments
+
+    def compute_recent_occlusion_suppressed_obj_ids(
+        predictor_model,
+        frame_idx,
+        tracker_low_res_masks_global,
+        tracker_metadata_prev,
+        obj_ids_newly_removed,
+        reverse,
+    ):
+        if tracker_low_res_masks_global is None or tracker_metadata_prev is None:
+            return []
+        obj_ids_global = tracker_metadata_prev.get("obj_ids_all_gpu")
+        if obj_ids_global is None:
+            return []
+        obj_ids_global = [int(obj_id) for obj_id in obj_ids_global]
+        if len(obj_ids_global) <= 1:
+            return []
+        binary_masks = tracker_low_res_masks_global > 0
+        if binary_masks.size(0) != len(obj_ids_global):
+            return []
+        obj_id_to_last_occluded = tracker_metadata_prev.get("obj_id_to_last_occluded", {})
+        NEVER_OCCLUDED = -1
+        ALWAYS_OCCLUDED = 100000
+        last_occluded_prev = torch.cat(
+            [
+                obj_id_to_last_occluded.get(
+                    obj_id,
+                    torch.full(
+                        (1,),
+                        fill_value=(
+                            ALWAYS_OCCLUDED
+                            if int(obj_id) in obj_ids_newly_removed
+                            else NEVER_OCCLUDED
+                        ),
+                        device=binary_masks.device,
+                        dtype=torch.long,
+                    ),
+                )
+                for obj_id in obj_ids_global
+            ],
+            dim=0,
+        )
+        to_suppress = predictor_model._get_objects_to_suppress_based_on_most_recently_occluded(
+            binary_masks,
+            last_occluded_prev,
+            obj_ids_global,
+            frame_idx,
+            reverse,
+        )
+        return [
+            int(obj_id)
+            for obj_id, suppressed in zip(obj_ids_global, to_suppress.detach().cpu().tolist())
+            if suppressed
+        ]
 
     def sanitize_sequence(values):
         if values is None:
@@ -1432,7 +1510,18 @@ def install_video_internal_fixture_recorder(target, debug_dir: Path, capture_fra
             normalized_output_keys = normalize_offload_output_contract(result[0])
         if recorder.should_capture(frame_idx):
             inference_state = call_args["inference_state"]
-            current_out = result[0] if isinstance(result, tuple) and result else None
+            current_out = result if isinstance(result, dict) else None
+            public_suppressed_obj_ids = sanitize_sequence(
+                current_out.get("suppressed_obj_ids")
+                if isinstance(current_out, dict)
+                else None
+            ) or []
+            recent_occlusion_suppressed_obj_ids = sorted(
+                recent_occlusion_suppressed_by_frame.get(frame_idx, set())
+            )
+            effective_suppressed_obj_ids = sorted(
+                set(public_suppressed_obj_ids).union(recent_occlusion_suppressed_obj_ids)
+            )
             tensor_map = {}
             add_result_tree(tensor_map, "run_single_frame_inference_output", result)
             recorder.add_record(
@@ -1467,6 +1556,19 @@ def install_video_internal_fixture_recorder(target, debug_dir: Path, capture_fra
                     ),
                     "pred_masks_device": (
                         tensor_device_type(current_out.get("pred_masks"))
+                        if isinstance(current_out, dict)
+                        else None
+                    ),
+                    "removed_obj_ids": sanitize_sequence(
+                        current_out.get("removed_obj_ids")
+                        if isinstance(current_out, dict)
+                        else None
+                    ),
+                    "public_suppressed_obj_ids": public_suppressed_obj_ids,
+                    "recent_occlusion_suppressed_obj_ids": recent_occlusion_suppressed_obj_ids,
+                    "suppressed_obj_ids": effective_suppressed_obj_ids,
+                    "unconfirmed_obj_ids": sanitize_sequence(
+                        current_out.get("unconfirmed_obj_ids")
                         if isinstance(current_out, dict)
                         else None
                     ),
@@ -1514,6 +1616,12 @@ def install_video_internal_fixture_recorder(target, debug_dir: Path, capture_fra
     def wrapped_build_tracker_output(self, *args, **kwargs):
         call_args = bind_call_arguments(original_build_tracker_output, self, args, kwargs)
         frame_idx = int(call_args["frame_idx"])
+        inference_state = call_args["inference_state"]
+        cached_frame_outputs = inference_state.setdefault("cached_frame_outputs", {})
+        synthesized_empty_cache = False
+        if frame_idx not in cached_frame_outputs:
+            cached_frame_outputs[frame_idx] = {}
+            synthesized_empty_cache = True
         result = original_build_tracker_output(*args, **kwargs)
         if recorder.should_capture(frame_idx):
             tensor_map = {}
@@ -1535,6 +1643,7 @@ def install_video_internal_fixture_recorder(target, debug_dir: Path, capture_fra
                         ).keys()
                     ),
                     "has_refined_masks": call_args.get("refined_obj_id_to_mask") is not None,
+                    "synthesized_empty_cache_for_build": synthesized_empty_cache,
                 },
                 tensors=tensor_map,
             )
@@ -1681,6 +1790,47 @@ def install_video_internal_fixture_recorder(target, debug_dir: Path, capture_fra
                     "is_image_only": bool(call_args.get("is_image_only", False)),
                 },
                 tensors=tensor_map,
+            )
+        return result
+
+    def wrapped_suppress_overlapping_based_on_recent_occlusion(self, *args, **kwargs):
+        call_args = bind_call_arguments(
+            original_suppress_overlapping_based_on_recent_occlusion, self, args, kwargs
+        )
+        frame_idx = int(call_args["frame_idx"])
+        obj_ids_newly_removed = {
+            int(obj_id) for obj_id in call_args.get("obj_ids_newly_removed", set())
+        }
+        suppressed_obj_ids = compute_recent_occlusion_suppressed_obj_ids(
+            self,
+            frame_idx,
+            call_args.get("tracker_low_res_masks_global"),
+            call_args.get("tracker_metadata_prev"),
+            obj_ids_newly_removed,
+            bool(call_args.get("reverse", False)),
+        )
+        result = original_suppress_overlapping_based_on_recent_occlusion(*args, **kwargs)
+        if suppressed_obj_ids:
+            recent_occlusion_suppressed_by_frame.setdefault(frame_idx, set()).update(
+                suppressed_obj_ids
+            )
+        if recorder.should_capture(frame_idx):
+            recorder.add_record(
+                stage="suppress_overlapping_based_on_recent_occlusion",
+                frame_idx=frame_idx,
+                metadata={
+                    "reverse": bool(call_args.get("reverse", False)),
+                    "obj_ids_newly_removed": sorted(obj_ids_newly_removed),
+                    "suppressed_obj_ids": suppressed_obj_ids,
+                    "suppress_overlapping_based_on_recent_occlusion_threshold": float(
+                        getattr(
+                            self,
+                            "suppress_overlapping_based_on_recent_occlusion_threshold",
+                            0.0,
+                        )
+                    ),
+                },
+                tensors={},
             )
         return result
 
@@ -2147,6 +2297,13 @@ def install_video_internal_fixture_recorder(target, debug_dir: Path, capture_fra
         model._det_track_one_frame = types.MethodType(
             wrapped_det_track_one_frame, model
         )
+    if (
+        model is not None
+        and original_suppress_overlapping_based_on_recent_occlusion is not None
+    ):
+        model._suppress_overlapping_based_on_recent_occlusion = types.MethodType(
+            wrapped_suppress_overlapping_based_on_recent_occlusion, model
+        )
     tracker._run_memory_encoder = types.MethodType(wrapped_run_memory_encoder, tracker)
     tracker._prepare_memory_conditioned_features = types.MethodType(
         wrapped_prepare_memory_conditioned_features, tracker
@@ -2339,11 +2496,47 @@ def execute_video_scenario_action_video_inference(
         return
 
     if action_type == "propagate":
+        start_frame_index = action.get("start_frame_idx", None)
+        model = getattr(predictor, "model", None)
+        tracker = getattr(model, "tracker", None)
+        always_start_from_first_ann_frame = bool(
+            getattr(model, "always_start_from_first_ann_frame", False)
+            or getattr(tracker, "always_start_from_first_ann_frame", False)
+        )
+        if always_start_from_first_ann_frame:
+            get_session = getattr(predictor, "_get_session", None)
+            if callable(get_session):
+                session = get_session(session_id)
+                inference_state = session.get("state", {})
+                first_ann_frame_idx = inference_state.get("first_ann_frame_idx", None)
+                cond_outputs = (
+                    inference_state.get("output_dict", {})
+                    .get("cond_frame_outputs", {})
+                )
+                if first_ann_frame_idx is None:
+                    if isinstance(cond_outputs, dict) and cond_outputs:
+                        first_ann_frame_idx = min(cond_outputs.keys())
+                start_frame_index = first_ann_frame_idx if first_ann_frame_idx is not None else start_frame_index
+        if start_frame_index is not None:
+            get_session = getattr(predictor, "_get_session", None)
+            if callable(get_session):
+                session = get_session(session_id)
+                inference_state = session.get("state", {})
+                cond_outputs = (
+                    inference_state.get("output_dict", {})
+                    .get("cond_frame_outputs", {})
+                )
+                if (
+                    isinstance(cond_outputs, dict)
+                    and len(cond_outputs) == 1
+                    and start_frame_index not in cond_outputs
+                ):
+                    start_frame_index = min(cond_outputs.keys())
         request = {
             "type": "propagate_in_video",
             "session_id": session_id,
             "propagation_direction": action.get("direction", "forward"),
-            "start_frame_index": action.get("start_frame_idx", None),
+            "start_frame_index": start_frame_index,
             "max_frame_num_to_track": action.get("max_frame_num_to_track", None),
         }
         for response in predictor.handle_stream_request(request):

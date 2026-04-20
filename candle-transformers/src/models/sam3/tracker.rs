@@ -141,7 +141,7 @@ pub struct Sam3TrackerMaskDecoderConfig {
     pub dynamic_multimask_stability_thresh: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Sam3TrackerPredictorConfig {
     pub with_backbone: bool,
     pub forward_backbone_per_frame_for_eval: bool,
@@ -161,6 +161,7 @@ pub struct Sam3TrackerPredictorConfig {
     pub hotstart_delay: usize,
     pub hotstart_unmatch_thresh: usize,
     pub hotstart_dup_thresh: usize,
+    pub suppress_overlapping_based_on_recent_occlusion_threshold: f32,
     pub masklet_confirmation_enable: bool,
     pub masklet_confirmation_consecutive_det_thresh: usize,
     pub compile_all_components: bool,
@@ -361,6 +362,7 @@ fn create_predictor_config(
         hotstart_delay: if apply_temporal_disambiguation { 15 } else { 0 },
         hotstart_unmatch_thresh: if apply_temporal_disambiguation { 8 } else { 0 },
         hotstart_dup_thresh: if apply_temporal_disambiguation { 8 } else { 0 },
+        suppress_overlapping_based_on_recent_occlusion_threshold: 0.7,
         masklet_confirmation_enable: false,
         masklet_confirmation_consecutive_det_thresh: 3,
         compile_all_components: false,
@@ -1051,9 +1053,12 @@ impl TrackerCxBlock {
         let residual = xs.clone();
         let mut xs = self.dwconv.forward(xs)?;
         xs = self.norm.forward(&xs)?;
-        xs = xs.permute((0, 2, 3, 1))?;
+        // CUDA linear falls back to a broadcasted 4D matmul for non-contiguous NHWC inputs,
+        // which rejects the permuted stride layout produced here. Normalize to contiguous NHWC
+        // before the pointwise projections so the fast flatten+matmul path is used instead.
+        xs = xs.permute((0, 2, 3, 1))?.contiguous()?;
         xs = self.pwconv1.forward(&xs)?;
-        xs = xs.gelu_erf()?;
+        xs = xs.gelu_erf()?.contiguous()?;
         xs = self.pwconv2.forward(&xs)?;
         if let Some(gamma) = self.gamma.as_ref() {
             xs = xs.broadcast_mul(&gamma.reshape((1, 1, 1, gamma.dim(0)?))?)?;
@@ -3395,6 +3400,8 @@ mod tests {
         hotstart_delay: usize,
         hotstart_unmatch_thresh: usize,
         hotstart_dup_thresh: usize,
+        #[serde(default = "default_recent_occlusion_suppression_threshold")]
+        suppress_overlapping_based_on_recent_occlusion_threshold: f32,
         masklet_confirmation_enable: bool,
         masklet_confirmation_consecutive_det_thresh: usize,
         always_start_from_first_ann_frame: bool,
@@ -3420,6 +3427,10 @@ mod tests {
     struct TrackerTensorStat {
         shape: Vec<usize>,
         dtype: String,
+    }
+
+    fn default_recent_occlusion_suppression_threshold() -> f32 {
+        0.7
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -3635,6 +3646,10 @@ mod tests {
         config.predictor.hotstart_delay = predictor.hotstart_delay;
         config.predictor.hotstart_unmatch_thresh = predictor.hotstart_unmatch_thresh;
         config.predictor.hotstart_dup_thresh = predictor.hotstart_dup_thresh;
+        config
+            .predictor
+            .suppress_overlapping_based_on_recent_occlusion_threshold =
+            predictor.suppress_overlapping_based_on_recent_occlusion_threshold;
         config.predictor.masklet_confirmation_enable = predictor.masklet_confirmation_enable;
         config.predictor.masklet_confirmation_consecutive_det_thresh =
             predictor.masklet_confirmation_consecutive_det_thresh;
