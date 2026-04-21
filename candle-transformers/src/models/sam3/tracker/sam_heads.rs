@@ -441,12 +441,14 @@ impl Sam3TrackerModel {
             )?;
         let object_present = object_score_logits.gt(0f64)?;
         let (low_res_masks, high_res_masks, sam_output_token) = if multimask_output {
+<<<<<<< HEAD
             let best_iou_indices = ious.argmax(1)?.contiguous()?;
             let (_, _, low_res_height, low_res_width) = low_res_multimasks.dims4()?;
             let low_res_index = best_iou_indices
                 .unsqueeze(1)?
                 .unsqueeze(2)?
                 .unsqueeze(3)?
+<<<<<<< HEAD
                 .broadcast_as((batch_size, 1, low_res_height, low_res_width))?
                 .contiguous()?;
             let low_res_masks = low_res_multimasks.contiguous()?.gather(&low_res_index, 1)?;
@@ -455,6 +457,7 @@ impl Sam3TrackerModel {
                 let token_index = best_iou_indices
                     .unsqueeze(1)?
                     .unsqueeze(2)?
+<<<<<<< HEAD
                     .broadcast_as((batch_size, 1, token_width))?
                     .contiguous()?;
                 sam_output_tokens
