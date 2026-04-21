@@ -45,10 +45,33 @@ pub struct TrackerFrameState {
     pub object_score_logits: Tensor,
     pub maskmem_features: Option<Tensor>,
     pub maskmem_pos_enc: Option<Tensor>,
+    pub maskmem_prompt_features: Option<Tensor>,
+    pub maskmem_prompt_pos_enc: Option<Tensor>,
     pub is_cond_frame: bool,
 }
 
 impl TrackerFrameState {
+    pub fn set_maskmem_state(
+        &mut self,
+        maskmem_features: Tensor,
+        maskmem_pos_enc: Tensor,
+    ) -> Result<()> {
+        let (maskmem_prompt_features, maskmem_prompt_pos_enc) =
+            prepare_maskmem_prompt_tensors(&maskmem_features, &maskmem_pos_enc)?;
+        self.maskmem_features = Some(maskmem_features);
+        self.maskmem_pos_enc = Some(maskmem_pos_enc);
+        self.maskmem_prompt_features = Some(maskmem_prompt_features);
+        self.maskmem_prompt_pos_enc = Some(maskmem_prompt_pos_enc);
+        Ok(())
+    }
+
+    pub fn clear_maskmem_state(&mut self) {
+        self.maskmem_features = None;
+        self.maskmem_pos_enc = None;
+        self.maskmem_prompt_features = None;
+        self.maskmem_prompt_pos_enc = None;
+    }
+
     pub fn to_storage_device(&self, device: &candle::Device) -> Result<Self> {
         Ok(Self {
             low_res_masks: maybe_to_device(&self.low_res_masks, device)?,
@@ -66,9 +89,29 @@ impl TrackerFrameState {
                 .as_ref()
                 .map(|tensor| maybe_to_device(tensor, device))
                 .transpose()?,
+            maskmem_prompt_features: self
+                .maskmem_prompt_features
+                .as_ref()
+                .map(|tensor| maybe_to_device(tensor, device))
+                .transpose()?,
+            maskmem_prompt_pos_enc: self
+                .maskmem_prompt_pos_enc
+                .as_ref()
+                .map(|tensor| maybe_to_device(tensor, device))
+                .transpose()?,
             is_cond_frame: self.is_cond_frame,
         })
     }
+}
+
+pub(super) fn prepare_maskmem_prompt_tensors(
+    maskmem_features: &Tensor,
+    maskmem_pos_enc: &Tensor,
+) -> Result<(Tensor, Tensor)> {
+    Ok((
+        maskmem_features.flatten(2, 3)?.permute((2, 0, 1))?,
+        maskmem_pos_enc.flatten(2, 3)?.permute((2, 0, 1))?,
+    ))
 }
 
 pub(super) fn maybe_to_device(tensor: &Tensor, device: &Device) -> Result<Tensor> {

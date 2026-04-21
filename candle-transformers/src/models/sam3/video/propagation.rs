@@ -1,4 +1,5 @@
 use super::*;
+use crate::models::sam3::neck::TrackerVisualSequences;
 use crate::models::sam3::torch_ops::tensor::first_scalar_f32;
 
 #[derive(Debug, Clone)]
@@ -662,8 +663,7 @@ impl Sam3VideoTrackerCore<'_> {
                 self.prompt_frame_uses_point_memory(object, history_frame_idx),
             )?;
             let mut updated_state = move_tracker_state(&state, compute_device)?;
-            updated_state.maskmem_features = Some(maskmem_features);
-            updated_state.maskmem_pos_enc = Some(maskmem_pos_enc);
+            updated_state.set_maskmem_state(maskmem_features, maskmem_pos_enc)?;
             let updated_state = move_tracker_state(&updated_state, session.storage_device())?;
             if let Some(tracked) = session.tracked_objects.get_mut(&object.obj_id) {
                 tracked
@@ -732,8 +732,7 @@ impl Sam3VideoTrackerCore<'_> {
                 if state.is_cond_frame {
                     continue;
                 }
-                state.maskmem_features = None;
-                state.maskmem_pos_enc = None;
+                state.clear_maskmem_state();
             }
         }
     }
@@ -797,8 +796,7 @@ impl Sam3VideoTrackerCore<'_> {
             is_mask_from_points,
         )?;
         let mut state = state.clone();
-        state.maskmem_features = Some(maskmem_features);
-        state.maskmem_pos_enc = Some(maskmem_pos_enc);
+        state.set_maskmem_state(maskmem_features, maskmem_pos_enc)?;
         Ok(state)
     }
 
@@ -822,8 +820,7 @@ impl Sam3VideoTrackerCore<'_> {
                 if state.is_cond_frame {
                     continue;
                 }
-                state.maskmem_features = None;
-                state.maskmem_pos_enc = None;
+                state.clear_maskmem_state();
             }
         }
     }
@@ -1698,6 +1695,24 @@ pub(super) fn move_visual_output(
     output: &VisualBackboneOutput,
     device: &Device,
 ) -> Result<VisualBackboneOutput> {
+    fn move_tracker_sequences(
+        sequences: &TrackerVisualSequences,
+        device: &Device,
+    ) -> Result<TrackerVisualSequences> {
+        Ok(TrackerVisualSequences {
+            feat_sizes: sequences.feat_sizes.clone(),
+            vision_feats: sequences
+                .vision_feats
+                .iter()
+                .map(|tensor| move_tensor_to_device_if_needed(tensor, device))
+                .collect::<Result<Vec<_>>>()?,
+            vision_pos_embeds: sequences
+                .vision_pos_embeds
+                .iter()
+                .map(|tensor| move_tensor_to_device_if_needed(tensor, device))
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
     Ok(VisualBackboneOutput {
         backbone_fpn: output
             .backbone_fpn
@@ -1729,6 +1744,16 @@ pub(super) fn move_visual_output(
                     .collect::<Result<Vec<_>>>()
             })
             .transpose()?,
+        tracker_sequences: output
+            .tracker_sequences
+            .as_ref()
+            .map(|sequences| move_tracker_sequences(sequences, device))
+            .transpose()?,
+        tracker_sam2_sequences: output
+            .tracker_sam2_sequences
+            .as_ref()
+            .map(|sequences| move_tracker_sequences(sequences, device))
+            .transpose()?,
     })
 }
 
@@ -1739,6 +1764,11 @@ pub(super) fn tracker_visual_output(output: &VisualBackboneOutput) -> VisualBack
             vision_pos_enc: vision_pos_enc.clone(),
             sam2_backbone_fpn: output.sam2_backbone_fpn.clone(),
             sam2_pos_enc: output.sam2_pos_enc.clone(),
+            tracker_sequences: output
+                .tracker_sam2_sequences
+                .clone()
+                .or_else(|| output.tracker_sequences.clone()),
+            tracker_sam2_sequences: output.tracker_sam2_sequences.clone(),
         },
         _ => output.clone(),
     }
@@ -1771,6 +1801,16 @@ pub(super) fn move_tracker_state(
             .transpose()?,
         maskmem_pos_enc: state
             .maskmem_pos_enc
+            .as_ref()
+            .map(|tensor| move_tensor_to_device_if_needed(tensor, device))
+            .transpose()?,
+        maskmem_prompt_features: state
+            .maskmem_prompt_features
+            .as_ref()
+            .map(|tensor| move_tensor_to_device_if_needed(tensor, device))
+            .transpose()?,
+        maskmem_prompt_pos_enc: state
+            .maskmem_prompt_pos_enc
             .as_ref()
             .map(|tensor| move_tensor_to_device_if_needed(tensor, device))
             .transpose()?,

@@ -19,6 +19,31 @@ struct PreparedMemoryPrompt {
     selected_object_pointer_frame_indices: Vec<usize>,
 }
 
+fn state_maskmem_prompt_tensors(
+    state: &TrackerFrameState,
+    device: &Device,
+    dtype: DType,
+) -> Result<(Tensor, Tensor)> {
+    match (&state.maskmem_prompt_features, &state.maskmem_prompt_pos_enc) {
+        (Some(maskmem_features), Some(maskmem_pos_enc)) => Ok((
+            maybe_to_device_dtype(maskmem_features, device, dtype)?,
+            maybe_to_device_dtype(maskmem_pos_enc, device, dtype)?,
+        )),
+        _ => {
+            let Some(maskmem_features) = &state.maskmem_features else {
+                candle::bail!("tracker memory conditioning is missing maskmem_features")
+            };
+            let Some(maskmem_pos_enc) = &state.maskmem_pos_enc else {
+                candle::bail!("tracker memory conditioning is missing maskmem_pos_enc")
+            };
+            let maskmem_features =
+                maybe_to_device_dtype(maskmem_features, device, dtype)?;
+            let maskmem_pos_enc = maybe_to_device_dtype(maskmem_pos_enc, device, dtype)?;
+            prepare_maskmem_prompt_tensors(&maskmem_features, &maskmem_pos_enc)
+        }
+    }
+}
+
 impl Sam3TrackerModel {
     pub(super) fn cal_mem_score(
         &self,
@@ -318,22 +343,15 @@ impl Sam3TrackerModel {
             let prev = cond_frame_outputs
                 .get(&selected_frame)
                 .expect("selected conditioning frame missing from history");
-            let Some(maskmem_features) = &prev.maskmem_features else {
+            if prev.maskmem_features.is_none() || prev.maskmem_pos_enc.is_none() {
                 candle::bail!(
-                    "conditioning frame {selected_frame} is missing maskmem_features required for tracker memory conditioning"
+                    "conditioning frame {selected_frame} is missing maskmem tensors required for tracker memory conditioning"
                 );
-            };
-            let Some(maskmem_pos_enc) = &prev.maskmem_pos_enc else {
-                candle::bail!(
-                    "conditioning frame {selected_frame} is missing maskmem_pos_enc required for tracker memory conditioning"
-                );
-            };
-            let maskmem_features =
-                maybe_to_device_dtype(maskmem_features, device, self.no_obj_ptr.dtype())?;
-            let maskmem_pos_enc =
-                maybe_to_device_dtype(maskmem_pos_enc, device, self.no_obj_ptr.dtype())?;
-            prompt_parts.push(maskmem_features.flatten(2, 3)?.permute((2, 0, 1))?);
-            let pos = maskmem_pos_enc.flatten(2, 3)?.permute((2, 0, 1))?;
+            }
+            let (maskmem_features, maskmem_pos_enc) =
+                state_maskmem_prompt_tensors(prev, device, self.no_obj_ptr.dtype())?;
+            prompt_parts.push(maskmem_features);
+            let pos = maskmem_pos_enc;
             let pos = pos.broadcast_add(&self.maskmem_tpos_enc.i(self.config.num_maskmem - 1)?)?;
             prompt_pos_parts.push(pos);
         }
@@ -374,22 +392,10 @@ impl Sam3TrackerModel {
             if prev.maskmem_features.is_none() || prev.maskmem_pos_enc.is_none() {
                 continue;
             }
-            let Some(maskmem_features) = &prev.maskmem_features else {
-                candle::bail!(
-                    "memory frame {prev_frame_idx} is missing maskmem_features required for tracker memory conditioning"
-                );
-            };
-            let Some(maskmem_pos_enc) = &prev.maskmem_pos_enc else {
-                candle::bail!(
-                    "memory frame {prev_frame_idx} is missing maskmem_pos_enc required for tracker memory conditioning"
-                );
-            };
-            let maskmem_features =
-                maybe_to_device_dtype(maskmem_features, device, self.no_obj_ptr.dtype())?;
-            let maskmem_pos_enc =
-                maybe_to_device_dtype(maskmem_pos_enc, device, self.no_obj_ptr.dtype())?;
-            prompt_parts.push(maskmem_features.flatten(2, 3)?.permute((2, 0, 1))?);
-            let pos = maskmem_pos_enc.flatten(2, 3)?.permute((2, 0, 1))?;
+            let (maskmem_features, maskmem_pos_enc) =
+                state_maskmem_prompt_tensors(prev, device, self.no_obj_ptr.dtype())?;
+            prompt_parts.push(maskmem_features);
+            let pos = maskmem_pos_enc;
             let pos = pos.broadcast_add(
                 &self
                     .maskmem_tpos_enc

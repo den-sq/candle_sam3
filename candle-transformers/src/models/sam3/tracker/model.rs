@@ -247,39 +247,59 @@ impl Sam3TrackerModel {
         };
         let mut memory_frame_indices = Vec::new();
         let backbone_features = if !history.is_empty() {
-            let feat_sizes = visual
-                .backbone_fpn
-                .iter()
-                .zip(visual.vision_pos_enc.iter())
-                .map(|(feat, pos)| {
-                    let (_, feat_channels, feat_h, feat_w) = feat.dims4()?;
-                    let pos_shape = pos.dims4()?;
-                    if pos_shape != (1, feat_channels, feat_h, feat_w) {
-                        candle::bail!(
-                            "tracker expected matching feature/pos shapes, got ({feat_channels}, {feat_h}, {feat_w}) and {pos_shape:?}"
-                        );
-                    }
-                    Ok((feat_h, feat_w))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let current_vision_feats = visual
-                .backbone_fpn
-                .iter()
-                .map(|feat| {
-                    feat.to_dtype(compute_dtype)?
-                        .permute((2, 3, 0, 1))?
-                        .reshape((feat.dim(2)? * feat.dim(3)?, feat.dim(0)?, feat.dim(1)?))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let current_vision_pos_embeds = visual
-                .vision_pos_enc
-                .iter()
-                .map(|pos| {
-                    pos.to_dtype(compute_dtype)?
-                        .permute((2, 3, 0, 1))?
-                        .reshape((pos.dim(2)? * pos.dim(3)?, pos.dim(0)?, pos.dim(1)?))
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let (feat_sizes, current_vision_feats, current_vision_pos_embeds) =
+                if let Some(sequences) = visual.tracker_sequences.as_ref() {
+                    let current_vision_feats = sequences
+                        .vision_feats
+                        .iter()
+                        .map(|feat| maybe_to_dtype(feat, compute_dtype))
+                        .collect::<Result<Vec<_>>>()?;
+                    let current_vision_pos_embeds = sequences
+                        .vision_pos_embeds
+                        .iter()
+                        .map(|pos| maybe_to_dtype(pos, compute_dtype))
+                        .collect::<Result<Vec<_>>>()?;
+                    (
+                        sequences.feat_sizes.clone(),
+                        current_vision_feats,
+                        current_vision_pos_embeds,
+                    )
+                } else {
+                    let feat_sizes = visual
+                        .backbone_fpn
+                        .iter()
+                        .zip(visual.vision_pos_enc.iter())
+                        .map(|(feat, pos)| {
+                            let (_, feat_channels, feat_h, feat_w) = feat.dims4()?;
+                            let pos_shape = pos.dims4()?;
+                            if pos_shape != (1, feat_channels, feat_h, feat_w) {
+                                candle::bail!(
+                                    "tracker expected matching feature/pos shapes, got ({feat_channels}, {feat_h}, {feat_w}) and {pos_shape:?}"
+                                );
+                            }
+                            Ok((feat_h, feat_w))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let current_vision_feats = visual
+                        .backbone_fpn
+                        .iter()
+                        .map(|feat| {
+                            feat.to_dtype(compute_dtype)?
+                                .permute((2, 3, 0, 1))?
+                                .reshape((feat.dim(2)? * feat.dim(3)?, feat.dim(0)?, feat.dim(1)?))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let current_vision_pos_embeds = visual
+                        .vision_pos_enc
+                        .iter()
+                        .map(|pos| {
+                            pos.to_dtype(compute_dtype)?
+                                .permute((2, 3, 0, 1))?
+                                .reshape((pos.dim(2)? * pos.dim(3)?, pos.dim(0)?, pos.dim(1)?))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    (feat_sizes, current_vision_feats, current_vision_pos_embeds)
+                };
             let prepared = self.prepare_memory_conditioned_features(
                 frame_idx,
                 is_conditioning_frame,
@@ -314,8 +334,7 @@ impl Sam3TrackerModel {
                     &state.object_score_logits,
                     false,
                 )?;
-                state.maskmem_features = Some(maskmem_features);
-                state.maskmem_pos_enc = Some(maskmem_pos_enc);
+                state.set_maskmem_state(maskmem_features, maskmem_pos_enc)?;
                 state = self.maybe_offload_state_for_eval(state, storage_device)?;
             }
             return Ok(TrackerStepOutput {
@@ -350,8 +369,7 @@ impl Sam3TrackerModel {
                 &state.object_score_logits,
                 point_prompt.is_some(),
             )?;
-            state.maskmem_features = Some(maskmem_features);
-            state.maskmem_pos_enc = Some(maskmem_pos_enc);
+            state.set_maskmem_state(maskmem_features, maskmem_pos_enc)?;
             state = self.maybe_offload_state_for_eval(state, storage_device)?;
         }
         Ok(TrackerStepOutput {
@@ -472,6 +490,16 @@ impl Sam3TrackerModel {
                 .transpose()?,
             maskmem_pos_enc: state
                 .maskmem_pos_enc
+                .as_ref()
+                .map(|tensor| maybe_to_device(tensor, storage))
+                .transpose()?,
+            maskmem_prompt_features: state
+                .maskmem_prompt_features
+                .as_ref()
+                .map(|tensor| maybe_to_device(&maybe_to_dtype(tensor, DType::BF16)?, storage))
+                .transpose()?,
+            maskmem_prompt_pos_enc: state
+                .maskmem_prompt_pos_enc
                 .as_ref()
                 .map(|tensor| maybe_to_device(tensor, storage))
                 .transpose()?,

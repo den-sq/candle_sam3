@@ -492,6 +492,8 @@ impl Sam3TrackerModel {
             object_score_logits,
             maskmem_features: None,
             maskmem_pos_enc: None,
+            maskmem_prompt_features: None,
+            maskmem_prompt_pos_enc: None,
             is_cond_frame,
         })
     }
@@ -549,6 +551,8 @@ impl Sam3TrackerModel {
             object_score_logits,
             maskmem_features: None,
             maskmem_pos_enc: None,
+            maskmem_prompt_features: None,
+            maskmem_prompt_pos_enc: None,
             is_cond_frame,
         })
     }

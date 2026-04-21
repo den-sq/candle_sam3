@@ -9,11 +9,59 @@ use super::torch_ops::position::build_2d_sine_position_encoding_grid;
 use super::vitdet::ViTDetTrunkOutput;
 
 #[derive(Debug, Clone)]
+pub struct TrackerVisualSequences {
+    pub feat_sizes: Vec<(usize, usize)>,
+    pub vision_feats: Vec<Tensor>,
+    pub vision_pos_embeds: Vec<Tensor>,
+}
+
+#[derive(Debug, Clone)]
 pub struct VisualBackboneOutput {
     pub backbone_fpn: Vec<Tensor>,
     pub vision_pos_enc: Vec<Tensor>,
     pub sam2_backbone_fpn: Option<Vec<Tensor>>,
     pub sam2_pos_enc: Option<Vec<Tensor>>,
+    pub tracker_sequences: Option<TrackerVisualSequences>,
+    pub tracker_sam2_sequences: Option<TrackerVisualSequences>,
+}
+
+fn build_tracker_visual_sequences(
+    backbone_fpn: &[Tensor],
+    vision_pos_enc: &[Tensor],
+) -> Result<TrackerVisualSequences> {
+    let feat_sizes = backbone_fpn
+        .iter()
+        .zip(vision_pos_enc.iter())
+        .map(|(feat, pos)| {
+            let (_, feat_channels, feat_h, feat_w) = feat.dims4()?;
+            let pos_shape = pos.dims4()?;
+            if pos_shape != (1, feat_channels, feat_h, feat_w) {
+                candle::bail!(
+                    "tracker expected matching feature/pos shapes, got ({feat_channels}, {feat_h}, {feat_w}) and {pos_shape:?}"
+                )
+            }
+            Ok((feat_h, feat_w))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let vision_feats = backbone_fpn
+        .iter()
+        .map(|feat| {
+            feat.permute((2, 3, 0, 1))?
+                .reshape((feat.dim(2)? * feat.dim(3)?, feat.dim(0)?, feat.dim(1)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let vision_pos_embeds = vision_pos_enc
+        .iter()
+        .map(|pos| {
+            pos.permute((2, 3, 0, 1))?
+                .reshape((pos.dim(2)? * pos.dim(3)?, pos.dim(0)?, pos.dim(1)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(TrackerVisualSequences {
+        feat_sizes,
+        vision_feats,
+        vision_pos_embeds,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -228,19 +276,32 @@ impl Sam3DualViTDetNeck {
         let feature_map = feature_map.permute((0, 3, 1, 2))?;
         let backbone_fpn = self.forward_branch(&self.stages, &feature_map)?;
         let vision_pos_enc = self.build_position_encodings(&backbone_fpn, self.config.d_model)?;
+        let tracker_sequences = Some(build_tracker_visual_sequences(
+            backbone_fpn.as_slice(),
+            vision_pos_enc.as_slice(),
+        )?);
         let (sam2_backbone_fpn, sam2_pos_enc) = match &self.sam2_stages {
             Some(stages) => {
                 let branch = self.forward_branch(stages, &feature_map)?;
-                let pos = vision_pos_enc.iter().map(Tensor::clone).collect();
+                let pos: Vec<_> = vision_pos_enc.iter().map(Tensor::clone).collect();
                 (Some(branch), Some(pos))
             }
             None => (None, None),
+        };
+        let tracker_sam2_sequences = match (&sam2_backbone_fpn, &sam2_pos_enc) {
+            (Some(backbone_fpn), Some(vision_pos_enc)) => Some(build_tracker_visual_sequences(
+                backbone_fpn.as_slice(),
+                vision_pos_enc.as_slice(),
+            )?),
+            _ => None,
         };
         Ok(VisualBackboneOutput {
             backbone_fpn,
             vision_pos_enc,
             sam2_backbone_fpn,
             sam2_pos_enc,
+            tracker_sequences,
+            tracker_sam2_sequences,
         })
     }
 
