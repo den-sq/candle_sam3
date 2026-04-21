@@ -2,16 +2,29 @@ use super::*;
 
 impl Sam3TrackerModel {
     pub fn new(config: &Sam3TrackerConfig, vb: VarBuilder) -> Result<Self> {
+        let model_device = vb.device().clone();
+        let model_dtype = vb.dtype();
         let (vision_trunk, vision_neck) = if config.predictor.with_backbone {
+            let vision_trunk = Some(Sam3ViTDetTrunk::new(
+                &Config::default().vision,
+                vb.pp("backbone").pp("vision_backbone").pp("trunk"),
+            )?);
+            let vision_neck = Some(Sam3DualViTDetNeck::new(
+                &Config::default().neck,
+                vb.pp("backbone").pp("vision_backbone"),
+            )?);
+            if let Some(vision_neck) = vision_neck.as_ref() {
+                let default_vision = Config::default().vision;
+                vision_neck.prime_position_encoding_cache(
+                    &model_device,
+                    model_dtype,
+                    default_vision.image_size / default_vision.patch_size,
+                    default_vision.image_size / default_vision.patch_size,
+                )?;
+            }
             (
-                Some(Sam3ViTDetTrunk::new(
-                    &Config::default().vision,
-                    vb.pp("backbone").pp("vision_backbone").pp("trunk"),
-                )?),
-                Some(Sam3DualViTDetNeck::new(
-                    &Config::default().neck,
-                    vb.pp("backbone").pp("vision_backbone"),
-                )?),
+                vision_trunk,
+                vision_neck,
             )
         } else {
             (None, None)
@@ -131,15 +144,8 @@ impl Sam3TrackerModel {
         let t_diff_max = max_abs_pos
             .map(|value| value.saturating_sub(1).max(1))
             .unwrap_or(1) as f64;
-        let pos_inds = Tensor::from_vec(
-            rel_pos_list
-                .iter()
-                .map(|value| *value as f32)
-                .collect::<Vec<_>>(),
-            rel_pos_list.len(),
-            device,
-        )?;
-        let pos_inds = pos_inds.broadcast_div(&Tensor::new(t_diff_max as f32, device)?)?;
+        let pos_inds = device_f32_vector(device, rel_pos_list)?;
+        let pos_inds = pos_inds.affine(1.0 / t_diff_max, 0.0)?;
         let pos_enc = get_1d_sine_pe(&pos_inds, self.config.hidden_dim)?;
         self.obj_ptr_tpos_proj.forward(&pos_enc)
     }
@@ -500,4 +506,16 @@ impl Sam3TrackerModel {
             is_mask_from_points,
         )
     }
+}
+
+fn device_f32_vector(device: &Device, values: &[i64]) -> Result<Tensor> {
+    if values.is_empty() {
+        return Tensor::zeros(0, DType::F32, device);
+    }
+    let parts = values
+        .iter()
+        .map(|value| Tensor::arange(*value as f32, *value as f32 + 1.0, device))
+        .collect::<Result<Vec<_>>>()?;
+    let part_refs = parts.iter().collect::<Vec<_>>();
+    Tensor::cat(part_refs.as_slice(), 0)
 }

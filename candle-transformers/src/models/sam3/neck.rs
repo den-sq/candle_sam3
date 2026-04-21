@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use candle::{Result, Tensor};
+use candle::{DType, Device, Result, Tensor};
 use candle_nn::{Conv2d, Conv2dConfig, ConvTranspose2d, ConvTranspose2dConfig, Module, VarBuilder};
 
 use super::config::NeckConfig;
+use super::torch_ops::position::build_2d_sine_position_encoding_grid;
 use super::vitdet::ViTDetTrunkOutput;
 
 #[derive(Debug, Clone)]
@@ -159,6 +160,15 @@ impl FeaturePyramidStage {
         let feature_map = self.conv_1x1.forward(&feature_map)?;
         self.conv_3x3.forward(&feature_map)
     }
+
+    fn output_shape(&self, height: usize, width: usize) -> (usize, usize) {
+        match self.kind {
+            PyramidStageKind::UpsampleX4 => (height * 4, width * 4),
+            PyramidStageKind::UpsampleX2 => (height * 2, width * 2),
+            PyramidStageKind::Identity => (height, width),
+            PyramidStageKind::DownsampleX2 => (height / 2, width / 2),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -196,6 +206,19 @@ impl Sam3DualViTDetNeck {
 
     pub fn config(&self) -> &NeckConfig {
         &self.config
+    }
+
+    pub(crate) fn prime_position_encoding_cache(
+        &self,
+        device: &Device,
+        dtype: DType,
+        trunk_height: usize,
+        trunk_width: usize,
+    ) -> Result<()> {
+        for (height, width) in self.retained_stage_shapes(trunk_height, trunk_width)? {
+            let _ = self.cached_position_encoding_base(device, dtype, self.config.d_model, height, width)?;
+        }
+        Ok(())
     }
 
     pub fn forward(&self, trunk: &ViTDetTrunkOutput) -> Result<VisualBackboneOutput> {
@@ -254,9 +277,31 @@ impl Sam3DualViTDetNeck {
         if channels != d_model {
             candle::bail!("sam3 neck expected projected feature width {d_model}, got {channels}")
         }
+        let base = self.cached_position_encoding_base(
+            feature.device(),
+            feature.dtype(),
+            d_model,
+            height,
+            width,
+        )?;
+        if batch_size == 1 {
+            Ok(base)
+        } else {
+            base.repeat((batch_size, 1, 1, 1))
+        }
+    }
+
+    fn cached_position_encoding_base(
+        &self,
+        device: &Device,
+        dtype: DType,
+        d_model: usize,
+        height: usize,
+        width: usize,
+    ) -> Result<Tensor> {
         let key = PositionEncodingCacheKey {
-            device: format!("{:?}", feature.device()),
-            dtype: format!("{:?}", feature.dtype()),
+            device: format!("{:?}", device),
+            dtype: format!("{:?}", dtype),
             d_model,
             height,
             width,
@@ -268,28 +313,48 @@ impl Sam3DualViTDetNeck {
                 .expect("neck cache lock poisoned");
             cache.get(&key).cloned()
         };
-        let base = match cached {
-            Some(tensor) => tensor,
+        match cached {
+            Some(tensor) => Ok(tensor),
             None => {
-                let base = build_2d_sine_position_encoding_base(
-                    feature.device(),
-                    feature.dtype(),
+                let base = build_2d_sine_position_encoding_grid(
+                    device,
+                    dtype,
+                    1,
                     d_model,
                     height,
                     width,
+                    true,
+                    2.0 * std::f32::consts::PI,
+                    10_000f32,
                 )?;
                 let mut cache = self
                     .position_encoding_cache
                     .lock()
                     .expect("neck cache lock poisoned");
-                cache.entry(key).or_insert_with(|| base.clone()).clone()
+                Ok(cache.entry(key).or_insert_with(|| base.clone()).clone())
             }
-        };
-        if batch_size == 1 {
-            Ok(base)
-        } else {
-            base.repeat((batch_size, 1, 1, 1))
         }
+    }
+
+    fn retained_stage_shapes(
+        &self,
+        trunk_height: usize,
+        trunk_width: usize,
+    ) -> Result<Vec<(usize, usize)>> {
+        let mut shapes = self
+            .stages
+            .iter()
+            .map(|stage| stage.output_shape(trunk_height, trunk_width))
+            .collect::<Vec<_>>();
+        if self.config.scalp > shapes.len() {
+            candle::bail!(
+                "sam3 neck scalp {} exceeds number of generated levels {}",
+                self.config.scalp,
+                shapes.len()
+            )
+        }
+        shapes.truncate(shapes.len() - self.config.scalp);
+        Ok(shapes)
     }
 }
 
@@ -321,55 +386,6 @@ fn stage_input_channels(kind: PyramidStageKind, d_model: usize) -> Result<usize>
             Ok(trunk_channels)
         }
     }
-}
-
-fn build_2d_sine_position_encoding_base(
-    device: &candle::Device,
-    dtype: candle::DType,
-    d_model: usize,
-    height: usize,
-    width: usize,
-) -> Result<Tensor> {
-    if d_model % 2 != 0 {
-        candle::bail!("sam3 neck position encoding requires even d_model, got {d_model}")
-    }
-    let num_pos_feats = d_model / 2;
-    if num_pos_feats % 2 != 0 {
-        candle::bail!("sam3 neck position encoding requires d_model divisible by 4, got {d_model}")
-    }
-    let temperature = 10_000f32;
-    let scale = 2.0 * std::f32::consts::PI;
-    let eps = 1e-6f32;
-    let mut dim_t = Vec::with_capacity(num_pos_feats);
-    for idx in 0..num_pos_feats {
-        let exponent = 2.0 * (idx / 2) as f32 / num_pos_feats as f32;
-        dim_t.push(temperature.powf(exponent));
-    }
-    let mut encoding = vec![0f32; d_model * height * width];
-    for y in 0..height {
-        let y_pos = ((y + 1) as f32 / (height as f32 + eps)) * scale;
-        for x in 0..width {
-            let x_pos = ((x + 1) as f32 / (width as f32 + eps)) * scale;
-            for idx in 0..num_pos_feats {
-                let div = dim_t[idx];
-                let y_value = if idx % 2 == 0 {
-                    (y_pos / div).sin()
-                } else {
-                    (y_pos / div).cos()
-                };
-                let x_value = if idx % 2 == 0 {
-                    (x_pos / div).sin()
-                } else {
-                    (x_pos / div).cos()
-                };
-                let spatial_index = y * width + x;
-                encoding[idx * height * width + spatial_index] = y_value;
-                encoding[(num_pos_feats + idx) * height * width + spatial_index] = x_value;
-            }
-        }
-    }
-    let encoding = Tensor::from_slice(&encoding, (1, d_model, height, width), device)?;
-    encoding.to_dtype(dtype)
 }
 
 #[cfg(test)]

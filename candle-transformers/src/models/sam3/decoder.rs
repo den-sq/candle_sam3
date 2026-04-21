@@ -6,6 +6,7 @@ use candle_nn::{LayerNorm, Linear, Module, VarBuilder};
 use super::config::DecoderConfig;
 use super::debug;
 use super::encoder::FusionEncoderOutput;
+use super::torch_ops::position::get_interleaved_1d_sine_pe;
 
 #[derive(Debug)]
 pub struct DecoderOutput {
@@ -818,45 +819,30 @@ fn gen_sineembed_for_position(pos_tensor: &Tensor, d_model: usize) -> Result<Ten
         )
     }
     let (num_queries, batch_size, coord_dim) = pos_tensor.dims3()?;
-    let num_feats = d_model / 2;
     let scale = 2.0 * PI as f32;
-    let mut dim_t = Vec::with_capacity(num_feats);
-    for idx in 0..num_feats {
-        dim_t.push(10000f32.powf((2 * (idx / 2)) as f32 / num_feats as f32));
-    }
-    let coords = pos_tensor.to_vec3::<f32>()?;
+    let pos_tensor = pos_tensor.to_dtype(DType::F32)?.affine(scale as f64, 0.0)?;
     let out_dim = match coord_dim {
         2 => d_model,
         4 => d_model * 2,
         dim => candle::bail!("sam3 decoder expected 2D or 4D positions, got {dim}"),
     };
-    let mut embeddings = Vec::with_capacity(num_queries * batch_size * out_dim);
-    for query in coords.iter() {
-        for coord in query.iter() {
-            append_sine_component(&mut embeddings, coord[1] * scale, &dim_t);
-            append_sine_component(&mut embeddings, coord[0] * scale, &dim_t);
-            if coord_dim == 4 {
-                append_sine_component(&mut embeddings, coord[2] * scale, &dim_t);
-                append_sine_component(&mut embeddings, coord[3] * scale, &dim_t);
-            }
-        }
+    let num_feats = d_model / 2;
+    let y_embed = get_interleaved_1d_sine_pe(&pos_tensor.i((.., .., 1))?, num_feats)?;
+    let x_embed = get_interleaved_1d_sine_pe(&pos_tensor.i((.., .., 0))?, num_feats)?;
+    let embedding = if coord_dim == 4 {
+        let w_embed = get_interleaved_1d_sine_pe(&pos_tensor.i((.., .., 2))?, num_feats)?;
+        let h_embed = get_interleaved_1d_sine_pe(&pos_tensor.i((.., .., 3))?, num_feats)?;
+        Tensor::cat(&[&y_embed, &x_embed, &w_embed, &h_embed], 2)?
+    } else {
+        Tensor::cat(&[&y_embed, &x_embed], 2)?
+    };
+    let embedding_shape = embedding.dims3()?;
+    if embedding_shape != (num_queries, batch_size, out_dim) {
+        candle::bail!(
+            "sam3 decoder sine embedding expected shape ({num_queries}, {batch_size}, {out_dim}), got {embedding_shape:?}"
+        )
     }
-    Tensor::from_vec(
-        embeddings,
-        (num_queries, batch_size, out_dim),
-        pos_tensor.device(),
-    )
-}
-
-fn append_sine_component(out: &mut Vec<f32>, value: f32, dim_t: &[f32]) {
-    for (idx, dim) in dim_t.iter().enumerate() {
-        let angle = value / *dim;
-        out.push(if idx % 2 == 0 {
-            angle.sin()
-        } else {
-            angle.cos()
-        });
-    }
+    Ok(embedding)
 }
 
 fn push_box_rpb_delta(out: &mut Vec<f32>, delta0: f32, delta1: f32, mode: &str) {

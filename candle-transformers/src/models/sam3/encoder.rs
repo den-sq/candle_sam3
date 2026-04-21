@@ -1,4 +1,4 @@
-use candle::{DType, Result, Tensor};
+use candle::{DType, Device, Result, Tensor};
 use candle_nn::{LayerNorm, Linear, Module, VarBuilder};
 
 use super::config::EncoderConfig;
@@ -287,11 +287,11 @@ fn prepare_multilevel_features(
 ) -> Result<(Vec<Tensor>, Vec<Tensor>, Tensor, Tensor, Tensor, usize)> {
     let mut memory_parts = Vec::with_capacity(visual_features.len());
     let mut pos_parts = Vec::with_capacity(visual_pos_embeds.len());
-    let mut spatial_shapes_vec = Vec::with_capacity(visual_features.len() * 2);
-    let mut level_start_index_vec = Vec::with_capacity(visual_features.len());
-    let mut valid_ratios_vec = Vec::new();
+    let mut spatial_shape_parts = Vec::with_capacity(visual_features.len());
+    let mut level_start_index_parts = Vec::with_capacity(visual_features.len());
     let mut current_offset = 0u32;
     let mut batch_size = None;
+    let device = visual_features[0].device();
 
     for (feature_map, pos_embed) in visual_features.iter().zip(visual_pos_embeds.iter()) {
         let (batch, channels, height, width) = feature_map.dims4()?;
@@ -309,7 +309,6 @@ fn prepare_multilevel_features(
             }
         } else {
             batch_size = Some(batch);
-            valid_ratios_vec = vec![1f32; batch * visual_features.len() * 2];
         }
         let feature_map = match pooled_prompt {
             Some(pooled_prompt) => feature_map.broadcast_add(
@@ -329,21 +328,17 @@ fn prepare_multilevel_features(
             batch,
             channels,
         ))?);
-        level_start_index_vec.push(current_offset);
+        level_start_index_parts.push(singleton_u32(device, current_offset)?);
         current_offset += (height * width) as u32;
-        spatial_shapes_vec.push(height as u32);
-        spatial_shapes_vec.push(width as u32);
+        spatial_shape_parts.push(pair_u32(device, height as u32, width as u32)?);
     }
 
     let batch_size = batch_size.unwrap_or(0);
-    let device = visual_features[0].device();
-    let spatial_shapes = Tensor::from_vec(spatial_shapes_vec, (visual_features.len(), 2), device)?;
-    let level_start_index = Tensor::from_vec(level_start_index_vec, visual_features.len(), device)?;
-    let valid_ratios = Tensor::from_vec(
-        valid_ratios_vec,
-        (batch_size, visual_features.len(), 2),
-        device,
-    )?;
+    let spatial_shape_refs = spatial_shape_parts.iter().collect::<Vec<_>>();
+    let spatial_shapes = Tensor::stack(spatial_shape_refs.as_slice(), 0)?;
+    let level_start_index_refs = level_start_index_parts.iter().collect::<Vec<_>>();
+    let level_start_index = Tensor::cat(level_start_index_refs.as_slice(), 0)?;
+    let valid_ratios = Tensor::ones((batch_size, visual_features.len(), 2), DType::F32, device)?;
     Ok((
         memory_parts,
         pos_parts,
@@ -352,6 +347,16 @@ fn prepare_multilevel_features(
         valid_ratios,
         batch_size,
     ))
+}
+
+fn singleton_u32(device: &Device, value: u32) -> Result<Tensor> {
+    Tensor::arange(value, value + 1, device)
+}
+
+fn pair_u32(device: &Device, first: u32, second: u32) -> Result<Tensor> {
+    let first = singleton_u32(device, first)?;
+    let second = singleton_u32(device, second)?;
+    Tensor::cat(&[&first, &second], 0)
 }
 
 fn pool_prompt_feat(prompt: &Tensor, prompt_mask: &Tensor, pool_with_mask: bool) -> Result<Tensor> {
