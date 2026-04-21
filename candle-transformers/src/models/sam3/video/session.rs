@@ -602,17 +602,41 @@ pub(crate) struct CachedTextPrompt {
 impl CachedTextPrompt {
     fn from_encoding(encoding: &TextEncoding, storage_device: &Device) -> Result<Self> {
         Ok(Self {
-            attention_mask: encoding.attention_mask.to_device(storage_device)?,
-            memory: encoding.memory.to_device(storage_device)?,
-            input_embeddings: encoding.input_embeddings.to_device(storage_device)?,
+            attention_mask: if encoding.attention_mask.device().same_device(storage_device) {
+                encoding.attention_mask.clone()
+            } else {
+                encoding.attention_mask.to_device(storage_device)?
+            },
+            memory: if encoding.memory.device().same_device(storage_device) {
+                encoding.memory.clone()
+            } else {
+                encoding.memory.to_device(storage_device)?
+            },
+            input_embeddings: if encoding.input_embeddings.device().same_device(storage_device) {
+                encoding.input_embeddings.clone()
+            } else {
+                encoding.input_embeddings.to_device(storage_device)?
+            },
         })
     }
 
     fn to_text_encoding(&self, compute_device: &Device) -> Result<TextEncoding> {
         Ok(TextEncoding {
-            attention_mask: self.attention_mask.to_device(compute_device)?,
-            memory: self.memory.to_device(compute_device)?,
-            input_embeddings: self.input_embeddings.to_device(compute_device)?,
+            attention_mask: if self.attention_mask.device().same_device(compute_device) {
+                self.attention_mask.clone()
+            } else {
+                self.attention_mask.to_device(compute_device)?
+            },
+            memory: if self.memory.device().same_device(compute_device) {
+                self.memory.clone()
+            } else {
+                self.memory.to_device(compute_device)?
+            },
+            input_embeddings: if self.input_embeddings.device().same_device(compute_device) {
+                self.input_embeddings.clone()
+            } else {
+                self.input_embeddings.to_device(compute_device)?
+            },
         })
     }
 }

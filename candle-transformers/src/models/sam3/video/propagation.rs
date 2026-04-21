@@ -169,14 +169,14 @@ impl ObjectFrameOutput {
     pub(super) fn to_storage_device(&self, storage_device: &Device) -> Result<Self> {
         Ok(Self {
             obj_id: self.obj_id,
-            mask_logits: self.mask_logits.to_device(storage_device)?,
-            masks: self.masks.to_device(storage_device)?,
-            boxes_xyxy: self.boxes_xyxy.to_device(storage_device)?,
-            scores: self.scores.to_device(storage_device)?,
+            mask_logits: move_tensor_to_device_if_needed(&self.mask_logits, storage_device)?,
+            masks: move_tensor_to_device_if_needed(&self.masks, storage_device)?,
+            boxes_xyxy: move_tensor_to_device_if_needed(&self.boxes_xyxy, storage_device)?,
+            scores: move_tensor_to_device_if_needed(&self.scores, storage_device)?,
             presence_scores: self
                 .presence_scores
                 .as_ref()
-                .map(|tensor| tensor.to_device(storage_device))
+                .map(|tensor| move_tensor_to_device_if_needed(tensor, storage_device))
                 .transpose()?,
             prompt_frame_idx: self.prompt_frame_idx,
             memory_frame_indices: self.memory_frame_indices.clone(),
@@ -858,7 +858,7 @@ impl Sam3VideoTrackerCore<'_> {
             compute_device,
             frame_idx,
         )?);
-        let track_output = self.tracker.track_frame(
+        let track_output = self.tracker.track_frame_with_storage_device(
             &visual_features,
             frame_idx,
             session.num_frames(),
@@ -871,6 +871,7 @@ impl Sam3VideoTrackerCore<'_> {
             matches!(direction, PropagationDirection::Backward),
             true,
             true,
+            Some(session.storage_device()),
         )?;
         let prompt_frame_idx = object.nearest_input_frame_idx(frame_idx, direction);
         let mut output = tracker_state_to_object_output(
@@ -985,7 +986,7 @@ impl Sam3VideoTrackerCore<'_> {
         let is_cond_frame = self.correction_frame_is_cond_frame();
         let mut tracker_state = self
             .tracker
-            .track_frame(
+            .track_frame_with_storage_device(
                 &visual,
                 frame_idx,
                 session.num_frames(),
@@ -998,6 +999,7 @@ impl Sam3VideoTrackerCore<'_> {
                 matches!(direction, PropagationDirection::Backward),
                 self.tracker.config().predictor.use_prev_mem_frame,
                 false,
+                Some(session.storage_device()),
             )?
             .state;
         tracker_state = self.attach_state_memory(
@@ -1074,7 +1076,7 @@ impl Sam3VideoTrackerCore<'_> {
         let is_cond_frame = self.correction_frame_is_cond_frame();
         let mut tracker_state = self
             .tracker
-            .track_frame(
+            .track_frame_with_storage_device(
                 &visual,
                 frame_idx,
                 session.num_frames(),
@@ -1087,6 +1089,7 @@ impl Sam3VideoTrackerCore<'_> {
                 matches!(direction, PropagationDirection::Backward),
                 self.tracker.config().predictor.use_prev_mem_frame,
                 false,
+                Some(session.storage_device()),
             )?
             .state;
         tracker_state = self.attach_state_memory(&visual, &tracker_state, false)?;
@@ -1196,7 +1199,7 @@ impl Sam3VideoTrackerCore<'_> {
         let tracker_mask_input = tracker_mask_input.gt(0f64)?.to_dtype(DType::F32)?;
         let tracker_state = self
             .tracker
-            .track_frame(
+            .track_frame_with_storage_device(
                 &tracker_visual_features,
                 frame_idx,
                 session.num_frames(),
@@ -1209,6 +1212,7 @@ impl Sam3VideoTrackerCore<'_> {
                 false,
                 true,
                 false,
+                Some(session.storage_device()),
             )?
             .state;
         let detector_score = detector_output.score_value()?;
@@ -1290,7 +1294,7 @@ impl Sam3VideoTrackerCore<'_> {
         };
         let tracker_state = self
             .tracker
-            .track_frame(
+            .track_frame_with_storage_device(
                 &visual_features,
                 frame_idx,
                 session.num_frames(),
@@ -1303,6 +1307,7 @@ impl Sam3VideoTrackerCore<'_> {
                 false,
                 false,
                 false,
+                Some(session.storage_device()),
             )?
             .state;
         let mut output = tracker_state_to_object_output(
@@ -1360,7 +1365,7 @@ impl Sam3VideoTrackerCore<'_> {
         .to_dtype(DType::F32)?;
         let tracker_state = self
             .tracker
-            .track_frame(
+            .track_frame_with_storage_device(
                 &visual_features,
                 frame_idx,
                 session.num_frames(),
@@ -1373,6 +1378,7 @@ impl Sam3VideoTrackerCore<'_> {
                 false,
                 true,
                 false,
+                Some(session.storage_device()),
             )?
             .state;
         let mut output = mask_prompt_to_object_output(
@@ -1696,12 +1702,12 @@ pub(super) fn move_visual_output(
         backbone_fpn: output
             .backbone_fpn
             .iter()
-            .map(|tensor| tensor.to_device(device))
+            .map(|tensor| move_tensor_to_device_if_needed(tensor, device))
             .collect::<Result<Vec<_>>>()?,
         vision_pos_enc: output
             .vision_pos_enc
             .iter()
-            .map(|tensor| tensor.to_device(device))
+            .map(|tensor| move_tensor_to_device_if_needed(tensor, device))
             .collect::<Result<Vec<_>>>()?,
         sam2_backbone_fpn: output
             .sam2_backbone_fpn
@@ -1709,7 +1715,7 @@ pub(super) fn move_visual_output(
             .map(|levels| {
                 levels
                     .iter()
-                    .map(|tensor| tensor.to_device(device))
+                    .map(|tensor| move_tensor_to_device_if_needed(tensor, device))
                     .collect::<Result<Vec<_>>>()
             })
             .transpose()?,
@@ -1719,7 +1725,7 @@ pub(super) fn move_visual_output(
             .map(|levels| {
                 levels
                     .iter()
-                    .map(|tensor| tensor.to_device(device))
+                    .map(|tensor| move_tensor_to_device_if_needed(tensor, device))
                     .collect::<Result<Vec<_>>>()
             })
             .transpose()?,
@@ -1753,23 +1759,31 @@ pub(super) fn move_tracker_state(
     device: &Device,
 ) -> Result<TrackerFrameState> {
     Ok(TrackerFrameState {
-        low_res_masks: state.low_res_masks.to_device(device)?,
-        high_res_masks: state.high_res_masks.to_device(device)?,
-        iou_scores: state.iou_scores.to_device(device)?,
-        obj_ptr: state.obj_ptr.to_device(device)?,
-        object_score_logits: state.object_score_logits.to_device(device)?,
+        low_res_masks: move_tensor_to_device_if_needed(&state.low_res_masks, device)?,
+        high_res_masks: move_tensor_to_device_if_needed(&state.high_res_masks, device)?,
+        iou_scores: move_tensor_to_device_if_needed(&state.iou_scores, device)?,
+        obj_ptr: move_tensor_to_device_if_needed(&state.obj_ptr, device)?,
+        object_score_logits: move_tensor_to_device_if_needed(&state.object_score_logits, device)?,
         maskmem_features: state
             .maskmem_features
             .as_ref()
-            .map(|tensor| tensor.to_device(device))
+            .map(|tensor| move_tensor_to_device_if_needed(tensor, device))
             .transpose()?,
         maskmem_pos_enc: state
             .maskmem_pos_enc
             .as_ref()
-            .map(|tensor| tensor.to_device(device))
+            .map(|tensor| move_tensor_to_device_if_needed(tensor, device))
             .transpose()?,
         is_cond_frame: state.is_cond_frame,
     })
+}
+
+fn move_tensor_to_device_if_needed(tensor: &Tensor, device: &Device) -> Result<Tensor> {
+    if tensor.device().same_device(device) {
+        Ok(tensor.clone())
+    } else {
+        tensor.to_device(device)
+    }
 }
 
 pub(super) fn resize_mask_prompt_to_video(

@@ -125,7 +125,7 @@ struct Sam3VisionAttention {
     proj: Linear,
     num_heads: usize,
     head_dim: usize,
-    scale: f64,
+    scale: Tensor,
     rotary_emb: VisionRotaryEmbedding,
 }
 
@@ -143,7 +143,7 @@ impl Sam3VisionAttention {
             proj,
             num_heads: config.num_heads,
             head_dim,
-            scale: (head_dim as f64).powf(-0.5),
+            scale: Tensor::new((head_dim as f32).powf(-0.5), vb.device())?,
             rotary_emb,
         })
     }
@@ -161,10 +161,9 @@ impl Sam3VisionAttention {
         let k = qkv.i(1)?.contiguous()?;
         let v = qkv.i(2)?.contiguous()?;
         let (q, k) = self.rotary_emb.apply(&q, &k)?;
-        let scale = Tensor::new(self.scale as f32, q.device())?;
         let q = q
             .to_dtype(DType::F32)?
-            .broadcast_mul(&scale)?
+            .broadcast_mul(&self.scale)?
             .contiguous()?;
         let k = k.to_dtype(DType::F32)?.contiguous()?;
         let v = v.to_dtype(DType::F32)?.contiguous()?;

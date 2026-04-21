@@ -75,6 +75,8 @@ pub(super) struct Sam3TrackerMaskDecoder {
     iou_token: Embedding,
     mask_tokens: Embedding,
     obj_score_token: Option<Embedding>,
+    output_tokens: Tensor,
+    output_token_count: usize,
     output_upscaling_conv1: ConvTranspose2d,
     output_upscaling_ln: LayerNorm2d,
     output_upscaling_conv2: ConvTranspose2d,
@@ -116,6 +118,17 @@ impl Sam3TrackerMaskDecoder {
         } else {
             None
         };
+        let output_tokens = {
+            let mut tokens = vec![iou_token.embeddings().i(0)?];
+            if let Some(obj_score_token) = &obj_score_token {
+                tokens.push(obj_score_token.embeddings().i(0)?);
+            }
+            for index in 0..num_mask_tokens {
+                tokens.push(mask_tokens.embeddings().i(index)?);
+            }
+            Tensor::stack(tokens.as_slice(), 0)?
+        };
+        let output_token_count = output_tokens.dim(0)?;
         let deconv_cfg = ConvTranspose2dConfig {
             stride: 2,
             ..Default::default()
@@ -206,6 +219,8 @@ impl Sam3TrackerMaskDecoder {
             iou_token,
             mask_tokens,
             obj_score_token,
+            output_tokens,
+            output_token_count,
             output_upscaling_conv1,
             output_upscaling_ln,
             output_upscaling_conv2,
@@ -276,20 +291,11 @@ impl Sam3TrackerMaskDecoder {
         high_res_features: Option<&[Tensor]>,
     ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         let batch_size = sparse_prompt_embeddings.dim(0)?;
-        let output_tokens = {
-            let mut tokens = vec![self.iou_token.embeddings().i(0)?];
-            if let Some(obj_score_token) = &self.obj_score_token {
-                tokens.push(obj_score_token.embeddings().i(0)?);
-            }
-            for index in 0..self.num_mask_tokens {
-                tokens.push(self.mask_tokens.embeddings().i(index)?);
-            }
-            Tensor::stack(tokens.as_slice(), 0)?.unsqueeze(0)?.expand((
-                batch_size,
-                tokens.len(),
-                self.transformer_dim,
-            ))?
-        };
+        let output_tokens = self.output_tokens.unsqueeze(0)?.expand((
+            batch_size,
+            self.output_token_count,
+            self.transformer_dim,
+        ))?;
         let tokens = Tensor::cat(&[&output_tokens, sparse_prompt_embeddings], 1)?;
 
         let src = if repeat_image {
@@ -392,7 +398,7 @@ impl Sam3TrackerModel {
             Some((coords, labels)) => (coords.clone(), labels.clone()),
             None => (
                 Tensor::zeros((batch_size, 1, 2), DType::F32, device)?,
-                (Tensor::ones((batch_size, 1), DType::F32, device)? * -1f64)?,
+                Tensor::full(-1f32, (batch_size, 1), device)?,
             ),
         };
         let sam_mask_prompt = match mask_inputs {
@@ -434,57 +440,40 @@ impl Sam3TrackerModel {
                 high_res_features,
             )?;
         let object_present = object_score_logits.gt(0f64)?;
-        let gated_low_res_multimasks = object_present
-            .reshape((batch_size, 1, 1, 1))?
-            .broadcast_as(low_res_multimasks.shape())?
-            .where_cond(
-                &low_res_multimasks,
-                &Tensor::full(NO_OBJ_SCORE as f32, low_res_multimasks.shape(), device)?,
-            )?;
-        let high_res_multimasks = gated_low_res_multimasks.upsample_bilinear2d(
-            self.config.image_size,
-            self.config.image_size,
-            false,
-        )?;
         let (low_res_masks, high_res_masks, sam_output_token) = if multimask_output {
             let best_iou_indices = ious.argmax(1)?;
-            let gated_low_res_multimasks = gated_low_res_multimasks.contiguous()?;
-            let high_res_multimasks = high_res_multimasks.contiguous()?;
-            let sam_output_tokens = sam_output_tokens.contiguous()?;
-            let (_, _, low_res_height, low_res_width) = gated_low_res_multimasks.dims4()?;
-            let (_, _, high_res_height, high_res_width) = high_res_multimasks.dims4()?;
+            let (_, _, low_res_height, low_res_width) = low_res_multimasks.dims4()?;
             let low_res_index = best_iou_indices
                 .unsqueeze(1)?
                 .unsqueeze(2)?
                 .unsqueeze(3)?
-                .broadcast_as((batch_size, 1, low_res_height, low_res_width))?
-                .contiguous()?;
-            let high_res_index = best_iou_indices
-                .unsqueeze(1)?
-                .unsqueeze(2)?
-                .unsqueeze(3)?
-                .broadcast_as((batch_size, 1, high_res_height, high_res_width))?
-                .contiguous()?;
-            let low_res_masks = gated_low_res_multimasks.gather(&low_res_index, 1)?;
-            let high_res_masks = high_res_multimasks.gather(&high_res_index, 1)?;
+                .broadcast_as((batch_size, 1, low_res_height, low_res_width))?;
+            let low_res_masks = low_res_multimasks.gather(&low_res_index, 1)?;
             let sam_output_token = if sam_output_tokens.dim(1)? > 1 {
                 let token_width = sam_output_tokens.dim(2)?;
                 let token_index = best_iou_indices
                     .unsqueeze(1)?
                     .unsqueeze(2)?
-                    .broadcast_as((batch_size, 1, token_width))?
-                    .contiguous()?;
+                    .broadcast_as((batch_size, 1, token_width))?;
                 sam_output_tokens.gather(&token_index, 1)?.squeeze(1)?
             } else {
                 sam_output_tokens.i((.., 0, ..))?
             };
+            let low_res_masks = gate_selected_masks(&low_res_masks, &object_present, device)?;
+            let high_res_masks = low_res_masks.upsample_bilinear2d(
+                self.config.image_size,
+                self.config.image_size,
+                false,
+            )?;
             (low_res_masks, high_res_masks, sam_output_token)
         } else {
-            (
-                gated_low_res_multimasks.clone(),
-                high_res_multimasks,
-                sam_output_tokens.i((.., 0, ..))?,
-            )
+            let low_res_masks = gate_selected_masks(&low_res_multimasks, &object_present, device)?;
+            let high_res_masks = low_res_masks.upsample_bilinear2d(
+                self.config.image_size,
+                self.config.image_size,
+                false,
+            )?;
+            (low_res_masks, high_res_masks, sam_output_tokens.i((.., 0, ..))?)
         };
         let obj_ptr = self.obj_ptr_proj.forward(&sam_output_token)?;
         let object_present_for_ptr = object_present
@@ -558,4 +547,14 @@ impl Sam3TrackerModel {
             is_cond_frame,
         })
     }
+}
+
+fn gate_selected_masks(low_res_masks: &Tensor, object_present: &Tensor, device: &Device) -> Result<Tensor> {
+    object_present
+        .reshape((object_present.dim(0)?, 1, 1, 1))?
+        .broadcast_as(low_res_masks.shape())?
+        .where_cond(
+            low_res_masks,
+            &Tensor::full(NO_OBJ_SCORE as f32, low_res_masks.shape(), device)?,
+        )
 }

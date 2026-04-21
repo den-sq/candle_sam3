@@ -1,7 +1,7 @@
 use super::*;
 
 fn normalize_point_coords(coords: &Tensor, device: &Device) -> Result<Tensor> {
-    let coords = coords.to_device(device)?.to_dtype(DType::F32)?;
+    let coords = maybe_to_device_dtype(coords, device, DType::F32)?;
     match coords.rank() {
         2 => coords.unsqueeze(0),
         3 => Ok(coords),
@@ -10,7 +10,7 @@ fn normalize_point_coords(coords: &Tensor, device: &Device) -> Result<Tensor> {
 }
 
 fn normalize_point_labels(labels: &Tensor, device: &Device) -> Result<Tensor> {
-    let labels = labels.to_device(device)?.to_dtype(DType::F32)?;
+    let labels = maybe_to_device_dtype(labels, device, DType::F32)?;
     match labels.rank() {
         1 => labels.unsqueeze(0),
         2 => Ok(labels),
@@ -19,7 +19,7 @@ fn normalize_point_labels(labels: &Tensor, device: &Device) -> Result<Tensor> {
 }
 
 fn normalize_boxes_as_points(boxes_xyxy: &Tensor, device: &Device) -> Result<Tensor> {
-    let boxes_xyxy = boxes_xyxy.to_device(device)?.to_dtype(DType::F32)?;
+    let boxes_xyxy = maybe_to_device_dtype(boxes_xyxy, device, DType::F32)?;
     match boxes_xyxy.rank() {
         1 => boxes_xyxy.reshape((1, 2, 2)),
         2 => boxes_xyxy.reshape((boxes_xyxy.dim(0)?, 2, 2)),
@@ -29,7 +29,7 @@ fn normalize_boxes_as_points(boxes_xyxy: &Tensor, device: &Device) -> Result<Ten
 }
 
 pub(super) fn normalize_mask_prompt(mask: &Tensor, device: &Device) -> Result<Tensor> {
-    let mask = mask.to_device(device)?.to_dtype(DType::F32)?;
+    let mask = maybe_to_device_dtype(mask, device, DType::F32)?;
     match mask.rank() {
         2 => mask.unsqueeze(0)?.unsqueeze(0),
         3 => mask.unsqueeze(1),
@@ -100,8 +100,8 @@ impl Sam3TrackerModel {
         let (_, channels_s1, _, _) = feat_s1.dims4()?;
         if channels_s0 == projected_s0 && channels_s1 == projected_s1 {
             return Ok(vec![
-                feat_s0.to_dtype(compute_dtype)?,
-                feat_s1.to_dtype(compute_dtype)?,
+                maybe_to_dtype(feat_s0, compute_dtype)?,
+                maybe_to_dtype(feat_s1, compute_dtype)?,
             ]);
         }
         if channels_s0 == self.config.hidden_dim && channels_s1 == self.config.hidden_dim {
@@ -112,8 +112,8 @@ impl Sam3TrackerModel {
                 candle::Error::Msg("tracker high-res projection conv_s1 missing".into())
             })?;
             return Ok(vec![
-                feat_s0.apply(conv_s0)?.to_dtype(compute_dtype)?,
-                feat_s1.apply(conv_s1)?.to_dtype(compute_dtype)?,
+                maybe_to_dtype(&feat_s0.apply(conv_s0)?, compute_dtype)?,
+                maybe_to_dtype(&feat_s1.apply(conv_s1)?, compute_dtype)?,
             ]);
         }
         candle::bail!(

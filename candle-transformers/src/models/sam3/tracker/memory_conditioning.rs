@@ -328,12 +328,10 @@ impl Sam3TrackerModel {
                     "conditioning frame {selected_frame} is missing maskmem_pos_enc required for tracker memory conditioning"
                 );
             };
-            let maskmem_features = maskmem_features
-                .to_device(device)?
-                .to_dtype(self.no_obj_ptr.dtype())?;
-            let maskmem_pos_enc = maskmem_pos_enc
-                .to_device(device)?
-                .to_dtype(self.no_obj_ptr.dtype())?;
+            let maskmem_features =
+                maybe_to_device_dtype(maskmem_features, device, self.no_obj_ptr.dtype())?;
+            let maskmem_pos_enc =
+                maybe_to_device_dtype(maskmem_pos_enc, device, self.no_obj_ptr.dtype())?;
             prompt_parts.push(maskmem_features.flatten(2, 3)?.permute((2, 0, 1))?);
             let pos = maskmem_pos_enc.flatten(2, 3)?.permute((2, 0, 1))?;
             let pos = pos.broadcast_add(&self.maskmem_tpos_enc.i(self.config.num_maskmem - 1)?)?;
@@ -386,12 +384,10 @@ impl Sam3TrackerModel {
                     "memory frame {prev_frame_idx} is missing maskmem_pos_enc required for tracker memory conditioning"
                 );
             };
-            let maskmem_features = maskmem_features
-                .to_device(device)?
-                .to_dtype(self.no_obj_ptr.dtype())?;
-            let maskmem_pos_enc = maskmem_pos_enc
-                .to_device(device)?
-                .to_dtype(self.no_obj_ptr.dtype())?;
+            let maskmem_features =
+                maybe_to_device_dtype(maskmem_features, device, self.no_obj_ptr.dtype())?;
+            let maskmem_pos_enc =
+                maybe_to_device_dtype(maskmem_pos_enc, device, self.no_obj_ptr.dtype())?;
             prompt_parts.push(maskmem_features.flatten(2, 3)?.permute((2, 0, 1))?);
             let pos = maskmem_pos_enc.flatten(2, 3)?.permute((2, 0, 1))?;
             let pos = pos.broadcast_add(
