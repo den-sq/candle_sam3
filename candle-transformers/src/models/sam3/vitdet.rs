@@ -156,25 +156,22 @@ impl Sam3VisionAttention {
             .qkv
             .forward(&hidden_states.contiguous()?)?
             .reshape((batch_size, seq_len, 3, self.num_heads, self.head_dim))?
-            .permute((2, 0, 3, 1, 4))?;
-        let q = qkv.i(0)?.contiguous()?;
-        let k = qkv.i(1)?.contiguous()?;
-        let v = qkv.i(2)?.contiguous()?;
-        let (q, k) = self.rotary_emb.apply(&q, &k)?;
-        let q = q
-            .to_dtype(DType::F32)?
-            .broadcast_mul(&self.scale)?
+            .permute((2, 0, 3, 1, 4))?
             .contiguous()?;
-        let k = k.to_dtype(DType::F32)?.contiguous()?;
-        let v = v.to_dtype(DType::F32)?.contiguous()?;
+        let q = qkv.i(0)?;
+        let k = qkv.i(1)?;
+        let v = qkv.i(2)?;
+        let (q, k) = self.rotary_emb.apply(&q, &k)?;
+        let q = q.to_dtype(DType::F32)?.broadcast_mul(&self.scale)?;
+        let k = k.to_dtype(DType::F32)?;
+        let v = v.to_dtype(DType::F32)?;
         let attn = q.matmul(&k.transpose(2, 3)?)?;
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
         let hidden_states = attn
             .matmul(&v)?
             .to_dtype(in_dtype)?
             .transpose(1, 2)?
-            .reshape((batch_size, height, width, channels))?
-            .contiguous()?;
+            .reshape((batch_size, height, width, channels))?;
         self.proj.forward(&hidden_states)
     }
 }
