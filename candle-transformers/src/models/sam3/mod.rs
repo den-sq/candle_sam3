@@ -27,6 +27,7 @@ mod image;
 mod neck;
 mod segmentation;
 mod text;
+pub(crate) mod torch_ops;
 mod tracker;
 mod video;
 mod vitdet;
