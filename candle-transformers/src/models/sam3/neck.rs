@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use candle::{Result, Tensor};
 use candle_nn::{Conv2d, Conv2dConfig, ConvTranspose2d, ConvTranspose2dConfig, Module, VarBuilder};
 
@@ -163,6 +166,16 @@ pub struct Sam3DualViTDetNeck {
     config: NeckConfig,
     stages: Vec<FeaturePyramidStage>,
     sam2_stages: Option<Vec<FeaturePyramidStage>>,
+    position_encoding_cache: Mutex<HashMap<PositionEncodingCacheKey, Tensor>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PositionEncodingCacheKey {
+    device: String,
+    dtype: String,
+    d_model: usize,
+    height: usize,
+    width: usize,
 }
 
 impl Sam3DualViTDetNeck {
@@ -177,6 +190,7 @@ impl Sam3DualViTDetNeck {
             config: config.clone(),
             stages,
             sam2_stages,
+            position_encoding_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -190,7 +204,7 @@ impl Sam3DualViTDetNeck {
         };
         let feature_map = feature_map.permute((0, 3, 1, 2))?;
         let backbone_fpn = self.forward_branch(&self.stages, &feature_map)?;
-        let vision_pos_enc = build_position_encodings(&backbone_fpn, self.config.d_model)?;
+        let vision_pos_enc = self.build_position_encodings(&backbone_fpn, self.config.d_model)?;
         let (sam2_backbone_fpn, sam2_pos_enc) = match &self.sam2_stages {
             Some(stages) => {
                 let branch = self.forward_branch(stages, &feature_map)?;
@@ -226,6 +240,57 @@ impl Sam3DualViTDetNeck {
         levels.truncate(levels.len() - self.config.scalp);
         Ok(levels)
     }
+
+    fn build_position_encodings(&self, features: &[Tensor], d_model: usize) -> Result<Vec<Tensor>> {
+        let mut encodings = Vec::with_capacity(features.len());
+        for feature in features {
+            encodings.push(self.cached_2d_sine_position_encoding(feature, d_model)?);
+        }
+        Ok(encodings)
+    }
+
+    fn cached_2d_sine_position_encoding(&self, feature: &Tensor, d_model: usize) -> Result<Tensor> {
+        let (batch_size, channels, height, width) = feature.dims4()?;
+        if channels != d_model {
+            candle::bail!("sam3 neck expected projected feature width {d_model}, got {channels}")
+        }
+        let key = PositionEncodingCacheKey {
+            device: format!("{:?}", feature.device()),
+            dtype: format!("{:?}", feature.dtype()),
+            d_model,
+            height,
+            width,
+        };
+        let cached = {
+            let cache = self
+                .position_encoding_cache
+                .lock()
+                .expect("neck cache lock poisoned");
+            cache.get(&key).cloned()
+        };
+        let base = match cached {
+            Some(tensor) => tensor,
+            None => {
+                let base = build_2d_sine_position_encoding_base(
+                    feature.device(),
+                    feature.dtype(),
+                    d_model,
+                    height,
+                    width,
+                )?;
+                let mut cache = self
+                    .position_encoding_cache
+                    .lock()
+                    .expect("neck cache lock poisoned");
+                cache.entry(key).or_insert_with(|| base.clone()).clone()
+            }
+        };
+        if batch_size == 1 {
+            Ok(base)
+        } else {
+            base.repeat((batch_size, 1, 1, 1))
+        }
+    }
 }
 
 fn build_stages(config: &NeckConfig, vb: VarBuilder) -> Result<Vec<FeaturePyramidStage>> {
@@ -258,19 +323,13 @@ fn stage_input_channels(kind: PyramidStageKind, d_model: usize) -> Result<usize>
     }
 }
 
-fn build_position_encodings(features: &[Tensor], d_model: usize) -> Result<Vec<Tensor>> {
-    let mut encodings = Vec::with_capacity(features.len());
-    for feature in features {
-        encodings.push(build_2d_sine_position_encoding(feature, d_model)?);
-    }
-    Ok(encodings)
-}
-
-fn build_2d_sine_position_encoding(feature: &Tensor, d_model: usize) -> Result<Tensor> {
-    let (batch_size, channels, height, width) = feature.dims4()?;
-    if channels != d_model {
-        candle::bail!("sam3 neck expected projected feature width {d_model}, got {channels}")
-    }
+fn build_2d_sine_position_encoding_base(
+    device: &candle::Device,
+    dtype: candle::DType,
+    d_model: usize,
+    height: usize,
+    width: usize,
+) -> Result<Tensor> {
     if d_model % 2 != 0 {
         candle::bail!("sam3 neck position encoding requires even d_model, got {d_model}")
     }
@@ -278,8 +337,6 @@ fn build_2d_sine_position_encoding(feature: &Tensor, d_model: usize) -> Result<T
     if num_pos_feats % 2 != 0 {
         candle::bail!("sam3 neck position encoding requires d_model divisible by 4, got {d_model}")
     }
-    let device = feature.device();
-    let dtype = feature.dtype();
     let temperature = 10_000f32;
     let scale = 2.0 * std::f32::consts::PI;
     let eps = 1e-6f32;
@@ -312,7 +369,7 @@ fn build_2d_sine_position_encoding(feature: &Tensor, d_model: usize) -> Result<T
         }
     }
     let encoding = Tensor::from_slice(&encoding, (1, d_model, height, width), device)?;
-    encoding.repeat((batch_size, 1, 1, 1))?.to_dtype(dtype)
+    encoding.to_dtype(dtype)
 }
 
 #[cfg(test)]

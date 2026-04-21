@@ -114,6 +114,10 @@ struct Args {
     #[arg(long, default_value = "2")]
     video_max_feature_cache_entries: usize,
 
+    /// Offload decoded video frames to CPU storage when possible.
+    #[arg(long)]
+    video_offload_frames_to_cpu: bool,
+
     /// Offload finalized video state tensors to CPU storage when possible.
     #[arg(long)]
     video_offload_state_to_cpu: bool,
@@ -2678,7 +2682,8 @@ pub fn main() -> anyhow::Result<()> {
             prefetch_ahead: args.video_prefetch_ahead,
             prefetch_behind: args.video_prefetch_behind,
             max_feature_cache_entries: args.video_max_feature_cache_entries,
-            offload_state_to_cpu: args.video_offload_state_to_cpu || !args.cpu,
+            offload_frames_to_cpu: args.video_offload_frames_to_cpu,
+            offload_state_to_cpu: args.video_offload_state_to_cpu,
             debug_bundle: args.video_debug_bundle,
             debug_obj_ids: args.video_debug_obj_ids.clone(),
             debug_frame_indices: args.video_debug_frames.clone(),

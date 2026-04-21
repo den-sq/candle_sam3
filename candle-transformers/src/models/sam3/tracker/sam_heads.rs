@@ -447,30 +447,38 @@ impl Sam3TrackerModel {
             false,
         )?;
         let (low_res_masks, high_res_masks, sam_output_token) = if multimask_output {
-            let best_iou_indices = ious.argmax(1)?.to_vec1::<u32>()?;
-            let mut low_res_masks = Vec::with_capacity(best_iou_indices.len());
-            let mut high_res_masks = Vec::with_capacity(best_iou_indices.len());
-            let mut sam_output_tokens_best = Vec::with_capacity(best_iou_indices.len());
-            for (batch_index, best_index) in best_iou_indices.into_iter().enumerate() {
-                let best_index = best_index as usize;
-                low_res_masks.push(gated_low_res_multimasks.i((
-                    batch_index,
-                    best_index,
-                    ..,
-                    ..,
-                ))?);
-                high_res_masks.push(high_res_multimasks.i((batch_index, best_index, .., ..))?);
-                sam_output_tokens_best.push(if sam_output_tokens.dim(1)? > 1 {
-                    sam_output_tokens.i((batch_index, best_index, ..))?
-                } else {
-                    sam_output_tokens.i((batch_index, 0, ..))?
-                });
-            }
-            (
-                Tensor::stack(low_res_masks.as_slice(), 0)?.unsqueeze(1)?,
-                Tensor::stack(high_res_masks.as_slice(), 0)?.unsqueeze(1)?,
-                Tensor::stack(sam_output_tokens_best.as_slice(), 0)?,
-            )
+            let best_iou_indices = ious.argmax(1)?;
+            let gated_low_res_multimasks = gated_low_res_multimasks.contiguous()?;
+            let high_res_multimasks = high_res_multimasks.contiguous()?;
+            let sam_output_tokens = sam_output_tokens.contiguous()?;
+            let (_, _, low_res_height, low_res_width) = gated_low_res_multimasks.dims4()?;
+            let (_, _, high_res_height, high_res_width) = high_res_multimasks.dims4()?;
+            let low_res_index = best_iou_indices
+                .unsqueeze(1)?
+                .unsqueeze(2)?
+                .unsqueeze(3)?
+                .broadcast_as((batch_size, 1, low_res_height, low_res_width))?
+                .contiguous()?;
+            let high_res_index = best_iou_indices
+                .unsqueeze(1)?
+                .unsqueeze(2)?
+                .unsqueeze(3)?
+                .broadcast_as((batch_size, 1, high_res_height, high_res_width))?
+                .contiguous()?;
+            let low_res_masks = gated_low_res_multimasks.gather(&low_res_index, 1)?;
+            let high_res_masks = high_res_multimasks.gather(&high_res_index, 1)?;
+            let sam_output_token = if sam_output_tokens.dim(1)? > 1 {
+                let token_width = sam_output_tokens.dim(2)?;
+                let token_index = best_iou_indices
+                    .unsqueeze(1)?
+                    .unsqueeze(2)?
+                    .broadcast_as((batch_size, 1, token_width))?
+                    .contiguous()?;
+                sam_output_tokens.gather(&token_index, 1)?.squeeze(1)?
+            } else {
+                sam_output_tokens.i((.., 0, ..))?
+            };
+            (low_res_masks, high_res_masks, sam_output_token)
         } else {
             (
                 gated_low_res_multimasks.clone(),

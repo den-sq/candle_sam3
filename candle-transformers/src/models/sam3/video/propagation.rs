@@ -1,4 +1,5 @@
 use super::*;
+use crate::models::sam3::torch_ops::tensor::first_scalar_f32;
 
 #[derive(Debug, Clone)]
 pub struct SessionPrompt {
@@ -162,13 +163,7 @@ impl ObjectFrameOutput {
     }
 
     pub(super) fn score_value(&self) -> Result<f32> {
-        Ok(self
-            .scores
-            .flatten_all()?
-            .to_vec1::<f32>()?
-            .into_iter()
-            .next()
-            .unwrap_or(0.0))
+        first_scalar_f32(&self.scores)
     }
 
     pub(super) fn to_storage_device(&self, storage_device: &Device) -> Result<Self> {

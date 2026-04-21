@@ -1,5 +1,5 @@
 use super::*;
-use crate::models::sam3::torch_ops::tensor::repeat_interleave;
+use crate::models::sam3::torch_ops::tensor::{first_scalar_f32, repeat_interleave};
 
 #[derive(Debug)]
 pub(super) struct PreparedMemoryConditioning {
@@ -28,18 +28,8 @@ impl Sam3TrackerModel {
         if object_score_logits.dim(1)? > 1 || iou_score.dim(1)? > 1 {
             candle::bail!("tracker frame filter only supports one object");
         }
-        let object_score = candle_nn::ops::sigmoid(object_score_logits)?
-            .flatten_all()?
-            .to_vec1::<f32>()?
-            .into_iter()
-            .next()
-            .unwrap_or(0.0);
-        let iou_score = iou_score
-            .flatten_all()?
-            .to_vec1::<f32>()?
-            .into_iter()
-            .next()
-            .unwrap_or(0.0);
+        let object_score = first_scalar_f32(&candle_nn::ops::sigmoid(object_score_logits)?)?;
+        let iou_score = first_scalar_f32(iou_score)?;
         Ok(object_score * iou_score)
     }
 

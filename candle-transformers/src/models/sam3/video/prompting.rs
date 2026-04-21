@@ -1,5 +1,46 @@
 use super::*;
 
+fn select_best_grounding_query(
+    scores: &Tensor,
+    boxes_xyxy: &Tensor,
+    mask_logits: &Tensor,
+    presence_scores: Option<&Tensor>,
+) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
+    let best_idx = scores.argmax(1)?;
+    let batch_size = scores.dim(0)?;
+    let num_box_coords = boxes_xyxy.dim(2)?;
+    let mask_height = mask_logits.dim(2)?;
+    let mask_width = mask_logits.dim(3)?;
+    let score_index = best_idx
+        .unsqueeze(2)?
+        .broadcast_as((batch_size, 1, scores.dim(2)?))?
+        .contiguous()?;
+    let box_index = best_idx
+        .unsqueeze(2)?
+        .broadcast_as((batch_size, 1, num_box_coords))?
+        .contiguous()?;
+    let mask_index = best_idx
+        .unsqueeze(2)?
+        .unsqueeze(3)?
+        .broadcast_as((batch_size, 1, mask_height, mask_width))?
+        .contiguous()?;
+    let best_score = scores.contiguous()?.gather(&score_index, 1)?.squeeze(1)?;
+    let best_box = boxes_xyxy.contiguous()?.gather(&box_index, 1)?.squeeze(1)?;
+    let best_mask_logits = mask_logits
+        .contiguous()?
+        .gather(&mask_index, 1)?
+        .squeeze(1)?;
+    let best_presence = presence_scores
+        .map(|tensor| {
+            tensor
+                .contiguous()?
+                .gather(&best_idx.contiguous()?, 1)?
+                .squeeze(1)
+        })
+        .transpose()?;
+    Ok((best_score, best_box, best_mask_logits, best_presence))
+}
+
 pub(super) fn load_tokenizer(path: &Path, context_length: usize) -> Result<Tokenizer> {
     let tokenizer_path = if path.is_dir() {
         path.join("tokenizer.json")
@@ -82,26 +123,19 @@ pub(super) fn ground_from_encoded_prompt(
     let decoder = model.decode_grounding(&fused, prompt)?;
     let segmentation = model.segment_grounding(visual_features, &decoder, &fused, prompt)?;
     let scores = model.text_detection_scores(&decoder)?;
-    let best_idx = scores
-        .argmax(1)?
-        .flatten_all()?
-        .to_vec1::<u32>()?
-        .into_iter()
-        .next()
-        .unwrap_or(0) as usize;
-    let best_score = scores.i((0, best_idx))?;
-    let best_box = decoder.pred_boxes_xyxy.i((0, best_idx))?;
-    let mask_logits = segmentation.mask_logits.i((0, best_idx))?;
+    let (best_score, best_box, mask_logits, best_presence) = select_best_grounding_query(
+        &scores,
+        &decoder.pred_boxes_xyxy,
+        &segmentation.mask_logits,
+        segmentation.presence_logits.as_ref(),
+    )?;
     let mask = candle_nn::ops::sigmoid(&mask_logits)?;
     Ok(GroundingOutput {
-        mask_logits: mask_logits.unsqueeze(0)?,
-        masks: mask.unsqueeze(0)?,
-        boxes_xyxy: best_box.unsqueeze(0)?,
-        scores: best_score.unsqueeze(0)?,
-        presence_scores: segmentation
-            .presence_logits
-            .as_ref()
-            .and_then(|tensor| tensor.i((0, best_idx)).ok()),
+        mask_logits,
+        masks: mask,
+        boxes_xyxy: best_box,
+        scores: best_score,
+        presence_scores: best_presence,
     })
 }
 

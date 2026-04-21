@@ -5,8 +5,23 @@ pub(crate) fn resize_bilinear2d_antialias(
     out_h: usize,
     out_w: usize,
 ) -> Result<Tensor> {
-    let input_cpu = input.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-    let (batch, channels, in_h, in_w) = input_cpu.dims4()?;
+    let input_f32 = input.to_dtype(DType::F32)?;
+    let (batch, channels, in_h, in_w) = input_f32.dims4()?;
+    if in_h == out_h && in_w == out_w {
+        return Ok(input_f32);
+    }
+    if out_h >= in_h && out_w >= in_w {
+        return input_f32.upsample_bilinear2d(out_h, out_w, false);
+    }
+    if in_h % out_h == 0 && in_w % out_w == 0 {
+        let stride_h = in_h / out_h;
+        let stride_w = in_w / out_w;
+        if stride_h > 0 && stride_w > 0 {
+            return input_f32.avg_pool2d_with_stride((stride_h, stride_w), (stride_h, stride_w));
+        }
+    }
+
+    let input_cpu = input_f32.to_device(&Device::Cpu)?;
     let input_vec = input_cpu.flatten_all()?.to_vec1::<f32>()?;
     let width_weights = antialias_linear_weights(in_w, out_w);
     let height_weights = antialias_linear_weights(in_h, out_h);

@@ -61,8 +61,8 @@ impl Default for VideoSessionOptions {
     fn default() -> Self {
         Self {
             tokenizer_path: None,
-            offload_frames_to_cpu: true,
-            offload_state_to_cpu: true,
+            offload_frames_to_cpu: false,
+            offload_state_to_cpu: false,
             prefetch_ahead: 2,
             prefetch_behind: 1,
             max_feature_cache_entries: 2,

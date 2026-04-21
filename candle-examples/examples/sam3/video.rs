@@ -36,6 +36,7 @@ pub struct VideoMode {
     pub prefetch_ahead: usize,
     pub prefetch_behind: usize,
     pub max_feature_cache_entries: usize,
+    pub offload_frames_to_cpu: bool,
     pub offload_state_to_cpu: bool,
     pub debug_bundle: bool,
     pub debug_obj_ids: Vec<u32>,
@@ -315,7 +316,7 @@ pub fn run_video_prediction(
     let source = sam3::VideoSource::from_path(&video_mode.video_path)?;
     let session_options = sam3::VideoSessionOptions {
         tokenizer_path: video_mode.tokenizer_path.as_ref().map(PathBuf::from),
-        offload_frames_to_cpu: true,
+        offload_frames_to_cpu: video_mode.offload_frames_to_cpu,
         offload_state_to_cpu: video_mode.offload_state_to_cpu,
         prefetch_ahead: video_mode.prefetch_ahead,
         prefetch_behind: video_mode.prefetch_behind,
@@ -563,6 +564,7 @@ pub fn run_video_reference_comparison(
         prefetch_ahead: 2,
         prefetch_behind: 1,
         max_feature_cache_entries: 2,
+        offload_frames_to_cpu: false,
         offload_state_to_cpu: false,
         debug_bundle,
         debug_obj_ids,

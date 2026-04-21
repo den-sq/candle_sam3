@@ -1,4 +1,5 @@
 use super::*;
+use crate::models::sam3::torch_ops::tensor::{first_scalar_f32, flatten_all_contiguous};
 
 impl<'a> Sam3VideoTrackerCore<'a> {
     pub(super) fn postprocess_output(
@@ -74,7 +75,17 @@ impl<'a> Sam3VideoTrackerCore<'a> {
                 .into_iter()
                 .map(|output| {
                     let plane = mask_to_bool_plane(&output.masks, output_threshold)?;
-                    rebuild_object_output_from_binary_plane(&output, &plane)
+                    let height = plane.len();
+                    let width = plane.first().map(Vec::len).unwrap_or(0);
+                    let data = plane
+                        .iter()
+                        .flat_map(|row| {
+                            row.iter().map(|value| if *value { 1.0f32 } else { 0.0f32 })
+                        })
+                        .collect::<Vec<_>>();
+                    let binary_mask =
+                        Tensor::from_vec(data, (1, height, width), output.masks.device())?;
+                    rebuild_object_output_from_binary_mask(&output, &binary_mask)
                 })
                 .collect::<Result<Vec<_>>>()?
         };
@@ -134,31 +145,23 @@ pub(super) fn apply_prompt_frame_output_postprocess(
 
 pub(super) fn object_presence_score(output: &ObjectFrameOutput) -> Result<f32> {
     if let Some(presence_scores) = output.presence_scores.as_ref() {
-        Ok(presence_scores
-            .flatten_all()?
-            .to_vec1::<f32>()?
-            .into_iter()
-            .next()
-            .unwrap_or(0.0))
+        first_scalar_f32(presence_scores)
     } else {
         output.score_value()
     }
 }
 
 pub(super) fn tracker_state_presence_score(state: &TrackerFrameState) -> Result<f32> {
-    Ok(candle_nn::ops::sigmoid(&state.object_score_logits)?
-        .flatten_all()?
-        .to_vec1::<f32>()?
-        .into_iter()
-        .next()
-        .unwrap_or(0.0))
+    first_scalar_f32(&candle_nn::ops::sigmoid(&state.object_score_logits)?)
 }
 
 pub(super) fn mask_has_foreground(mask: &Tensor, threshold: f32) -> Result<bool> {
-    Ok(mask_to_bool_plane(mask, threshold)?
-        .into_iter()
-        .flatten()
-        .any(|value| value))
+    Ok(mask
+        .ge(threshold as f64)?
+        .to_dtype(DType::F32)?
+        .max_all()?
+        .to_scalar::<f32>()?
+        > 0.0)
 }
 
 fn object_has_detectable_output(output: &ObjectFrameOutput, threshold: f32) -> Result<bool> {
@@ -172,26 +175,20 @@ fn binary_mask_logits(mask: &Tensor) -> Result<Tensor> {
 }
 
 fn canonicalize_single_score_tensor(tensor: &Tensor) -> Result<Tensor> {
-    let value = tensor
-        .flatten_all()?
-        .to_vec1::<f32>()?
-        .into_iter()
-        .next()
-        .unwrap_or(0.0);
-    Tensor::from_vec(vec![value], (1,), tensor.device())
+    flatten_all_contiguous(tensor)?.reshape((tensor.elem_count(),))
 }
 
-fn rebuild_object_output_from_binary_plane(
+fn rebuild_object_output_from_binary_mask(
     output: &ObjectFrameOutput,
-    plane: &[Vec<bool>],
+    binary_mask: &Tensor,
 ) -> Result<ObjectFrameOutput> {
-    let height = plane.len();
-    let width = plane.first().map(Vec::len).unwrap_or(0);
-    let data = plane
-        .iter()
-        .flat_map(|row| row.iter().map(|value| if *value { 1.0f32 } else { 0.0f32 }))
-        .collect::<Vec<_>>();
-    let binary_mask = Tensor::from_vec(data, (1, height, width), output.masks.device())?;
+    let binary_mask = match binary_mask.rank() {
+        4 => binary_mask.clone(),
+        3 => binary_mask.unsqueeze(0)?,
+        2 => binary_mask.unsqueeze(0)?.unsqueeze(0)?,
+        rank => candle::bail!("expected binary mask rank 2, 3, or 4, got {}", rank),
+    }
+    .to_dtype(DType::F32)?;
     Ok(ObjectFrameOutput {
         obj_id: output.obj_id,
         mask_logits: binary_mask.clone(),
@@ -215,42 +212,37 @@ fn apply_object_wise_non_overlapping_constraints(
     if outputs.len() <= 1 {
         return Ok(outputs.to_vec());
     }
-    let mut planes = outputs
-        .iter()
-        .map(|output| mask_to_bool_plane(&output.masks, threshold))
-        .collect::<Result<Vec<_>>>()?;
-    let height = planes.first().map(Vec::len).unwrap_or(0);
-    let width = planes
-        .first()
-        .and_then(|plane| plane.first().map(Vec::len))
-        .unwrap_or(0);
-    for row in 0..height {
-        for col in 0..width {
-            let mut winner = None;
-            let mut winner_score = f32::NEG_INFINITY;
-            for (idx, plane) in planes.iter().enumerate() {
-                if !plane[row][col] {
-                    continue;
-                }
-                let score = scores[idx];
-                if winner.is_none() || score >= winner_score {
-                    winner = Some(idx);
-                    winner_score = score;
-                }
-            }
-            if let Some(winner_idx) = winner {
-                for (idx, plane) in planes.iter_mut().enumerate() {
-                    if idx != winner_idx {
-                        plane[row][col] = false;
-                    }
-                }
-            }
-        }
+    let device = outputs[0].masks.device();
+    let mut mask_tensors = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        let mask = match output.masks.rank() {
+            4 => output.masks.clone(),
+            3 => output.masks.unsqueeze(1)?,
+            2 => output.masks.unsqueeze(0)?.unsqueeze(0)?,
+            rank => candle::bail!("expected mask rank 2, 3, or 4, got {}", rank),
+        };
+        mask_tensors.push(mask);
     }
+    let mask_refs = mask_tensors.iter().collect::<Vec<_>>();
+    let mask_stack = Tensor::cat(&mask_refs, 0)?.contiguous()?;
+    let mask_present = mask_stack.ge(threshold as f64)?;
+    let score_tensor = Tensor::from_vec(scores.to_vec(), (outputs.len(), 1, 1, 1), device)?;
+    let scored_masks = mask_present.where_cond(
+        &score_tensor.broadcast_as(mask_stack.shape())?,
+        &Tensor::full(f32::NEG_INFINITY, mask_stack.shape(), device)?,
+    )?;
+    let winner_idx = scored_masks.argmax_keepdim(0)?;
+    let object_idx =
+        Tensor::arange(0u32, outputs.len() as u32, device)?.reshape((outputs.len(), 1, 1, 1))?;
+    let keep = object_idx.broadcast_eq(&winner_idx.broadcast_as(mask_stack.shape())?)?;
+    let binary_masks = keep.where_cond(
+        &mask_present.to_dtype(DType::F32)?,
+        &Tensor::zeros(mask_stack.shape(), DType::F32, device)?,
+    )?;
     outputs
         .iter()
-        .zip(planes.iter())
-        .map(|(output, plane)| rebuild_object_output_from_binary_plane(output, plane))
+        .enumerate()
+        .map(|(idx, output)| rebuild_object_output_from_binary_mask(output, &binary_masks.i(idx)?))
         .collect()
 }
 
@@ -261,41 +253,41 @@ pub(super) fn mask_to_normalized_xyxy(mask: &Tensor) -> Result<Tensor> {
         2 => mask.clone(),
         rank => candle::bail!("expected mask rank 2, 3, or 4, got {}", rank),
     };
-    let values = mask.ge(0.5f32)?.to_vec2::<u8>()?;
-    if values.is_empty() || values[0].is_empty() {
+    let (height, width) = mask.dims2()?;
+    if height == 0 || width == 0 {
         return Tensor::zeros((1, 4), DType::F32, mask.device());
     }
-    let height = values.len();
-    let width = values[0].len();
-    let mut min_x = width;
-    let mut min_y = height;
-    let mut max_x = 0usize;
-    let mut max_y = 0usize;
-    let mut any = false;
-    for (y, row) in values.iter().enumerate() {
-        for (x, value) in row.iter().enumerate() {
-            if *value != 0 {
-                any = true;
-                min_x = min_x.min(x);
-                min_y = min_y.min(y);
-                max_x = max_x.max(x);
-                max_y = max_y.max(y);
-            }
-        }
-    }
-    if !any {
+    let binary = mask.ge(0.5f32)?.to_dtype(DType::F32)?;
+    let row_any = binary.max(candle::D::Minus1)?;
+    let col_any = binary.max(candle::D::Minus2)?;
+    if row_any.max_all()?.to_scalar::<f32>()? <= 0.0 {
         return Tensor::zeros((1, 4), DType::F32, mask.device());
     }
-    Tensor::from_vec(
-        vec![
-            min_x as f32 / width.max(1) as f32,
-            min_y as f32 / height.max(1) as f32,
-            (max_x + 1) as f32 / width.max(1) as f32,
-            (max_y + 1) as f32 / height.max(1) as f32,
-        ],
-        (1, 4),
-        mask.device(),
-    )
+    let width_scale = width.max(1) as f64;
+    let height_scale = height.max(1) as f64;
+    let min_x = col_any
+        .argmax(0)?
+        .to_dtype(DType::F32)?
+        .reshape((1,))?
+        .affine(1.0 / width_scale, 0.0)?;
+    let min_y = row_any
+        .argmax(0)?
+        .to_dtype(DType::F32)?
+        .reshape((1,))?
+        .affine(1.0 / height_scale, 0.0)?;
+    let max_x = col_any
+        .flip(&[0])?
+        .argmax(0)?
+        .to_dtype(DType::F32)?
+        .reshape((1,))?
+        .affine(-1.0 / width_scale, 1.0)?;
+    let max_y = row_any
+        .flip(&[0])?
+        .argmax(0)?
+        .to_dtype(DType::F32)?
+        .reshape((1,))?
+        .affine(-1.0 / height_scale, 1.0)?;
+    Tensor::stack(&[&min_x, &min_y, &max_x, &max_y], 0)?.reshape((1, 4))
 }
 
 pub(super) fn resize_mask_logits_to_video(
@@ -326,8 +318,7 @@ pub(super) fn resize_mask_probs(
 }
 
 fn canonicalize_score_tensor(scores: &Tensor) -> Result<Tensor> {
-    let values = scores.flatten_all()?.to_vec1::<f32>()?;
-    Tensor::from_vec(values, (scores.elem_count(),), scores.device())
+    flatten_all_contiguous(scores)?.reshape((scores.elem_count(),))
 }
 
 fn score_tensor_from_value(score: f32, device: &Device) -> Result<Tensor> {
@@ -353,8 +344,15 @@ pub(super) fn postprocess_low_res_mask_logits_for_video(
     if max_area == 0 {
         return Ok(mask_logits.clone());
     }
+    if matches!(mask_logits.device(), Device::Cpu) {
+        return postprocess_low_res_mask_logits_on_cpu(mask_logits, max_area);
+    }
     let device = mask_logits.device().clone();
     let mask_logits = mask_logits.to_device(&Device::Cpu)?;
+    postprocess_low_res_mask_logits_on_cpu(&mask_logits, max_area)?.to_device(&device)
+}
+
+fn postprocess_low_res_mask_logits_on_cpu(mask_logits: &Tensor, max_area: usize) -> Result<Tensor> {
     let (batch, channel, height, width) = mask_logits.dims4()?;
     let mut processed = Vec::with_capacity(batch * channel * height * width);
 
@@ -367,7 +365,7 @@ pub(super) fn postprocess_low_res_mask_logits_for_video(
         }
     }
 
-    Tensor::from_vec(processed, (batch, channel, height, width), &Device::Cpu)?.to_device(&device)
+    Tensor::from_vec(processed, (batch, channel, height, width), &Device::Cpu)
 }
 
 fn fill_small_holes_in_plane(plane: &mut [Vec<f32>], height: usize, width: usize, max_area: usize) {
