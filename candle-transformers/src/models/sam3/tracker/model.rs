@@ -185,6 +185,39 @@ impl Sam3TrackerModel {
         use_prev_mem_frame: bool,
         run_mem_encoder: bool,
     ) -> Result<TrackerStepOutput> {
+        self.track_frame_with_storage_device(
+            visual,
+            frame_idx,
+            num_frames,
+            point_coords,
+            point_labels,
+            boxes_xyxy,
+            mask_input,
+            history,
+            is_conditioning_frame,
+            reverse,
+            use_prev_mem_frame,
+            run_mem_encoder,
+            None,
+        )
+    }
+
+    pub fn track_frame_with_storage_device(
+        &self,
+        visual: &VisualBackboneOutput,
+        frame_idx: usize,
+        num_frames: usize,
+        point_coords: Option<&Tensor>,
+        point_labels: Option<&Tensor>,
+        boxes_xyxy: Option<&Tensor>,
+        mask_input: Option<&Tensor>,
+        history: &BTreeMap<usize, TrackerFrameState>,
+        is_conditioning_frame: bool,
+        reverse: bool,
+        use_prev_mem_frame: bool,
+        run_mem_encoder: bool,
+        storage_device: Option<&Device>,
+    ) -> Result<TrackerStepOutput> {
         if visual.backbone_fpn.is_empty() {
             candle::bail!("tracker requires at least one visual feature level")
         }
@@ -254,13 +287,12 @@ impl Sam3TrackerModel {
             )?;
             prompt_frame_indices = prepared.selected_conditioning_frame_indices;
             memory_frame_indices = prepared.selected_memory_frame_indices;
-            prepared.pix_feat_with_mem.to_dtype(compute_dtype)?
+            maybe_to_dtype(&prepared.pix_feat_with_mem, compute_dtype)?
         } else {
-            visual
-                .backbone_fpn
-                .last()
-                .expect("checked non-empty above")
-                .to_dtype(compute_dtype)?
+            maybe_to_dtype(
+                visual.backbone_fpn.last().expect("checked non-empty above"),
+                compute_dtype,
+            )?
         };
         if let Some(mask_input) = mask_input {
             let mut state = self.use_mask_as_output(
@@ -278,7 +310,7 @@ impl Sam3TrackerModel {
                 )?;
                 state.maskmem_features = Some(maskmem_features);
                 state.maskmem_pos_enc = Some(maskmem_pos_enc);
-                state = self.maybe_offload_state_for_eval(state)?;
+                state = self.maybe_offload_state_for_eval(state, storage_device)?;
             }
             return Ok(TrackerStepOutput {
                 state,
@@ -314,7 +346,7 @@ impl Sam3TrackerModel {
             )?;
             state.maskmem_features = Some(maskmem_features);
             state.maskmem_pos_enc = Some(maskmem_pos_enc);
-            state = self.maybe_offload_state_for_eval(state)?;
+            state = self.maybe_offload_state_for_eval(state, storage_device)?;
         }
         Ok(TrackerStepOutput {
             state,
@@ -346,12 +378,14 @@ impl Sam3TrackerModel {
         object_score_logits: &Tensor,
         is_mask_from_pts: bool,
     ) -> Result<(Tensor, Tensor)> {
-        let pix_feat = pix_feat.to_dtype(self.no_obj_ptr.dtype())?;
+        let pix_feat = maybe_to_dtype(pix_feat, self.no_obj_ptr.dtype())?;
         let mut pred_masks_high_res =
             normalize_mask_prompt(pred_masks_high_res, pix_feat.device())?;
-        let object_score_logits = object_score_logits
-            .to_device(pix_feat.device())?
-            .to_dtype(self.no_obj_ptr.dtype())?;
+        let object_score_logits = maybe_to_device_dtype(
+            object_score_logits,
+            pix_feat.device(),
+            self.no_obj_ptr.dtype(),
+        )?;
         if self.config.non_overlap_masks_for_mem_enc {
             pred_masks_high_res = self.apply_non_overlapping_constraints(&pred_masks_high_res)?;
         }
@@ -360,28 +394,29 @@ impl Sam3TrackerModel {
         } else {
             candle_nn::ops::sigmoid(&pred_masks_high_res)?
         };
-        if self.config.sigmoid_scale_for_mem_enc != 1.0 {
-            mask_for_mem =
-                mask_for_mem.affine(self.config.sigmoid_scale_for_mem_enc as f64, 0.0)?;
-        }
-        if self.config.sigmoid_bias_for_mem_enc != 0.0 {
-            mask_for_mem = mask_for_mem.affine(1.0, self.config.sigmoid_bias_for_mem_enc as f64)?;
+        if self.config.sigmoid_scale_for_mem_enc != 1.0
+            || self.config.sigmoid_bias_for_mem_enc != 0.0
+        {
+            mask_for_mem = mask_for_mem.affine(
+                self.config.sigmoid_scale_for_mem_enc as f64,
+                self.config.sigmoid_bias_for_mem_enc as f64,
+            )?;
         }
         let (mut maskmem_features, maskmem_pos_enc) =
             self.maskmem_backbone
                 .forward(&pix_feat, &mask_for_mem, true)?;
-        let appearing = object_score_logits
-            .gt(0f64)?
-            .to_dtype(maskmem_features.dtype())?
-            .affine(-1.0, 1.0)?;
-        let no_obj_embed = self
-            .no_obj_embed_spatial
-            .to_device(maskmem_features.device())?
-            .to_dtype(maskmem_features.dtype())?
-            .reshape((1, self.config.memory_dim, 1, 1))?;
-        let no_obj_add = appearing
-            .reshape((appearing.dim(0)?, 1, 1, 1))?
-            .broadcast_mul(&no_obj_embed.broadcast_as(maskmem_features.shape())?)?;
+        let no_obj_scale = object_score_logits
+            .le(0f64)?
+            .to_dtype(maskmem_features.dtype())?;
+        let no_obj_embed = maybe_to_device_dtype(
+            &self.no_obj_embed_spatial,
+            maskmem_features.device(),
+            maskmem_features.dtype(),
+        )?
+        .reshape((1, self.config.memory_dim, 1, 1))?;
+        let no_obj_add = no_obj_scale
+            .reshape((no_obj_scale.dim(0)?, 1, 1, 1))?
+            .broadcast_mul(&no_obj_embed)?;
         maskmem_features = maskmem_features.broadcast_add(&no_obj_add)?;
         Ok((maskmem_features, maskmem_pos_enc))
     }
@@ -409,26 +444,30 @@ impl Sam3TrackerModel {
     pub(super) fn maybe_offload_state_for_eval(
         &self,
         state: TrackerFrameState,
+        storage_device: Option<&Device>,
     ) -> Result<TrackerFrameState> {
         if !self.config.predictor.offload_output_to_cpu_for_eval {
             return Ok(state);
         }
         let storage = &Device::Cpu;
+        if storage_device.is_some_and(|device| !device.same_device(storage)) {
+            return Ok(state);
+        }
         Ok(TrackerFrameState {
-            low_res_masks: state.low_res_masks.to_device(storage)?,
-            high_res_masks: state.high_res_masks.to_device(storage)?,
-            iou_scores: state.iou_scores.to_device(storage)?,
+            low_res_masks: maybe_to_device(&state.low_res_masks, storage)?,
+            high_res_masks: maybe_to_device(&state.high_res_masks, storage)?,
+            iou_scores: maybe_to_device(&state.iou_scores, storage)?,
             obj_ptr: state.obj_ptr,
             object_score_logits: state.object_score_logits,
             maskmem_features: state
                 .maskmem_features
                 .as_ref()
-                .map(|tensor| tensor.to_dtype(DType::BF16)?.to_device(storage))
+                .map(|tensor| maybe_to_device(&maybe_to_dtype(tensor, DType::BF16)?, storage))
                 .transpose()?,
             maskmem_pos_enc: state
                 .maskmem_pos_enc
                 .as_ref()
-                .map(|tensor| tensor.to_device(storage))
+                .map(|tensor| maybe_to_device(tensor, storage))
                 .transpose()?,
             is_cond_frame: state.is_cond_frame,
         })

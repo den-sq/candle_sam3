@@ -51,24 +51,45 @@ pub struct TrackerFrameState {
 impl TrackerFrameState {
     pub fn to_storage_device(&self, device: &candle::Device) -> Result<Self> {
         Ok(Self {
-            low_res_masks: self.low_res_masks.to_device(device)?,
-            high_res_masks: self.high_res_masks.to_device(device)?,
-            iou_scores: self.iou_scores.to_device(device)?,
-            obj_ptr: self.obj_ptr.to_device(device)?,
-            object_score_logits: self.object_score_logits.to_device(device)?,
+            low_res_masks: maybe_to_device(&self.low_res_masks, device)?,
+            high_res_masks: maybe_to_device(&self.high_res_masks, device)?,
+            iou_scores: maybe_to_device(&self.iou_scores, device)?,
+            obj_ptr: maybe_to_device(&self.obj_ptr, device)?,
+            object_score_logits: maybe_to_device(&self.object_score_logits, device)?,
             maskmem_features: self
                 .maskmem_features
                 .as_ref()
-                .map(|tensor| tensor.to_device(device))
+                .map(|tensor| maybe_to_device(tensor, device))
                 .transpose()?,
             maskmem_pos_enc: self
                 .maskmem_pos_enc
                 .as_ref()
-                .map(|tensor| tensor.to_device(device))
+                .map(|tensor| maybe_to_device(tensor, device))
                 .transpose()?,
             is_cond_frame: self.is_cond_frame,
         })
     }
+}
+
+pub(super) fn maybe_to_device(tensor: &Tensor, device: &Device) -> Result<Tensor> {
+    if tensor.device().same_device(device) {
+        Ok(tensor.clone())
+    } else {
+        tensor.to_device(device)
+    }
+}
+
+pub(super) fn maybe_to_dtype(tensor: &Tensor, dtype: DType) -> Result<Tensor> {
+    if tensor.dtype() == dtype {
+        Ok(tensor.clone())
+    } else {
+        tensor.to_dtype(dtype)
+    }
+}
+
+pub(super) fn maybe_to_device_dtype(tensor: &Tensor, device: &Device, dtype: DType) -> Result<Tensor> {
+    let tensor = maybe_to_device(tensor, device)?;
+    maybe_to_dtype(&tensor, dtype)
 }
 
 #[derive(Debug, Clone)]
@@ -2100,7 +2121,7 @@ mod tests {
             maskmem_pos_enc: Some(Tensor::zeros((1, 64, 4, 4), DType::F32, &device)?),
             is_cond_frame: true,
         };
-        let offloaded = model.maybe_offload_state_for_eval(state)?;
+        let offloaded = model.maybe_offload_state_for_eval(state, None)?;
         assert_eq!(
             offloaded.maskmem_features.as_ref().unwrap().dtype(),
             DType::BF16
