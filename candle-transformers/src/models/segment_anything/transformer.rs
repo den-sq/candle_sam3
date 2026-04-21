@@ -41,6 +41,10 @@ impl Attention {
     fn recombine_heads(&self, x: &Tensor) -> Result<Tensor> {
         let (b, n_heads, n_tokens, c_per_head) = x.dims4()?;
         x.transpose(1, 2)?
+            // Keep Q/K/V as strided views during attention and pay for a single
+            // materialization here, where the following reshape/out-proj need a
+            // token-major contiguous layout anyway.
+            .contiguous()?
             .reshape((b, n_tokens, n_heads * c_per_head))
     }
 
@@ -137,9 +141,11 @@ impl TwoWayAttentionBlock {
         let queries = self.norm1.forward(&queries)?;
 
         // Cross attention block, tokens attending to image embedding
+        let keys_with_pe = (keys + key_pe)?;
         let q = (&queries + query_pe)?;
-        let k = (keys + key_pe)?;
-        let attn_out = self.cross_attn_token_to_image.forward(&q, &k, keys)?;
+        let attn_out = self
+            .cross_attn_token_to_image
+            .forward(&q, &keys_with_pe, keys)?;
         let queries = (&queries + attn_out)?;
         let queries = self.norm2.forward(&queries)?;
 
@@ -150,8 +156,9 @@ impl TwoWayAttentionBlock {
 
         // Cross attention block, image embedding attending to tokens
         let q = (&queries + query_pe)?;
-        let k = (keys + key_pe)?;
-        let attn_out = self.cross_attn_image_to_token.forward(&k, &q, &queries)?;
+        let attn_out = self
+            .cross_attn_image_to_token
+            .forward(&keys_with_pe, &q, &queries)?;
         let keys = (keys + attn_out)?;
         let keys = self.norm4.forward(&keys)?;
 

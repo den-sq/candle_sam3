@@ -424,11 +424,15 @@ impl Sam3TrackerModel {
         )?;
         let backbone_dtype = backbone_features.dtype();
         let sparse_embeddings = sparse_embeddings.to_dtype(backbone_dtype)?;
-        let dense_embeddings = dense_embeddings.to_dtype(backbone_dtype)?;
+        let dense_embeddings = if sam_mask_prompt.is_none() {
+            self.sam_prompt_encoder
+                .no_mask_dense_embedding_with_dtype(backbone_dtype)?
+        } else {
+            dense_embeddings.to_dtype(backbone_dtype)?
+        };
         let image_pe = self
             .sam_prompt_encoder
-            .get_dense_pe()?
-            .to_dtype(backbone_dtype)?;
+            .get_dense_pe_with_dtype(backbone_dtype)?;
         let (low_res_multimasks, ious, sam_output_tokens, object_score_logits) =
             self.sam_mask_decoder.forward(
                 backbone_features,

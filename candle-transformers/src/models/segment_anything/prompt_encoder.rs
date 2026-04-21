@@ -1,4 +1,7 @@
-use candle::{DType, IndexOp, Result, Tensor, D};
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use candle::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::VarBuilder;
 
 #[derive(Debug)]
@@ -64,7 +67,15 @@ pub struct PromptEncoder {
     image_embedding_size: (usize, usize),
     input_image_size: (usize, usize),
     embed_dim: usize,
+    dense_pe_cache: Mutex<HashMap<PromptTensorCacheKey, Tensor>>,
+    no_mask_dense_cache: Mutex<HashMap<PromptTensorCacheKey, Tensor>>,
     span: tracing::Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PromptTensorCacheKey {
+    device: String,
+    dtype: String,
 }
 
 impl PromptEncoder {
@@ -123,14 +134,74 @@ impl PromptEncoder {
             image_embedding_size,
             input_image_size,
             embed_dim,
+            dense_pe_cache: Mutex::new(HashMap::new()),
+            no_mask_dense_cache: Mutex::new(HashMap::new()),
             span,
         })
     }
 
     pub fn get_dense_pe(&self) -> Result<Tensor> {
-        self.pe_layer
-            .forward(self.image_embedding_size.0, self.image_embedding_size.1)?
-            .unsqueeze(0)
+        self.get_dense_pe_with_dtype(self.pe_layer.positional_encoding_gaussian_matrix.dtype())
+    }
+
+    pub fn get_dense_pe_with_dtype(&self, dtype: DType) -> Result<Tensor> {
+        let device = self.pe_layer.positional_encoding_gaussian_matrix.device();
+        let key = self.prompt_tensor_cache_key(device, dtype);
+        let cached = {
+            let cache = self
+                .dense_pe_cache
+                .lock()
+                .expect("prompt encoder dense pe cache lock poisoned");
+            cache.get(&key).cloned()
+        };
+        match cached {
+            Some(tensor) => Ok(tensor),
+            None => {
+                let dense_pe = self
+                    .pe_layer
+                    .forward(self.image_embedding_size.0, self.image_embedding_size.1)?
+                    .to_dtype(dtype)?
+                    .unsqueeze(0)?;
+                let mut cache = self
+                    .dense_pe_cache
+                    .lock()
+                    .expect("prompt encoder dense pe cache lock poisoned");
+                Ok(cache.entry(key).or_insert_with(|| dense_pe.clone()).clone())
+            }
+        }
+    }
+
+    pub fn no_mask_dense_embedding_with_dtype(&self, dtype: DType) -> Result<Tensor> {
+        let device = self.no_mask_embed.embeddings().device();
+        let key = self.prompt_tensor_cache_key(device, dtype);
+        let cached = {
+            let cache = self
+                .no_mask_dense_cache
+                .lock()
+                .expect("prompt encoder no-mask cache lock poisoned");
+            cache.get(&key).cloned()
+        };
+        match cached {
+            Some(tensor) => Ok(tensor),
+            None => {
+                let emb = if self.no_mask_embed.embeddings().dtype() == dtype {
+                    self.no_mask_embed.embeddings().clone()
+                } else {
+                    self.no_mask_embed.embeddings().to_dtype(dtype)?
+                };
+                let dense = emb.reshape((1, (), 1, 1))?.expand((
+                    1,
+                    emb.elem_count(),
+                    self.image_embedding_size.0,
+                    self.image_embedding_size.1,
+                ))?;
+                let mut cache = self
+                    .no_mask_dense_cache
+                    .lock()
+                    .expect("prompt encoder no-mask cache lock poisoned");
+                Ok(cache.entry(key).or_insert_with(|| dense.clone()).clone())
+            }
+        }
     }
 
     fn embed_masks(&self, masks: &Tensor) -> Result<Tensor> {
@@ -246,18 +317,17 @@ impl PromptEncoder {
         };
 
         let dense_embeddings = match masks {
-            None => {
-                let emb = self.no_mask_embed.embeddings();
-                emb.reshape((1, (), 1, 1))?.expand((
-                    1,
-                    emb.elem_count(),
-                    self.image_embedding_size.0,
-                    self.image_embedding_size.1,
-                ))?
-            }
+            None => self.no_mask_dense_embedding_with_dtype(self.no_mask_embed.embeddings().dtype())?,
             Some(masks) => self.embed_masks(masks)?,
         };
         Ok((sparse_embeddings, dense_embeddings))
+    }
+
+    fn prompt_tensor_cache_key(&self, device: &Device, dtype: DType) -> PromptTensorCacheKey {
+        PromptTensorCacheKey {
+            device: format!("{:?}", device),
+            dtype: format!("{:?}", dtype),
+        }
     }
 }
 
