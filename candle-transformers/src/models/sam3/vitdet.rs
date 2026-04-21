@@ -267,6 +267,17 @@ impl Sam3VisionBlock {
         (residual + hidden_states)?.contiguous()
     }
 
+    fn forward_windowed(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        let residual = hidden_states;
+        let hidden_states = self.norm1.forward(hidden_states)?;
+        let hidden_states = self.attn.forward(&hidden_states)?;
+        let hidden_states = (residual + hidden_states)?.contiguous()?;
+        let residual = &hidden_states;
+        let hidden_states = self.norm2.forward(&hidden_states)?;
+        let hidden_states = self.mlp.forward(&hidden_states)?;
+        (residual + hidden_states)?.contiguous()
+    }
+
     fn forward_with_debug(
         &self,
         hidden_states: &Tensor,
@@ -470,6 +481,35 @@ impl Sam3ViTDetTrunk {
         Ok((output, block_outputs.unwrap_or_default(), debug_tensors))
     }
 
+    fn forward_blocks_fast(&self, mut hidden_states: Tensor) -> Result<Tensor> {
+        let mut block_index = 0;
+        while block_index < self.blocks.len() {
+            let block = &self.blocks[block_index];
+            if block.window_size == 0 {
+                hidden_states = block.forward(&hidden_states)?;
+                block_index += 1;
+                continue;
+            }
+
+            let window_size = block.window_size;
+            let original_hw = (hidden_states.dim(1)?, hidden_states.dim(2)?);
+            // Keep tensors partitioned across consecutive windowed blocks so we only
+            // pay the NHWC<->window layout materialization once per run.
+            let (mut windowed_states, padded_hw) = window_partition_nhwc(&hidden_states, window_size)?;
+            while block_index < self.blocks.len() {
+                let block = &self.blocks[block_index];
+                if block.window_size != window_size {
+                    break;
+                }
+                windowed_states = block.forward_windowed(&windowed_states)?;
+                block_index += 1;
+            }
+            hidden_states =
+                window_unpartition_nhwc(&windowed_states, window_size, padded_hw, original_hw)?;
+        }
+        Ok(hidden_states)
+    }
+
     fn forward_impl(
         &self,
         images: &Tensor,
@@ -513,21 +553,24 @@ impl Sam3ViTDetTrunk {
         if !debug_blocks.is_empty() {
             debug_tensors.insert("vision.pre_block.ln_pre".to_owned(), hidden_states.clone());
         }
-        let mut block_outputs =
-            collect_block_outputs.then(|| Vec::with_capacity(self.blocks.len()));
-        for (block_index, block) in self.blocks.iter().enumerate() {
-            if debug_blocks.contains(&block_index) {
-                let (next_hidden_states, block_debug) =
-                    block.forward_with_debug(&hidden_states, block_index)?;
-                hidden_states = next_hidden_states;
-                debug_tensors.extend(block_debug);
-            } else {
-                hidden_states = block.forward(&hidden_states)?;
-            }
+        let mut block_outputs = collect_block_outputs.then(|| Vec::with_capacity(self.blocks.len()));
+        if collect_block_outputs || !debug_blocks.is_empty() {
+            for (block_index, block) in self.blocks.iter().enumerate() {
+                if debug_blocks.contains(&block_index) {
+                    let (next_hidden_states, block_debug) =
+                        block.forward_with_debug(&hidden_states, block_index)?;
+                    hidden_states = next_hidden_states;
+                    debug_tensors.extend(block_debug);
+                } else {
+                    hidden_states = block.forward(&hidden_states)?;
+                }
 
-            if let Some(block_outputs) = block_outputs.as_mut() {
-                block_outputs.push(hidden_states.clone());
+                if let Some(block_outputs) = block_outputs.as_mut() {
+                    block_outputs.push(hidden_states.clone());
+                }
             }
+        } else {
+            hidden_states = self.forward_blocks_fast(hidden_states)?;
         }
         Ok((
             ViTDetTrunkOutput {
