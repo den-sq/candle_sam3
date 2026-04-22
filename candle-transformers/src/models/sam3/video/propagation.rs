@@ -921,7 +921,7 @@ impl Sam3VideoTrackerCore<'_> {
             true,
             session.video_size(),
         )?;
-        apply_prompt_frame_output_postprocess(&mut output, config)?;
+        apply_prompt_frame_output_postprocess(&mut output, config, Some(session.storage_device()))?;
         if let Some(recorder) = session.debug_recorder_mut() {
             recorder.record_first_propagation(
                 object,
@@ -1060,7 +1060,7 @@ impl Sam3VideoTrackerCore<'_> {
             session.video_size(),
         )?;
         output.presence_scores = None;
-        apply_prompt_frame_output_postprocess(&mut output, config)?;
+        apply_prompt_frame_output_postprocess(&mut output, config, Some(session.storage_device()))?;
         Ok((output, tracker_state, object.display_score.or(Some(1.0))))
     }
 
@@ -1143,7 +1143,7 @@ impl Sam3VideoTrackerCore<'_> {
             Some(frame_idx),
             session.video_size(),
         )?;
-        apply_prompt_frame_output_postprocess(&mut output, config)?;
+        apply_prompt_frame_output_postprocess(&mut output, config, Some(session.storage_device()))?;
         let display_score = output.score_value().ok();
         Ok((output, tracker_state, display_score))
     }
@@ -1272,7 +1272,11 @@ impl Sam3VideoTrackerCore<'_> {
             session.video_size(),
         )?;
         seed_output.presence_scores = None;
-        apply_prompt_frame_output_postprocess(&mut seed_output, config)?;
+        apply_prompt_frame_output_postprocess(
+            &mut seed_output,
+            config,
+            Some(session.storage_device()),
+        )?;
         if let Some(recorder) = session.debug_recorder_mut() {
             recorder.record_tracker_seed(
                 object,
@@ -1367,7 +1371,7 @@ impl Sam3VideoTrackerCore<'_> {
             session.video_size(),
         )?;
         output.presence_scores = None;
-        apply_prompt_frame_output_postprocess(&mut output, config)?;
+        apply_prompt_frame_output_postprocess(&mut output, config, Some(session.storage_device()))?;
         if let Some(recorder) = session.debug_recorder_mut() {
             recorder.record_tracker_seed(
                 object,
@@ -1434,7 +1438,7 @@ impl Sam3VideoTrackerCore<'_> {
             Some(frame_idx),
             session.video_size(),
         )?;
-        apply_prompt_frame_output_postprocess(&mut output, config)?;
+        apply_prompt_frame_output_postprocess(&mut output, config, Some(session.storage_device()))?;
         let display_score = output.score_value().ok();
         if let Some(recorder) = session.debug_recorder_mut() {
             recorder.record_tracker_seed(

@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use candle::{DType, Device, IndexOp, Result, Tensor, TensorId, D};
 use candle_nn::{
@@ -105,7 +105,7 @@ impl TrackerFrameState {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PackedPromptHistory {
     initialized: bool,
     maskmem_frames: Vec<usize>,
@@ -115,6 +115,31 @@ pub struct PackedPromptHistory {
     obj_ptr_frames: Vec<usize>,
     obj_ptr_frame_slots: HashMap<usize, usize>,
     obj_ptrs: Option<Tensor>,
+    maskmem_slot_tensor_cache: Arc<Mutex<HashMap<SlotTensorCacheKey, Tensor>>>,
+    obj_ptr_slot_tensor_cache: Arc<Mutex<HashMap<SlotTensorCacheKey, Tensor>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SlotTensorCacheKey {
+    device: String,
+    frames: Vec<usize>,
+}
+
+impl Default for PackedPromptHistory {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            maskmem_frames: Vec::new(),
+            maskmem_frame_slots: HashMap::new(),
+            maskmem_prompt_features: None,
+            maskmem_prompt_pos_enc: None,
+            obj_ptr_frames: Vec::new(),
+            obj_ptr_frame_slots: HashMap::new(),
+            obj_ptrs: None,
+            maskmem_slot_tensor_cache: Arc::new(Mutex::new(HashMap::new())),
+            obj_ptr_slot_tensor_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 impl PackedPromptHistory {
@@ -151,7 +176,12 @@ impl PackedPromptHistory {
         frames: &[usize],
         device: &Device,
     ) -> Result<Option<Tensor>> {
-        self.slot_indices_tensor(frames, &self.maskmem_frame_slots, device)
+        self.slot_indices_tensor(
+            frames,
+            &self.maskmem_frame_slots,
+            &self.maskmem_slot_tensor_cache,
+            device,
+        )
     }
 
     pub fn obj_ptr_slot_indices_tensor(
@@ -159,7 +189,12 @@ impl PackedPromptHistory {
         frames: &[usize],
         device: &Device,
     ) -> Result<Option<Tensor>> {
-        self.slot_indices_tensor(frames, &self.obj_ptr_frame_slots, device)
+        self.slot_indices_tensor(
+            frames,
+            &self.obj_ptr_frame_slots,
+            &self.obj_ptr_slot_tensor_cache,
+            device,
+        )
     }
 
     pub fn append_state(&mut self, frame_idx: usize, state: &TrackerFrameState) -> Result<()> {
@@ -219,10 +254,23 @@ impl PackedPromptHistory {
         &self,
         frames: &[usize],
         frame_slots: &HashMap<usize, usize>,
+        cache: &Arc<Mutex<HashMap<SlotTensorCacheKey, Tensor>>>,
         device: &Device,
     ) -> Result<Option<Tensor>> {
         if frames.is_empty() {
             return Ok(None);
+        }
+        let key = SlotTensorCacheKey {
+            device: format!("{:?}", device),
+            frames: frames.to_vec(),
+        };
+        if let Some(cached) = cache
+            .lock()
+            .expect("slot tensor cache lock poisoned")
+            .get(&key)
+            .cloned()
+        {
+            return Ok(Some(cached));
         }
         let mut slots = Vec::with_capacity(frames.len());
         for frame in frames {
@@ -231,7 +279,9 @@ impl PackedPromptHistory {
             };
             slots.push(*slot as u32);
         }
-        Ok(Some(Tensor::from_vec(slots, frames.len(), device)?))
+        let slots = Tensor::from_vec(slots, frames.len(), device)?;
+        let mut guard = cache.lock().expect("slot tensor cache lock poisoned");
+        Ok(Some(guard.entry(key).or_insert_with(|| slots.clone()).clone()))
     }
 }
 

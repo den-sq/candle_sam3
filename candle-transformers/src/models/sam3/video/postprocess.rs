@@ -16,6 +16,8 @@ impl<'a> Sam3VideoTrackerCore<'a> {
             return Ok(Vec::new());
         }
 
+        let postprocess_device = session.storage_device().clone();
+        let postprocess_on_cpu = matches!(postprocess_device, Device::Cpu);
         let predictor_config = &self.tracker.config().predictor;
         let confirmation_threshold = predictor_config.masklet_confirmation_consecutive_det_thresh;
         let mut hidden_obj_ids = BTreeSet::new();
@@ -33,11 +35,18 @@ impl<'a> Sam3VideoTrackerCore<'a> {
         let use_local_confirmation_gate =
             predictor_config.masklet_confirmation_enable && config.hotstart_delay == 0;
 
-        for (obj_id, output, state, _) in results.iter() {
+        for (obj_id, raw_output, state, _) in results.iter() {
+            let output = if postprocess_on_cpu
+                && !raw_output.masks.device().same_device(&postprocess_device)
+            {
+                raw_output.to_storage_device(&postprocess_device)?
+            } else {
+                raw_output.clone()
+            };
             if hidden_obj_ids.contains(obj_id) {
                 continue;
             }
-            let has_detectable_output = object_has_detectable_output(output, output_threshold)?;
+            let has_detectable_output = object_has_detectable_output(&output, output_threshold)?;
             let is_confirmed = if use_local_confirmation_gate {
                 let object = session.tracked_objects.get_mut(obj_id).ok_or_else(|| {
                     candle::Error::Msg(format!(
@@ -58,7 +67,9 @@ impl<'a> Sam3VideoTrackerCore<'a> {
             }
             visible_outputs.push(output.clone());
             visible_scores.push(if output.presence_scores.is_some() {
-                object_presence_score(output)?
+                object_presence_score(&output)?
+            } else if postprocess_on_cpu {
+                tracker_state_presence_score_on_device(state, &postprocess_device)?
             } else {
                 tracker_state_presence_score(state)?
             });
@@ -132,9 +143,17 @@ pub(super) fn mask_prompt_to_object_output(
 pub(super) fn apply_prompt_frame_output_postprocess(
     output: &mut ObjectFrameOutput,
     config: &VideoConfig,
+    postprocess_device: Option<&Device>,
 ) -> Result<()> {
     if config.fill_hole_area == 0 {
         return Ok(());
+    }
+    if let Some(postprocess_device) = postprocess_device {
+        if matches!(postprocess_device, Device::Cpu)
+            && !output.mask_logits.device().same_device(postprocess_device)
+        {
+            *output = output.to_storage_device(postprocess_device)?;
+        }
     }
     output.mask_logits =
         postprocess_low_res_mask_logits_for_video(&output.mask_logits, config.fill_hole_area)?;
@@ -153,6 +172,15 @@ pub(super) fn object_presence_score(output: &ObjectFrameOutput) -> Result<f32> {
 
 pub(super) fn tracker_state_presence_score(state: &TrackerFrameState) -> Result<f32> {
     first_scalar_f32(&candle_nn::ops::sigmoid(&state.object_score_logits)?)
+}
+
+fn tracker_state_presence_score_on_device(state: &TrackerFrameState, device: &Device) -> Result<f32> {
+    let logits = if state.object_score_logits.device().same_device(device) {
+        state.object_score_logits.clone()
+    } else {
+        state.object_score_logits.to_device(device)?
+    };
+    first_scalar_f32(&candle_nn::ops::sigmoid(&logits)?)
 }
 
 pub(super) fn mask_has_foreground(mask: &Tensor, threshold: f32) -> Result<bool> {

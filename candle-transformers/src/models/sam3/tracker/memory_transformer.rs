@@ -318,30 +318,41 @@ fn compute_tracker_axial_freqs(
         candle::bail!("tracker rotary dim must be divisible by 4, got {dim}");
     }
     let rotary_dim = dim / 4;
-    let seq_len = end_x * end_y;
-    let inv_freqs: Vec<f32> = (0..rotary_dim)
-        .map(|i| 1f32 / theta.powf((4 * i) as f32 / dim as f32))
-        .collect();
-    let mut freqs_real = vec![0f32; seq_len * (dim / 2)];
-    let mut freqs_imag = vec![0f32; seq_len * (dim / 2)];
-    for flat_idx in 0..seq_len {
-        let x_pos = (flat_idx % end_x) as f32;
-        let y_pos = (flat_idx / end_x) as f32;
-        let row_real = &mut freqs_real[flat_idx * (dim / 2)..(flat_idx + 1) * (dim / 2)];
-        let row_imag = &mut freqs_imag[flat_idx * (dim / 2)..(flat_idx + 1) * (dim / 2)];
-        for (i, inv_freq) in inv_freqs.iter().copied().enumerate() {
-            let x_freq = x_pos * inv_freq;
-            let y_freq = y_pos * inv_freq;
-            row_real[i] = x_freq.cos();
-            row_imag[i] = x_freq.sin();
-            row_real[rotary_dim + i] = y_freq.cos();
-            row_imag[rotary_dim + i] = y_freq.sin();
-        }
-    }
-    Ok((
-        Tensor::from_slice(&freqs_real, (seq_len, dim / 2), device)?,
-        Tensor::from_slice(&freqs_imag, (seq_len, dim / 2), device)?,
-    ))
+    let inv_freqs = Tensor::arange(0u32, rotary_dim as u32, device)?
+        .to_dtype(DType::F32)?
+        .affine((-4.0 * (theta as f64).ln()) / dim as f64, 0.0)?
+        .exp()?;
+    let x_pos = Tensor::arange(0u32, end_x as u32, device)?.to_dtype(DType::F32)?;
+    let y_pos = Tensor::arange(0u32, end_y as u32, device)?.to_dtype(DType::F32)?;
+    let x_freqs = x_pos
+        .unsqueeze(1)?
+        .broadcast_mul(&inv_freqs.unsqueeze(0)?)?;
+    let y_freqs = y_pos
+        .unsqueeze(1)?
+        .broadcast_mul(&inv_freqs.unsqueeze(0)?)?;
+
+    let x_real = x_freqs
+        .cos()?
+        .unsqueeze(0)?
+        .broadcast_as((end_y, end_x, rotary_dim))?
+        .flatten(0, 1)?;
+    let x_imag = x_freqs
+        .sin()?
+        .unsqueeze(0)?
+        .broadcast_as((end_y, end_x, rotary_dim))?
+        .flatten(0, 1)?;
+    let y_real = y_freqs
+        .cos()?
+        .unsqueeze(1)?
+        .broadcast_as((end_y, end_x, rotary_dim))?
+        .flatten(0, 1)?;
+    let y_imag = y_freqs
+        .sin()?
+        .unsqueeze(1)?
+        .broadcast_as((end_y, end_x, rotary_dim))?
+        .flatten(0, 1)?;
+
+    Ok((Tensor::cat(&[&x_real, &y_real], 1)?, Tensor::cat(&[&x_imag, &y_imag], 1)?))
 }
 
 fn apply_tracker_rotary_single(
