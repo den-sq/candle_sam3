@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use super::*;
 
 #[derive(Debug)]
@@ -127,7 +130,7 @@ impl TrackerCxBlock {
         xs = self.norm.forward(&xs)?;
         xs = xs.permute((0, 2, 3, 1))?.contiguous()?;
         xs = self.pwconv1.forward(&xs)?;
-        xs = xs.gelu_erf()?.contiguous()?;
+        xs = xs.gelu_erf()?;
         xs = self.pwconv2.forward(&xs)?;
         if let Some(gamma) = self.gamma.as_ref() {
             xs = xs.broadcast_mul(&gamma.reshape((1, 1, 1, gamma.dim(0)?))?)?;
@@ -178,6 +181,20 @@ pub(super) struct TrackerSimpleMaskEncoder {
     position_normalize: bool,
     position_scale: f32,
     position_temperature: f32,
+    position_cache: Mutex<HashMap<MaskmemPositionCacheKey, Tensor>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MaskmemPositionCacheKey {
+    device: String,
+    dtype: String,
+    channels: usize,
+    height: usize,
+    width: usize,
+    num_pos_feats: usize,
+    normalize: bool,
+    scale_bits: u32,
+    temperature_bits: u32,
 }
 
 impl TrackerSimpleMaskEncoder {
@@ -214,6 +231,7 @@ impl TrackerSimpleMaskEncoder {
                 .scale
                 .unwrap_or(2.0 * std::f32::consts::PI),
             position_temperature: config.position_encoding.temperature,
+            position_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -229,19 +247,56 @@ impl TrackerSimpleMaskEncoder {
             candle_nn::ops::sigmoid(masks)?
         };
         masks = self.mask_downsampler.forward(&masks)?;
-        let pix_feat = pix_feat.to_device(masks.device())?;
+        let pix_feat = if pix_feat.device().same_device(masks.device()) {
+            pix_feat.clone()
+        } else {
+            pix_feat.to_device(masks.device())?
+        };
         let mut xs = self.pix_feat_proj.forward(&pix_feat)?;
         xs = xs.broadcast_add(&masks)?;
         xs = self.fuser.forward(&xs)?;
         xs = self.out_proj.forward(&xs)?;
-        let pos = build_2d_sine_position_encoding(
-            &xs,
-            self.position_num_pos_feats,
-            self.position_normalize,
-            self.position_scale,
-            self.position_temperature,
-        )?
-        .to_dtype(xs.dtype())?;
+        let pos = self.cached_position_encoding(&xs)?;
         Ok((xs, pos))
+    }
+
+    fn cached_position_encoding(&self, xs: &Tensor) -> Result<Tensor> {
+        let (_, channels, height, width) = xs.dims4()?;
+        let key = MaskmemPositionCacheKey {
+            device: format!("{:?}", xs.device()),
+            dtype: format!("{:?}", xs.dtype()),
+            channels,
+            height,
+            width,
+            num_pos_feats: self.position_num_pos_feats,
+            normalize: self.position_normalize,
+            scale_bits: self.position_scale.to_bits(),
+            temperature_bits: self.position_temperature.to_bits(),
+        };
+        let cached = {
+            let cache = self
+                .position_cache
+                .lock()
+                .expect("maskmem position cache lock poisoned");
+            cache.get(&key).cloned()
+        };
+        match cached {
+            Some(pos) => Ok(pos),
+            None => {
+                let pos = build_2d_sine_position_encoding(
+                    xs,
+                    self.position_num_pos_feats,
+                    self.position_normalize,
+                    self.position_scale,
+                    self.position_temperature,
+                )?
+                .to_dtype(xs.dtype())?;
+                let mut cache = self
+                    .position_cache
+                    .lock()
+                    .expect("maskmem position cache lock poisoned");
+                Ok(cache.entry(key).or_insert_with(|| pos.clone()).clone())
+            }
+        }
     }
 }

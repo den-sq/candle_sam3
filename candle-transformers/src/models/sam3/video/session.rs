@@ -1,4 +1,5 @@
 use super::*;
+use crate::models::sam3::tracker::PackedPromptHistory;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionCacheStats {
@@ -21,6 +22,7 @@ pub struct TrackedObject {
     pub mask_prompt_frames: BTreeMap<usize, Tensor>,
     pub frame_outputs: BTreeMap<usize, ObjectFrameOutput>,
     pub tracker_states: BTreeMap<usize, TrackerFrameState>,
+    pub prompt_history_cache: PackedPromptHistory,
 }
 
 impl TrackedObject {
@@ -37,6 +39,7 @@ impl TrackedObject {
             mask_prompt_frames: BTreeMap::new(),
             frame_outputs: BTreeMap::new(),
             tracker_states: BTreeMap::new(),
+            prompt_history_cache: PackedPromptHistory::default(),
         }
     }
 
@@ -208,6 +211,25 @@ impl TrackedObject {
                 .map(|(idx, state)| (*idx, state.clone()))
                 .collect(),
         }
+    }
+
+    pub(crate) fn clear_prompt_history_cache(&mut self) {
+        self.prompt_history_cache.clear();
+    }
+
+    pub(crate) fn ensure_prompt_history_cache(&mut self) -> Result<()> {
+        self.prompt_history_cache.ensure_built(&self.tracker_states)
+    }
+
+    pub(crate) fn maybe_append_prompt_history_cache(
+        &mut self,
+        frame_idx: usize,
+        state: &TrackerFrameState,
+    ) -> Result<()> {
+        if self.prompt_history_cache.is_initialized() || self.tracker_states.len() == 1 {
+            self.prompt_history_cache.append_state(frame_idx, state)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn record_confirmation_activity(
@@ -439,6 +461,7 @@ impl Sam3VideoSession {
         if let Some(object) = self.tracked_objects.get_mut(&obj_id) {
             object.frame_outputs.retain(|idx, _| *idx <= frame_idx);
             object.tracker_states.retain(|idx, _| *idx <= frame_idx);
+            object.clear_prompt_history_cache();
         }
         let mut empty_frames = Vec::new();
         for (cached_frame_idx, frame_outputs) in self.frame_outputs.iter_mut() {

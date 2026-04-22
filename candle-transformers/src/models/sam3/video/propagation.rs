@@ -1,5 +1,6 @@
 use super::*;
 use crate::models::sam3::neck::TrackerVisualSequences;
+use crate::models::sam3::tracker::PackedPromptHistory;
 use crate::models::sam3::torch_ops::tensor::first_scalar_f32;
 
 #[derive(Debug, Clone)]
@@ -666,6 +667,7 @@ impl Sam3VideoTrackerCore<'_> {
             updated_state.set_maskmem_state(maskmem_features, maskmem_pos_enc)?;
             let updated_state = move_tracker_state(&updated_state, session.storage_device())?;
             if let Some(tracked) = session.tracked_objects.get_mut(&object.obj_id) {
+                tracked.clear_prompt_history_cache();
                 tracked
                     .tracker_states
                     .insert(history_frame_idx, updated_state);
@@ -725,6 +727,7 @@ impl Sam3VideoTrackerCore<'_> {
             }
         }
         if let Some(tracked) = session.tracked_objects.get_mut(&object.obj_id) {
+            let mut cleared_prompt_history = false;
             for target_frame_idx in trim_targets {
                 let Some(state) = tracked.tracker_states.get_mut(&target_frame_idx) else {
                     continue;
@@ -733,6 +736,10 @@ impl Sam3VideoTrackerCore<'_> {
                     continue;
                 }
                 state.clear_maskmem_state();
+                cleared_prompt_history = true;
+            }
+            if cleared_prompt_history {
+                tracked.clear_prompt_history_cache();
             }
         }
     }
@@ -761,6 +768,25 @@ impl Sam3VideoTrackerCore<'_> {
                 ))
             })
             .collect()
+    }
+
+    fn packed_prompt_history_on_compute_device(
+        &self,
+        session: &mut Sam3VideoSession,
+        obj_id: u32,
+        compute_device: &Device,
+    ) -> Result<Option<PackedPromptHistory>> {
+        if !session.storage_device().same_device(compute_device) {
+            return Ok(None);
+        }
+        let object = session.tracked_objects.get_mut(&obj_id).ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "unknown obj_id {} while building packed tracker history",
+                obj_id
+            ))
+        })?;
+        object.ensure_prompt_history_cache()?;
+        Ok(Some(object.prompt_history_cache.clone()))
     }
 
     fn previous_frame_low_res_mask_input(
@@ -813,6 +839,7 @@ impl Sam3VideoTrackerCore<'_> {
         let frame_idx_begin = frame_idx.saturating_sub(radius);
         let frame_idx_end = frame_idx.saturating_add(radius);
         for object in session.tracked_objects.values_mut() {
+            let mut cleared_prompt_history = false;
             for target_frame_idx in frame_idx_begin..=frame_idx_end {
                 let Some(state) = object.tracker_states.get_mut(&target_frame_idx) else {
                     continue;
@@ -821,6 +848,10 @@ impl Sam3VideoTrackerCore<'_> {
                     continue;
                 }
                 state.clear_maskmem_state();
+                cleared_prompt_history = true;
+            }
+            if cleared_prompt_history {
+                object.clear_prompt_history_cache();
             }
         }
     }
@@ -850,6 +881,8 @@ impl Sam3VideoTrackerCore<'_> {
             direction,
             compute_device,
         )?;
+        let packed_history =
+            self.packed_prompt_history_on_compute_device(session, object.obj_id, compute_device)?;
         let visual_features = tracker_visual_output(&session.get_visual_features(
             model,
             compute_device,
@@ -869,6 +902,7 @@ impl Sam3VideoTrackerCore<'_> {
             true,
             true,
             Some(session.storage_device()),
+            packed_history.as_ref(),
         )?;
         let prompt_frame_idx = object.nearest_input_frame_idx(frame_idx, direction);
         let mut output = tracker_state_to_object_output(
@@ -939,6 +973,11 @@ impl Sam3VideoTrackerCore<'_> {
                 compute_device,
             )?
         };
+        let packed_history = if self.tracker.config().predictor.use_stateless_refinement {
+            None
+        } else {
+            self.packed_prompt_history_on_compute_device(session, object.obj_id, compute_device)?
+        };
         let visual = tracker_visual_output(&session.get_visual_features(
             model,
             compute_device,
@@ -997,6 +1036,7 @@ impl Sam3VideoTrackerCore<'_> {
                 self.tracker.config().predictor.use_prev_mem_frame,
                 false,
                 Some(session.storage_device()),
+                packed_history.as_ref(),
             )?
             .state;
         tracker_state = self.attach_state_memory(
@@ -1054,6 +1094,11 @@ impl Sam3VideoTrackerCore<'_> {
                 compute_device,
             )?
         };
+        let packed_history = if self.tracker.config().predictor.use_stateless_refinement {
+            None
+        } else {
+            self.packed_prompt_history_on_compute_device(session, object.obj_id, compute_device)?
+        };
         let visual = tracker_visual_output(&session.get_visual_features(
             model,
             compute_device,
@@ -1087,6 +1132,7 @@ impl Sam3VideoTrackerCore<'_> {
                 self.tracker.config().predictor.use_prev_mem_frame,
                 false,
                 Some(session.storage_device()),
+                packed_history.as_ref(),
             )?
             .state;
         tracker_state = self.attach_state_memory(&visual, &tracker_state, false)?;
@@ -1210,6 +1256,7 @@ impl Sam3VideoTrackerCore<'_> {
                 true,
                 false,
                 Some(session.storage_device()),
+                None,
             )?
             .state;
         let detector_score = detector_output.score_value()?;
@@ -1305,6 +1352,7 @@ impl Sam3VideoTrackerCore<'_> {
                 false,
                 false,
                 Some(session.storage_device()),
+                None,
             )?
             .state;
         let mut output = tracker_state_to_object_output(
@@ -1376,6 +1424,7 @@ impl Sam3VideoTrackerCore<'_> {
                 true,
                 false,
                 Some(session.storage_device()),
+                None,
             )?
             .state;
         let mut output = mask_prompt_to_object_output(
@@ -1669,7 +1718,15 @@ impl Sam3VideoTrackerCore<'_> {
         for (obj_id, _output, tracker_state, display_score) in pending_results {
             let tracker_storage = move_tracker_state(&tracker_state, session.storage_device())?;
             if let Some(object) = session.tracked_objects.get_mut(&obj_id) {
-                object.tracker_states.insert(frame_idx, tracker_storage);
+                let replaced = object
+                    .tracker_states
+                    .insert(frame_idx, tracker_storage.clone())
+                    .is_some();
+                if replaced {
+                    object.clear_prompt_history_cache();
+                } else {
+                    object.maybe_append_prompt_history_cache(frame_idx, &tracker_storage)?;
+                }
                 object.has_inference_history = true;
                 object.last_updated_frame = frame_idx;
                 if let Some(display_score) = display_score {

@@ -94,6 +94,7 @@ impl Sam3TrackerModel {
                 &config.shapes.no_obj_embed_spatial_shape,
                 "no_obj_embed_spatial",
             )?,
+            prepared_high_res_feature_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -205,6 +206,7 @@ impl Sam3TrackerModel {
             use_prev_mem_frame,
             run_mem_encoder,
             None,
+            None,
         )
     }
 
@@ -223,6 +225,7 @@ impl Sam3TrackerModel {
         use_prev_mem_frame: bool,
         run_mem_encoder: bool,
         storage_device: Option<&Device>,
+        packed_history: Option<&PackedPromptHistory>,
     ) -> Result<TrackerStepOutput> {
         if visual.backbone_fpn.is_empty() {
             candle::bail!("tracker requires at least one visual feature level")
@@ -310,6 +313,7 @@ impl Sam3TrackerModel {
                 num_frames,
                 reverse,
                 use_prev_mem_frame,
+                packed_history,
             )?;
             prompt_frame_indices = prepared.selected_conditioning_frame_indices;
             memory_frame_indices = prepared.selected_memory_frame_indices;
@@ -321,10 +325,26 @@ impl Sam3TrackerModel {
             )?
         };
         if let Some(mask_input) = mask_input {
-            let mut state = self.use_mask_as_output(
+            let mask_input = normalize_mask_prompt(mask_input, backbone_features.device())?;
+            let mask_inputs_float = mask_input.to_dtype(DType::F32)?;
+            let high_res_masks = mask_inputs_float.affine(20.0, -10.0)?;
+            let mask_input_low_res_size = (self.input_mask_size() / self.config.backbone_stride) * 4;
+            let low_res_masks = resize_bilinear2d_antialias(
+                &high_res_masks,
+                mask_input_low_res_size,
+                mask_input_low_res_size,
+            )?;
+            let iou_scores =
+                Tensor::ones((mask_inputs_float.dim(0)?, 1), DType::F32, backbone_features.device())?;
+            let mask_prompt = self.mask_downsample.forward(&mask_inputs_float)?;
+            let mut state = self.use_mask_as_output_prepared(
                 &backbone_features,
                 high_res_features,
-                mask_input,
+                mask_inputs_float,
+                high_res_masks,
+                low_res_masks,
+                iou_scores,
+                &mask_prompt,
                 is_conditioning_frame,
             )?;
             if run_mem_encoder && self.config.num_maskmem > 0 {

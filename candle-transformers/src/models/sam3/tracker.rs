@@ -1,6 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Mutex;
 
-use candle::{DType, Device, IndexOp, Result, Tensor, D};
+use candle::{DType, Device, IndexOp, Result, Tensor, TensorId, D};
 use candle_nn::{
     Conv2d, Conv2dConfig, ConvTranspose2d, ConvTranspose2dConfig, Embedding, LayerNorm, Module,
     VarBuilder,
@@ -104,6 +105,136 @@ impl TrackerFrameState {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PackedPromptHistory {
+    initialized: bool,
+    maskmem_frames: Vec<usize>,
+    maskmem_frame_slots: HashMap<usize, usize>,
+    maskmem_prompt_features: Option<Tensor>,
+    maskmem_prompt_pos_enc: Option<Tensor>,
+    obj_ptr_frames: Vec<usize>,
+    obj_ptr_frame_slots: HashMap<usize, usize>,
+    obj_ptrs: Option<Tensor>,
+}
+
+impl PackedPromptHistory {
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    pub fn ensure_built(&mut self, states: &BTreeMap<usize, TrackerFrameState>) -> Result<()> {
+        if self.initialized {
+            return Ok(());
+        }
+        *self = Self::from_states(states)?;
+        Ok(())
+    }
+
+    pub fn maskmem_prompt_features(&self) -> Option<&Tensor> {
+        self.maskmem_prompt_features.as_ref()
+    }
+
+    pub fn maskmem_prompt_pos_enc(&self) -> Option<&Tensor> {
+        self.maskmem_prompt_pos_enc.as_ref()
+    }
+
+    pub fn obj_ptrs(&self) -> Option<&Tensor> {
+        self.obj_ptrs.as_ref()
+    }
+
+    pub fn maskmem_slot_indices_tensor(
+        &self,
+        frames: &[usize],
+        device: &Device,
+    ) -> Result<Option<Tensor>> {
+        self.slot_indices_tensor(frames, &self.maskmem_frame_slots, device)
+    }
+
+    pub fn obj_ptr_slot_indices_tensor(
+        &self,
+        frames: &[usize],
+        device: &Device,
+    ) -> Result<Option<Tensor>> {
+        self.slot_indices_tensor(frames, &self.obj_ptr_frame_slots, device)
+    }
+
+    pub fn append_state(&mut self, frame_idx: usize, state: &TrackerFrameState) -> Result<()> {
+        if self.obj_ptr_frame_slots.contains_key(&frame_idx)
+            || self.maskmem_frame_slots.contains_key(&frame_idx)
+        {
+            self.clear();
+            return Ok(());
+        }
+
+        let next_obj_slot = self.obj_ptr_frames.len();
+        let obj_ptr = state.obj_ptr.unsqueeze(0)?;
+        Self::append_tensor(&mut self.obj_ptrs, obj_ptr)?;
+        self.obj_ptr_frames.push(frame_idx);
+        self.obj_ptr_frame_slots.insert(frame_idx, next_obj_slot);
+
+        if let (Some(maskmem_prompt_features), Some(maskmem_prompt_pos_enc)) = (
+            state.maskmem_prompt_features.as_ref(),
+            state.maskmem_prompt_pos_enc.as_ref(),
+        ) {
+            let next_maskmem_slot = self.maskmem_frames.len();
+            Self::append_tensor(
+                &mut self.maskmem_prompt_features,
+                maskmem_prompt_features.unsqueeze(0)?,
+            )?;
+            Self::append_tensor(
+                &mut self.maskmem_prompt_pos_enc,
+                maskmem_prompt_pos_enc.unsqueeze(0)?,
+            )?;
+            self.maskmem_frames.push(frame_idx);
+            self.maskmem_frame_slots.insert(frame_idx, next_maskmem_slot);
+        }
+
+        self.initialized = true;
+        Ok(())
+    }
+
+    fn from_states(states: &BTreeMap<usize, TrackerFrameState>) -> Result<Self> {
+        let mut packed = Self::default();
+        for (&frame_idx, state) in states.iter() {
+            packed.append_state(frame_idx, state)?;
+        }
+        packed.initialized = true;
+        Ok(packed)
+    }
+
+    fn append_tensor(dst: &mut Option<Tensor>, block: Tensor) -> Result<()> {
+        let block = block.contiguous()?;
+        *dst = Some(match dst.take() {
+            Some(existing) => Tensor::cat(&[&existing, &block], 0)?,
+            None => block,
+        });
+        Ok(())
+    }
+
+    fn slot_indices_tensor(
+        &self,
+        frames: &[usize],
+        frame_slots: &HashMap<usize, usize>,
+        device: &Device,
+    ) -> Result<Option<Tensor>> {
+        if frames.is_empty() {
+            return Ok(None);
+        }
+        let mut slots = Vec::with_capacity(frames.len());
+        for frame in frames {
+            let Some(slot) = frame_slots.get(frame) else {
+                return Ok(None);
+            };
+            slots.push(*slot as u32);
+        }
+        Ok(Some(Tensor::from_vec(slots, frames.len(), device)?))
+    }
+}
+
 pub(super) fn prepare_maskmem_prompt_tensors(
     maskmem_features: &Tensor,
     maskmem_pos_enc: &Tensor,
@@ -159,6 +290,14 @@ pub struct Sam3TrackerModel {
     no_mem_pos_enc: Tensor,
     no_obj_ptr: Tensor,
     no_obj_embed_spatial: Tensor,
+    prepared_high_res_feature_cache: Mutex<HashMap<PreparedHighResFeatureCacheKey, Vec<Tensor>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct PreparedHighResFeatureCacheKey {
+    pub feat_s0_id: TensorId,
+    pub feat_s1_id: TensorId,
+    pub dtype: String,
 }
 
 #[cfg(test)]

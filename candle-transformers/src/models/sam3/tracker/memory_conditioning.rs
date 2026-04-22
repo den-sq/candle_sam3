@@ -44,6 +44,17 @@ fn state_maskmem_prompt_tensors(
     }
 }
 
+fn combine_prompt_blocks(blocks: Vec<Tensor>) -> Result<Option<Tensor>> {
+    match blocks.len() {
+        0 => Ok(None),
+        1 => Ok(blocks.into_iter().next()),
+        _ => {
+            let block_refs = blocks.iter().collect::<Vec<_>>();
+            Ok(Some(Tensor::cat(block_refs.as_slice(), 0)?))
+        }
+    }
+}
+
 impl Sam3TrackerModel {
     pub(super) fn cal_mem_score(
         &self,
@@ -201,6 +212,7 @@ impl Sam3TrackerModel {
         num_frames: usize,
         track_in_reverse: bool,
         use_prev_mem_frame: bool,
+        packed_history: Option<&PackedPromptHistory>,
     ) -> Result<PreparedMemoryConditioning> {
         let batch_size = current_vision_feats
             .last()
@@ -240,6 +252,7 @@ impl Sam3TrackerModel {
             num_frames,
             track_in_reverse,
             &cond_frame_outputs,
+            packed_history,
         )?;
         let selected_conditioning_frame_indices =
             prepared_prompt.selected_conditioning_frame_indices.clone();
@@ -303,6 +316,7 @@ impl Sam3TrackerModel {
         num_frames: usize,
         track_in_reverse: bool,
         cond_frame_outputs: &BTreeMap<usize, &TrackerFrameState>,
+        packed_history: Option<&PackedPromptHistory>,
     ) -> Result<PreparedMemoryPrompt> {
         let device = cond_frame_outputs
             .values()
@@ -334,10 +348,11 @@ impl Sam3TrackerModel {
             .collect::<BTreeMap<_, _>>();
 
         let tpos_sign_mul: i64 = if track_in_reverse { -1 } else { 1 };
-        let mut prompt_parts = Vec::new();
-        let mut prompt_pos_parts = Vec::new();
         let mut selected_memory_frame_indices_ordered = Vec::new();
         let mut selected_object_pointer_frame_indices = Vec::new();
+        let mut selected_maskmem_frames = Vec::new();
+        let mut selected_maskmem_tpos_indices = Vec::new();
+        let mut selected_maskmem_states = Vec::new();
 
         for &selected_frame in selected_cond_ordered.iter() {
             let prev = cond_frame_outputs
@@ -348,12 +363,9 @@ impl Sam3TrackerModel {
                     "conditioning frame {selected_frame} is missing maskmem tensors required for tracker memory conditioning"
                 );
             }
-            let (maskmem_features, maskmem_pos_enc) =
-                state_maskmem_prompt_tensors(prev, device, self.no_obj_ptr.dtype())?;
-            prompt_parts.push(maskmem_features);
-            let pos = maskmem_pos_enc;
-            let pos = pos.broadcast_add(&self.maskmem_tpos_enc.i(self.config.num_maskmem - 1)?)?;
-            prompt_pos_parts.push(pos);
+            selected_maskmem_frames.push(selected_frame);
+            selected_maskmem_tpos_indices.push(self.config.num_maskmem - 1);
+            selected_maskmem_states.push(*prev);
         }
 
         let r = self.config.memory_temporal_stride_for_eval.max(1);
@@ -392,18 +404,71 @@ impl Sam3TrackerModel {
             if prev.maskmem_features.is_none() || prev.maskmem_pos_enc.is_none() {
                 continue;
             }
-            let (maskmem_features, maskmem_pos_enc) =
-                state_maskmem_prompt_tensors(prev, device, self.no_obj_ptr.dtype())?;
-            prompt_parts.push(maskmem_features);
-            let pos = maskmem_pos_enc;
-            let pos = pos.broadcast_add(
-                &self
-                    .maskmem_tpos_enc
-                    .i(self.config.num_maskmem - t_pos - 1)?,
-            )?;
-            prompt_pos_parts.push(pos);
+            selected_maskmem_frames.push(prev_frame_idx);
+            selected_maskmem_tpos_indices.push(self.config.num_maskmem - t_pos - 1);
+            selected_maskmem_states.push(prev);
             selected_memory_frame_indices_ordered.push(prev_frame_idx);
         }
+
+        let maskmem_block = if selected_maskmem_frames.is_empty() {
+            None
+        } else if let Some(packed_history) = packed_history {
+            match (
+                packed_history.maskmem_slot_indices_tensor(
+                    selected_maskmem_frames.as_slice(),
+                    device,
+                )?,
+                packed_history.maskmem_prompt_features(),
+                packed_history.maskmem_prompt_pos_enc(),
+            ) {
+                (Some(slot_indices), Some(packed_features), Some(packed_pos)) => {
+                    let tpos_indices = Tensor::from_vec(
+                        selected_maskmem_tpos_indices
+                            .iter()
+                            .map(|index| *index as u32)
+                            .collect(),
+                        selected_maskmem_tpos_indices.len(),
+                        device,
+                    )?;
+                    let prompt = packed_features
+                        .index_select(&slot_indices, 0)?
+                        .flatten(0, 1)?;
+                    let prompt_pos = packed_pos.index_select(&slot_indices, 0)?.broadcast_add(
+                        &self.maskmem_tpos_enc.index_select(&tpos_indices, 0)?,
+                    )?
+                    .flatten(0, 1)?;
+                    Some((prompt, prompt_pos))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let maskmem_block = match maskmem_block {
+            Some(block) => Some(block),
+            None if !selected_maskmem_states.is_empty() => {
+                let mut prompt_parts = Vec::with_capacity(selected_maskmem_states.len());
+                let mut prompt_pos_parts = Vec::with_capacity(selected_maskmem_states.len());
+                for (state, tpos_index) in selected_maskmem_states
+                    .iter()
+                    .zip(selected_maskmem_tpos_indices.iter().copied())
+                {
+                    let (maskmem_features, maskmem_pos_enc) =
+                        state_maskmem_prompt_tensors(state, device, self.no_obj_ptr.dtype())?;
+                    prompt_parts.push(maskmem_features);
+                    prompt_pos_parts.push(
+                        maskmem_pos_enc
+                            .broadcast_add(&self.maskmem_tpos_enc.i(tpos_index)?)?,
+                    );
+                }
+                let prompt = combine_prompt_blocks(prompt_parts)?
+                    .expect("maskmem prompt blocks are non-empty");
+                let prompt_pos = combine_prompt_blocks(prompt_pos_parts)?
+                    .expect("maskmem prompt position blocks are non-empty");
+                Some((prompt, prompt_pos))
+            }
+            None => None,
+        };
 
         let max_obj_ptrs_in_encoder = self.config.max_obj_ptrs_in_encoder.min(num_frames);
         let ptr_cond_frames = if !track_in_reverse {
@@ -464,8 +529,28 @@ impl Sam3TrackerModel {
         }
 
         let mut num_obj_ptr_tokens = 0usize;
-        if !obj_ptr_tensors.is_empty() {
-            let mut obj_ptrs = Tensor::stack(obj_ptr_tensors.as_slice(), 0)?;
+        let obj_ptr_block = if selected_object_pointer_frame_indices.is_empty() {
+            None
+        } else {
+            let mut obj_ptrs = if let Some(packed_history) = packed_history {
+                match (
+                    packed_history.obj_ptr_slot_indices_tensor(
+                        selected_object_pointer_frame_indices.as_slice(),
+                        device,
+                    )?,
+                    packed_history.obj_ptrs(),
+                ) {
+                    (Some(slot_indices), Some(packed_obj_ptrs)) => {
+                        packed_obj_ptrs.index_select(&slot_indices, 0)?
+                    }
+                    _ if obj_ptr_tensors.len() == 1 => obj_ptr_tensors[0].unsqueeze(0)?,
+                    _ => Tensor::stack(obj_ptr_tensors.as_slice(), 0)?,
+                }
+            } else if obj_ptr_tensors.len() == 1 {
+                obj_ptr_tensors[0].unsqueeze(0)?
+            } else {
+                Tensor::stack(obj_ptr_tensors.as_slice(), 0)?
+            };
             let mut obj_pos = self.get_tpos_enc(
                 obj_ptr_offsets.as_slice(),
                 device,
@@ -486,13 +571,22 @@ impl Sam3TrackerModel {
                 obj_pos = repeat_interleave(&obj_pos, split, 0)?;
             }
             num_obj_ptr_tokens = obj_ptrs.dim(0)?;
-            prompt_parts.push(obj_ptrs);
-            prompt_pos_parts.push(obj_pos);
-        }
+            Some((obj_ptrs, obj_pos))
+        };
 
         let mut selected_memory_frame_indices = selected_memory_frame_indices_ordered;
         selected_memory_frame_indices.sort_unstable();
-        if prompt_parts.is_empty() {
+        let mut prompt_blocks = Vec::new();
+        let mut prompt_pos_blocks = Vec::new();
+        if let Some((prompt, prompt_pos)) = maskmem_block {
+            prompt_blocks.push(prompt);
+            prompt_pos_blocks.push(prompt_pos);
+        }
+        if let Some((obj_ptrs, obj_pos)) = obj_ptr_block {
+            prompt_blocks.push(obj_ptrs);
+            prompt_pos_blocks.push(obj_pos);
+        }
+        if prompt_blocks.is_empty() {
             return Ok(PreparedMemoryPrompt {
                 prompt: None,
                 prompt_pos: None,
@@ -503,11 +597,9 @@ impl Sam3TrackerModel {
             });
         }
 
-        let prompt_refs = prompt_parts.iter().collect::<Vec<_>>();
-        let prompt_pos_refs = prompt_pos_parts.iter().collect::<Vec<_>>();
         Ok(PreparedMemoryPrompt {
-            prompt: Some(Tensor::cat(prompt_refs.as_slice(), 0)?),
-            prompt_pos: Some(Tensor::cat(prompt_pos_refs.as_slice(), 0)?),
+            prompt: combine_prompt_blocks(prompt_blocks)?,
+            prompt_pos: combine_prompt_blocks(prompt_pos_blocks)?,
             num_obj_ptr_tokens,
             selected_conditioning_frame_indices,
             selected_memory_frame_indices,

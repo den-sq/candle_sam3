@@ -41,9 +41,7 @@ impl Attention {
     fn recombine_heads(&self, x: &Tensor) -> Result<Tensor> {
         let (b, n_heads, n_tokens, c_per_head) = x.dims4()?;
         x.transpose(1, 2)?
-            // Keep Q/K/V as strided views during attention and pay for a single
-            // materialization here, where the following reshape/out-proj need a
-            // token-major contiguous layout anyway.
+            // The output projection wants a token-major contiguous layout.
             .contiguous()?
             .reshape((b, n_tokens, n_heads * c_per_head))
     }

@@ -485,9 +485,7 @@ impl Sam3TrackerModel {
             (low_res_masks, high_res_masks, sam_output_tokens.i((.., 0, ..))?)
         };
         let obj_ptr = self.obj_ptr_proj.forward(&sam_output_token)?;
-        let object_present_for_ptr = object_present
-            .broadcast_as(obj_ptr.shape())?
-            .where_cond(&obj_ptr, &self.no_obj_ptr.broadcast_as(obj_ptr.shape())?)?;
+        let object_present_for_ptr = gate_object_ptr(&obj_ptr, &object_present, &self.no_obj_ptr)?;
         Ok(TrackerFrameState {
             low_res_masks,
             high_res_masks,
@@ -525,11 +523,34 @@ impl Sam3TrackerModel {
             Some(high_res_features) => Some(self.prepare_high_res_features(high_res_features)?),
             None => None,
         };
+        self.use_mask_as_output_prepared(
+            backbone_features,
+            prepared_high_res_features.as_deref(),
+            mask_inputs_float,
+            high_res_masks,
+            low_res_masks,
+            iou_scores,
+            &mask_prompt,
+            is_cond_frame,
+        )
+    }
+
+    pub(super) fn use_mask_as_output_prepared(
+        &self,
+        backbone_features: &Tensor,
+        high_res_features: Option<&[Tensor]>,
+        mask_inputs_float: Tensor,
+        high_res_masks: Tensor,
+        low_res_masks: Tensor,
+        iou_scores: Tensor,
+        mask_prompt: &Tensor,
+        is_cond_frame: bool,
+    ) -> Result<TrackerFrameState> {
         let state = self.forward_sam_heads(
             backbone_features,
             None,
-            Some(&mask_prompt),
-            prepared_high_res_features.as_deref(),
+            Some(mask_prompt),
+            high_res_features,
             false,
             is_cond_frame,
         )?;
@@ -541,12 +562,7 @@ impl Sam3TrackerModel {
             .gt(0f64)?
             .unsqueeze(1)?;
         let object_score_logits = object_present.to_dtype(DType::F32)?.affine(20.0, -10.0)?;
-        let obj_ptr = object_present
-            .broadcast_as(state.obj_ptr.shape())?
-            .where_cond(
-                &state.obj_ptr,
-                &self.no_obj_ptr.broadcast_as(state.obj_ptr.shape())?,
-            )?;
+        let obj_ptr = gate_object_ptr(&state.obj_ptr, &object_present, &self.no_obj_ptr)?;
         Ok(TrackerFrameState {
             low_res_masks,
             high_res_masks,
@@ -562,12 +578,21 @@ impl Sam3TrackerModel {
     }
 }
 
-fn gate_selected_masks(low_res_masks: &Tensor, object_present: &Tensor, device: &Device) -> Result<Tensor> {
-    object_present
-        .reshape((object_present.dim(0)?, 1, 1, 1))?
-        .broadcast_as(low_res_masks.shape())?
-        .where_cond(
-            low_res_masks,
-            &Tensor::full(NO_OBJ_SCORE as f32, low_res_masks.shape(), device)?,
-        )
+fn gate_selected_masks(low_res_masks: &Tensor, object_present: &Tensor, _device: &Device) -> Result<Tensor> {
+    let present = object_present
+        .to_dtype(low_res_masks.dtype())?
+        .reshape((object_present.dim(0)?, 1, 1, 1))?;
+    let absent = present.affine(-1.0, 1.0)?;
+    low_res_masks
+        .broadcast_mul(&present)?
+        .broadcast_add(&absent.affine(NO_OBJ_SCORE, 0.0)?)
+}
+
+fn gate_object_ptr(obj_ptr: &Tensor, object_present: &Tensor, no_obj_ptr: &Tensor) -> Result<Tensor> {
+    let present = object_present.to_dtype(obj_ptr.dtype())?;
+    let absent = present.affine(-1.0, 1.0)?;
+    let no_obj_ptr = maybe_to_device_dtype(no_obj_ptr, obj_ptr.device(), obj_ptr.dtype())?;
+    obj_ptr
+        .broadcast_mul(&present)?
+        .broadcast_add(&absent.broadcast_mul(&no_obj_ptr)?)
 }

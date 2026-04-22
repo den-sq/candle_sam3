@@ -39,6 +39,49 @@ pub(super) fn normalize_mask_prompt(mask: &Tensor, device: &Device) -> Result<Te
 }
 
 impl Sam3TrackerModel {
+    fn prepare_high_res_features_uncached(
+        &self,
+        high_res_features: &[Tensor],
+    ) -> Result<Vec<Tensor>> {
+        if high_res_features.len() < 2 {
+            candle::bail!(
+                "tracker expected at least two high-resolution feature levels, got {}",
+                high_res_features.len()
+            );
+        }
+        let feat_s0 = &high_res_features[0];
+        let feat_s1 = &high_res_features[1];
+        let compute_dtype = self.no_obj_ptr.dtype();
+        let projected_s0 = self.config.mask_decoder.transformer_dim / 8;
+        let projected_s1 = self.config.mask_decoder.transformer_dim / 4;
+        let (_, channels_s0, _, _) = feat_s0.dims4()?;
+        let (_, channels_s1, _, _) = feat_s1.dims4()?;
+        if channels_s0 == projected_s0 && channels_s1 == projected_s1 {
+            return Ok(vec![
+                maybe_to_dtype(feat_s0, compute_dtype)?,
+                maybe_to_dtype(feat_s1, compute_dtype)?,
+            ]);
+        }
+        if channels_s0 == self.config.hidden_dim && channels_s1 == self.config.hidden_dim {
+            let conv_s0 = self.sam_mask_decoder.conv_s0.as_ref().ok_or_else(|| {
+                candle::Error::Msg("tracker high-res projection conv_s0 missing".into())
+            })?;
+            let conv_s1 = self.sam_mask_decoder.conv_s1.as_ref().ok_or_else(|| {
+                candle::Error::Msg("tracker high-res projection conv_s1 missing".into())
+            })?;
+            return Ok(vec![
+                maybe_to_dtype(&feat_s0.apply(conv_s0)?, compute_dtype)?,
+                maybe_to_dtype(&feat_s1.apply(conv_s1)?, compute_dtype)?,
+            ]);
+        }
+        candle::bail!(
+            "unexpected tracker high-res feature channel contract: s0={}, s1={}, expected projected [{projected_s0}, {projected_s1}] or hidden_dim {}",
+            channels_s0,
+            channels_s1,
+            self.config.hidden_dim
+        );
+    }
+
     pub(super) fn prepare_point_prompt(
         &self,
         point_coords: Option<&Tensor>,
@@ -94,34 +137,26 @@ impl Sam3TrackerModel {
         let feat_s0 = &high_res_features[0];
         let feat_s1 = &high_res_features[1];
         let compute_dtype = self.no_obj_ptr.dtype();
-        let projected_s0 = self.config.mask_decoder.transformer_dim / 8;
-        let projected_s1 = self.config.mask_decoder.transformer_dim / 4;
-        let (_, channels_s0, _, _) = feat_s0.dims4()?;
-        let (_, channels_s1, _, _) = feat_s1.dims4()?;
-        if channels_s0 == projected_s0 && channels_s1 == projected_s1 {
-            return Ok(vec![
-                maybe_to_dtype(feat_s0, compute_dtype)?,
-                maybe_to_dtype(feat_s1, compute_dtype)?,
-            ]);
+        let key = PreparedHighResFeatureCacheKey {
+            feat_s0_id: feat_s0.id(),
+            feat_s1_id: feat_s1.id(),
+            dtype: format!("{:?}", compute_dtype),
+        };
+        if let Some(cached) = self
+            .prepared_high_res_feature_cache
+            .lock()
+            .expect("tracker high-res feature cache lock poisoned")
+            .get(&key)
+            .cloned()
+        {
+            return Ok(cached);
         }
-        if channels_s0 == self.config.hidden_dim && channels_s1 == self.config.hidden_dim {
-            let conv_s0 = self.sam_mask_decoder.conv_s0.as_ref().ok_or_else(|| {
-                candle::Error::Msg("tracker high-res projection conv_s0 missing".into())
-            })?;
-            let conv_s1 = self.sam_mask_decoder.conv_s1.as_ref().ok_or_else(|| {
-                candle::Error::Msg("tracker high-res projection conv_s1 missing".into())
-            })?;
-            return Ok(vec![
-                maybe_to_dtype(&feat_s0.apply(conv_s0)?, compute_dtype)?,
-                maybe_to_dtype(&feat_s1.apply(conv_s1)?, compute_dtype)?,
-            ]);
-        }
-        candle::bail!(
-            "unexpected tracker high-res feature channel contract: s0={}, s1={}, expected projected [{projected_s0}, {projected_s1}] or hidden_dim {}",
-            channels_s0,
-            channels_s1,
-            self.config.hidden_dim
-        );
+        let prepared = self.prepare_high_res_features_uncached(high_res_features)?;
+        let mut cache = self
+            .prepared_high_res_feature_cache
+            .lock()
+            .expect("tracker high-res feature cache lock poisoned");
+        Ok(cache.entry(key).or_insert_with(|| prepared.clone()).clone())
     }
 
     #[cfg(test)]
