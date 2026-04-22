@@ -54,6 +54,87 @@ impl Module for TrackerMlp {
 }
 
 #[derive(Debug)]
+struct BatchedTrackerMlpLayer {
+    weight_t: Tensor,
+    bias: Option<Tensor>,
+}
+
+#[derive(Debug)]
+struct BatchedTrackerMlp {
+    layers: Vec<BatchedTrackerMlpLayer>,
+    sigmoid_output: bool,
+}
+
+impl BatchedTrackerMlp {
+    fn from_mlps(mlps: Vec<TrackerMlp>) -> Result<Self> {
+        let Some(first) = mlps.first() else {
+            candle::bail!("batched tracker mlp requires at least one mlp")
+        };
+        let num_layers = first.layers.len();
+        let sigmoid_output = first.sigmoid_output;
+        let mut layers = Vec::with_capacity(num_layers);
+        for layer_index in 0..num_layers {
+            let reference_layer = &first.layers[layer_index];
+            let has_bias = reference_layer.bias().is_some();
+            let mut weights = Vec::with_capacity(mlps.len());
+            let mut biases = if has_bias {
+                Some(Vec::with_capacity(mlps.len()))
+            } else {
+                None
+            };
+            for mlp in &mlps {
+                if mlp.layers.len() != num_layers {
+                    candle::bail!("batched tracker mlp requires identical layer counts");
+                }
+                if mlp.sigmoid_output != sigmoid_output {
+                    candle::bail!("batched tracker mlp requires identical output activation");
+                }
+                let layer = &mlp.layers[layer_index];
+                if layer.bias().is_some() != has_bias {
+                    candle::bail!("batched tracker mlp requires identical bias layout");
+                }
+                weights.push(layer.weight().clone());
+                if let (Some(layer_bias), Some(stacked_biases)) = (layer.bias(), biases.as_mut()) {
+                    stacked_biases.push(layer_bias.clone());
+                }
+            }
+            let weight_t = Tensor::stack(weights.as_slice(), 0)?
+                .transpose(1, 2)?
+                .contiguous()?;
+            let bias = match biases {
+                Some(stacked_biases) => Some(Tensor::stack(stacked_biases.as_slice(), 0)?),
+                None => None,
+            };
+            layers.push(BatchedTrackerMlpLayer { weight_t, bias });
+        }
+        Ok(Self {
+            layers,
+            sigmoid_output,
+        })
+    }
+
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let batch_size = xs.dim(0)?;
+        let mut xs = xs.clone();
+        for (index, layer) in self.layers.iter().enumerate() {
+            let weight_t = layer.weight_t.broadcast_left(batch_size)?;
+            xs = xs.unsqueeze(2)?.matmul(&weight_t)?.squeeze(2)?;
+            if let Some(bias) = &layer.bias {
+                xs = xs.broadcast_add(&bias.unsqueeze(0)?)?;
+            }
+            if index + 1 < self.layers.len() {
+                xs = xs.relu()?;
+            }
+        }
+        if self.sigmoid_output {
+            candle_nn::ops::sigmoid(&xs)
+        } else {
+            Ok(xs)
+        }
+    }
+}
+
+#[derive(Debug)]
 enum PredObjScoreHead {
     Linear(Linear),
     Mlp(TrackerMlp),
@@ -82,7 +163,7 @@ pub(super) struct Sam3TrackerMaskDecoder {
     output_upscaling_conv2: ConvTranspose2d,
     pub(super) conv_s0: Option<Conv2d>,
     pub(super) conv_s1: Option<Conv2d>,
-    output_hypernetworks_mlps: Vec<TrackerMlp>,
+    output_hypernetworks_mlps: BatchedTrackerMlp,
     iou_prediction_head: TrackerMlp,
     pred_obj_score_head: Option<PredObjScoreHead>,
     num_mask_tokens: usize,
@@ -184,6 +265,7 @@ impl Sam3TrackerMaskDecoder {
                 output_hypernetworks_vb.pp(index),
             )?);
         }
+        let output_hypernetworks_mlps = BatchedTrackerMlp::from_mlps(output_hypernetworks_mlps)?;
         let iou_prediction_head = TrackerMlp::new(
             config.transformer_dim,
             config.iou_head_hidden_dim,
@@ -350,17 +432,7 @@ impl Sam3TrackerMaskDecoder {
             }
         };
         let (_, upscaled_dim, upscaled_height, upscaled_width) = upscaled_embedding.dims4()?;
-        let mut hyper_in_list = Vec::with_capacity(self.num_mask_tokens);
-        for index in 0..self.num_mask_tokens {
-            hyper_in_list.push(
-                self.output_hypernetworks_mlps[index].forward(&mask_tokens_out.i((
-                    ..,
-                    index,
-                    ..,
-                ))?)?,
-            );
-        }
-        let hyper_in = Tensor::stack(hyper_in_list.as_slice(), 1)?;
+        let hyper_in = self.output_hypernetworks_mlps.forward(&mask_tokens_out)?;
         let masks = hyper_in
             .matmul(&upscaled_embedding.reshape((
                 batch_size,

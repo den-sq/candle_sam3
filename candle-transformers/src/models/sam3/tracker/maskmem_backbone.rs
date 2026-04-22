@@ -90,7 +90,7 @@ impl TrackerSimpleMaskDownSampler {
 #[derive(Debug)]
 struct TrackerCxBlock {
     dwconv: Conv2d,
-    norm: LayerNorm2d,
+    norm: LayerNorm,
     pwconv1: Linear,
     pwconv2: Linear,
     gamma: Option<Tensor>,
@@ -111,13 +111,13 @@ impl TrackerCxBlock {
             vb.pp("dwconv"),
         )?;
         let gamma = if config.layer_scale_init_value > 0.0 {
-            Some(vb.get((config.dim,), "gamma")?)
+            Some(vb.get((config.dim,), "gamma")?.reshape((1, 1, 1, config.dim))?)
         } else {
             None
         };
         Ok(Self {
             dwconv,
-            norm: LayerNorm2d::new(config.dim, 1e-6, vb.pp("norm"))?,
+            norm: candle_nn::layer_norm(config.dim, 1e-6, vb.pp("norm"))?,
             pwconv1: linear(vb.pp("pwconv1"), config.dim, 4 * config.dim, true)?,
             pwconv2: linear(vb.pp("pwconv2"), 4 * config.dim, config.dim, true)?,
             gamma,
@@ -127,15 +127,15 @@ impl TrackerCxBlock {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let residual = xs.clone();
         let mut xs = self.dwconv.forward(xs)?;
-        xs = self.norm.forward(&xs)?;
         xs = xs.permute((0, 2, 3, 1))?.contiguous()?;
+        xs = self.norm.forward(&xs)?;
         xs = self.pwconv1.forward(&xs)?;
         xs = xs.gelu_erf()?;
         xs = self.pwconv2.forward(&xs)?;
         if let Some(gamma) = self.gamma.as_ref() {
-            xs = xs.broadcast_mul(&gamma.reshape((1, 1, 1, gamma.dim(0)?))?)?;
+            xs = xs.broadcast_mul(gamma)?;
         }
-        xs = xs.permute((0, 3, 1, 2))?;
+        xs = xs.permute((0, 3, 1, 2))?.contiguous()?;
         residual.broadcast_add(&xs)
     }
 }
