@@ -1,0 +1,25 @@
+{
+  "name": "truck_point_refinement",
+  "steps": [
+    {
+      "name": "seed_positive",
+      "points": [
+        { "x": 0.2888888889, "y": 0.3125, "label": 1 }
+      ]
+    },
+    {
+      "name": "add_positive_detail",
+      "points": [
+        { "x": 0.2777777778, "y": 0.3125, "label": 1 },
+        { "x": 0.625, "y": 0.5208333333, "label": 1 }
+      ]
+    },
+    {
+      "name": "trim_with_negative",
+      "points": [
+        { "x": 0.2777777778, "y": 0.3125, "label": 1 },
+        { "x": 0.625, "y": 0.5208333333, "label": 0 }
+      ]
+    }
+  ]
+}

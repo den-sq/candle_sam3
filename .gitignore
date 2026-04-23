@@ -54,3 +54,4 @@ candle-examples/examples/sam3/output
 candle-examples/examples/sam3/reference*
 candle-examples/examples/sam3/upstream-video-single
 candle-examples/examples/sam3/test-frames
+candle-examples/examples/sam3/output/summary.json
