@@ -25,6 +25,8 @@ mod encoder;
 mod geometry;
 mod image;
 mod neck;
+#[cfg(feature = "sam3-parity-support")]
+pub mod parity_support;
 mod segmentation;
 mod text;
 pub(crate) mod torch_ops;
