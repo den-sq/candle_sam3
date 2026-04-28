@@ -1001,7 +1001,7 @@ impl Sam3VideoTrackerCore<'_> {
     ) -> Result<(ObjectFrameOutput, TrackerFrameState, Option<f32>)> {
         if prompt.text.is_some() {
             candle::bail!(
-                "SAM3 video tracker strict port currently supports correction prompts for point/box geometry only; text refinement lands in a later step."
+                "SAM3 video tracker correction prompts currently accept point/box geometry only; text refinement is not implemented in this runtime."
             );
         }
         self.ensure_history_states_have_memory(

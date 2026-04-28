@@ -22,7 +22,6 @@ use super::{
     Config,
 };
 
-const STRICT_PORT_IN_PROGRESS: &str = "SAM3 tracker strict port in progress; legacy tracker implementation was removed. See candle-transformers/src/models/sam3/VIDEO_TRACKER_STRICT_PORT.md before implementing tracker behavior.";
 const NO_OBJ_SCORE: f64 = -1024.0;
 
 mod config;
