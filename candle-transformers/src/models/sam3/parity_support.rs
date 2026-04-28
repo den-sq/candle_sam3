@@ -10,9 +10,16 @@ pub use super::config::{
 };
 pub use super::geometry::{EncodedPrompt, GeometryPrompt, SequenceGeometryEncoder};
 pub use super::image::{GroundingOutput, ImageSize, Sam3ImageModel, Sam3ImageState};
-pub use super::tracker::{Sam3TrackerConfig, Sam3TrackerModel, TrackerFrameState, TrackerStepOutput};
+pub use super::tracker::{
+    PackedPromptHistory, ParityPreparedMemoryConditioning, ParityPreparedMemoryPrompt,
+    Sam3TrackerConfig, Sam3TrackerModel, Sam3TrackerParityExt, TrackerFrameState,
+    TrackerStepOutput,
+};
 pub use super::video::{
-    FrameSource, ObjectFrameOutput, PropagationDirection, PropagationOptions, Sam3VideoPredictor,
-    Sam3VideoSession, SessionCacheStats, SessionPrompt, TrackedObject, VideoConfig,
-    VideoDebugConfig, VideoFrameOutput, VideoOutput, VideoSessionOptions, VideoSource,
+    FrameSource, ObjectFrameOutput, ObjectFrameOutputParityExt,
+    ParityTemporalDisambiguationFrameMetadata, PropagationDirection, PropagationOptions,
+    Sam3VideoPredictor, Sam3VideoPredictorParityExt, Sam3VideoSession, Sam3VideoSessionParityExt,
+    Sam3VideoTrackerCore, Sam3VideoTrackerCoreParityExt, SessionCacheStats, SessionPrompt,
+    TrackedObject, VideoConfig, VideoDebugConfig, VideoFrameOutput, VideoOutput,
+    VideoSessionOptions, VideoSource,
 };

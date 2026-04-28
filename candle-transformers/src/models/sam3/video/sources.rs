@@ -461,9 +461,6 @@ fn find_pillow_python() -> Option<PathBuf> {
         candidates.push(path);
     }
     candidates.push(PathBuf::from(".venv/bin/python"));
-    candidates.push(PathBuf::from(
-        "/home/dnorthover/ChengCode/candle_sam3/.venv/bin/python",
-    ));
     candidates.push(PathBuf::from("python3"));
     candidates.into_iter().find(|candidate| {
         candidate.is_absolute() || candidate.exists() || candidate == Path::new("python3")

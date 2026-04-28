@@ -19,12 +19,41 @@ struct PreparedMemoryPrompt {
     selected_object_pointer_frame_indices: Vec<usize>,
 }
 
+#[cfg(feature = "sam3-parity-support")]
+impl From<PreparedMemoryConditioning> for ParityPreparedMemoryConditioning {
+    fn from(value: PreparedMemoryConditioning) -> Self {
+        Self {
+            pix_feat_with_mem: value.pix_feat_with_mem,
+            selected_conditioning_frame_indices: value.selected_conditioning_frame_indices,
+            selected_memory_frame_indices: value.selected_memory_frame_indices,
+            selected_object_pointer_frame_indices: value.selected_object_pointer_frame_indices,
+        }
+    }
+}
+
+#[cfg(feature = "sam3-parity-support")]
+impl From<PreparedMemoryPrompt> for ParityPreparedMemoryPrompt {
+    fn from(value: PreparedMemoryPrompt) -> Self {
+        Self {
+            prompt: value.prompt,
+            prompt_pos: value.prompt_pos,
+            num_obj_ptr_tokens: value.num_obj_ptr_tokens,
+            selected_conditioning_frame_indices: value.selected_conditioning_frame_indices,
+            selected_memory_frame_indices: value.selected_memory_frame_indices,
+            selected_object_pointer_frame_indices: value.selected_object_pointer_frame_indices,
+        }
+    }
+}
+
 fn state_maskmem_prompt_tensors(
     state: &TrackerFrameState,
     device: &Device,
     dtype: DType,
 ) -> Result<(Tensor, Tensor)> {
-    match (&state.maskmem_prompt_features, &state.maskmem_prompt_pos_enc) {
+    match (
+        &state.maskmem_prompt_features,
+        &state.maskmem_prompt_pos_enc,
+    ) {
         (Some(maskmem_features), Some(maskmem_pos_enc)) => Ok((
             maybe_to_device_dtype(maskmem_features, device, dtype)?,
             maybe_to_device_dtype(maskmem_pos_enc, device, dtype)?,
@@ -36,8 +65,7 @@ fn state_maskmem_prompt_tensors(
             let Some(maskmem_pos_enc) = &state.maskmem_pos_enc else {
                 candle::bail!("tracker memory conditioning is missing maskmem_pos_enc")
             };
-            let maskmem_features =
-                maybe_to_device_dtype(maskmem_features, device, dtype)?;
+            let maskmem_features = maybe_to_device_dtype(maskmem_features, device, dtype)?;
             let maskmem_pos_enc = maybe_to_device_dtype(maskmem_pos_enc, device, dtype)?;
             prepare_maskmem_prompt_tensors(&maskmem_features, &maskmem_pos_enc)
         }
@@ -414,10 +442,8 @@ impl Sam3TrackerModel {
             None
         } else if let Some(packed_history) = packed_history {
             match (
-                packed_history.maskmem_slot_indices_tensor(
-                    selected_maskmem_frames.as_slice(),
-                    device,
-                )?,
+                packed_history
+                    .maskmem_slot_indices_tensor(selected_maskmem_frames.as_slice(), device)?,
                 packed_history.maskmem_prompt_features(),
                 packed_history.maskmem_prompt_pos_enc(),
             ) {
@@ -433,10 +459,10 @@ impl Sam3TrackerModel {
                     let prompt = packed_features
                         .index_select(&slot_indices, 0)?
                         .flatten(0, 1)?;
-                    let prompt_pos = packed_pos.index_select(&slot_indices, 0)?.broadcast_add(
-                        &self.maskmem_tpos_enc.index_select(&tpos_indices, 0)?,
-                    )?
-                    .flatten(0, 1)?;
+                    let prompt_pos = packed_pos
+                        .index_select(&slot_indices, 0)?
+                        .broadcast_add(&self.maskmem_tpos_enc.index_select(&tpos_indices, 0)?)?
+                        .flatten(0, 1)?;
                     Some((prompt, prompt_pos))
                 }
                 _ => None,
@@ -457,8 +483,7 @@ impl Sam3TrackerModel {
                         state_maskmem_prompt_tensors(state, device, self.no_obj_ptr.dtype())?;
                     prompt_parts.push(maskmem_features);
                     prompt_pos_parts.push(
-                        maskmem_pos_enc
-                            .broadcast_add(&self.maskmem_tpos_enc.i(tpos_index)?)?,
+                        maskmem_pos_enc.broadcast_add(&self.maskmem_tpos_enc.i(tpos_index)?)?,
                     );
                 }
                 let prompt = combine_prompt_blocks(prompt_parts)?
@@ -605,5 +630,130 @@ impl Sam3TrackerModel {
             selected_memory_frame_indices,
             selected_object_pointer_frame_indices,
         })
+    }
+}
+
+#[cfg(feature = "sam3-parity-support")]
+impl Sam3TrackerParityExt for Sam3TrackerModel {
+    fn parity_compute_dtype(&self) -> DType {
+        self.no_obj_ptr.dtype()
+    }
+
+    fn parity_prepare_high_res_features(
+        &self,
+        high_res_features: &[Tensor],
+    ) -> Result<Vec<Tensor>> {
+        self.prepare_high_res_features(high_res_features)
+    }
+
+    fn parity_use_multimask(&self, is_init_cond_frame: bool, point_count: usize) -> bool {
+        self.use_multimask(is_init_cond_frame, point_count)
+    }
+
+    fn parity_get_tpos_enc(
+        &self,
+        rel_pos_list: &[i64],
+        device: &Device,
+        max_abs_pos: Option<usize>,
+        dummy: bool,
+    ) -> Result<Tensor> {
+        self.get_tpos_enc(rel_pos_list, device, max_abs_pos, dummy)
+    }
+
+    fn parity_forward_sam_heads(
+        &self,
+        backbone_features: &Tensor,
+        point_prompt: Option<&(Tensor, Tensor)>,
+        mask_inputs: Option<&Tensor>,
+        high_res_features: Option<&[Tensor]>,
+        multimask_output: bool,
+        is_cond_frame: bool,
+    ) -> Result<TrackerFrameState> {
+        self.forward_sam_heads(
+            backbone_features,
+            point_prompt,
+            mask_inputs,
+            high_res_features,
+            multimask_output,
+            is_cond_frame,
+        )
+    }
+
+    fn parity_use_mask_as_output(
+        &self,
+        backbone_features: &Tensor,
+        high_res_features: Option<&[Tensor]>,
+        mask_inputs: &Tensor,
+        is_cond_frame: bool,
+    ) -> Result<TrackerFrameState> {
+        self.use_mask_as_output(
+            backbone_features,
+            high_res_features,
+            mask_inputs,
+            is_cond_frame,
+        )
+    }
+
+    fn parity_prepare_memory_conditioned_features(
+        &self,
+        frame_idx: usize,
+        is_init_cond_frame: bool,
+        current_vision_feats: &[Tensor],
+        current_vision_pos_embeds: &[Tensor],
+        feat_sizes: &[(usize, usize)],
+        history: &BTreeMap<usize, TrackerFrameState>,
+        num_frames: usize,
+        track_in_reverse: bool,
+        use_prev_mem_frame: bool,
+        packed_history: Option<&PackedPromptHistory>,
+    ) -> Result<ParityPreparedMemoryConditioning> {
+        self.prepare_memory_conditioned_features(
+            frame_idx,
+            is_init_cond_frame,
+            current_vision_feats,
+            current_vision_pos_embeds,
+            feat_sizes,
+            history,
+            num_frames,
+            track_in_reverse,
+            use_prev_mem_frame,
+            packed_history,
+        )
+        .map(Into::into)
+    }
+
+    fn parity_build_memory_conditioning_prompt(
+        &self,
+        frame_idx: usize,
+        history: &BTreeMap<usize, TrackerFrameState>,
+        num_frames: usize,
+        track_in_reverse: bool,
+        packed_history: Option<&PackedPromptHistory>,
+    ) -> Result<ParityPreparedMemoryPrompt> {
+        let cond_frame_outputs = history
+            .iter()
+            .filter_map(|(frame, state)| state.is_cond_frame.then_some((*frame, state)))
+            .collect::<BTreeMap<_, _>>();
+        self.build_memory_conditioning_prompt(
+            frame_idx,
+            history,
+            num_frames,
+            track_in_reverse,
+            &cond_frame_outputs,
+            packed_history,
+        )
+        .map(Into::into)
+    }
+
+    fn parity_memory_transformer_forward(
+        &self,
+        src: &Tensor,
+        prompt: &Tensor,
+        src_pos: Option<&Tensor>,
+        prompt_pos: Option<&Tensor>,
+        num_obj_ptr_tokens: usize,
+    ) -> Result<Tensor> {
+        self.memory_transformer
+            .forward(src, prompt, src_pos, prompt_pos, num_obj_ptr_tokens)
     }
 }

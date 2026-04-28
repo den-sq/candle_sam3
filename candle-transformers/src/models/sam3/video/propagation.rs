@@ -1,7 +1,7 @@
 use super::*;
 use crate::models::sam3::neck::TrackerVisualSequences;
-use crate::models::sam3::tracker::PackedPromptHistory;
 use crate::models::sam3::torch_ops::tensor::first_scalar_f32;
+use crate::models::sam3::tracker::PackedPromptHistory;
 
 #[derive(Debug, Clone)]
 pub struct SessionPrompt {
@@ -196,6 +196,13 @@ impl ObjectFrameOutput {
             scores: self.scores.clone(),
             presence_scores: self.presence_scores.clone(),
         }
+    }
+}
+
+#[cfg(feature = "sam3-parity-support")]
+impl ObjectFrameOutputParityExt for ObjectFrameOutput {
+    fn parity_score_value(&self) -> Result<f32> {
+        self.score_value()
     }
 }
 
@@ -583,6 +590,25 @@ impl<'a> Sam3VideoPredictor<'a> {
     }
 }
 
+#[cfg(feature = "sam3-parity-support")]
+impl Sam3VideoPredictorParityExt for Sam3VideoPredictor<'_> {
+    fn parity_video_config(&self) -> &VideoConfig {
+        &self.video_config
+    }
+
+    fn parity_video_config_mut(&mut self) -> &mut VideoConfig {
+        &mut self.video_config
+    }
+
+    fn parity_session(&self, session_id: &str) -> Option<&Sam3VideoSession> {
+        self.sessions.get(session_id)
+    }
+
+    fn parity_session_mut(&mut self, session_id: &str) -> Option<&mut Sam3VideoSession> {
+        self.sessions.get_mut(session_id)
+    }
+}
+
 #[derive(Debug)]
 pub struct Sam3VideoTrackerCore<'a> {
     pub(super) tracker: &'a Sam3TrackerModel,
@@ -591,6 +617,30 @@ pub struct Sam3VideoTrackerCore<'a> {
 impl<'a> Sam3VideoTrackerCore<'a> {
     pub fn new(tracker: &'a Sam3TrackerModel) -> Self {
         Self { tracker }
+    }
+}
+
+#[cfg(feature = "sam3-parity-support")]
+impl Sam3VideoTrackerCoreParityExt for Sam3VideoTrackerCore<'_> {
+    fn parity_process_frame(
+        &self,
+        model: &Sam3ImageModel,
+        compute_device: &Device,
+        config: &VideoConfig,
+        session: &mut Sam3VideoSession,
+        frame_idx: usize,
+        direction: PropagationDirection,
+        output_threshold: f32,
+    ) -> Result<VideoFrameOutput> {
+        self.process_frame(
+            model,
+            compute_device,
+            config,
+            session,
+            frame_idx,
+            direction,
+            output_threshold,
+        )
     }
 }
 

@@ -635,7 +635,11 @@ impl CachedTextPrompt {
             } else {
                 encoding.memory.to_device(storage_device)?
             },
-            input_embeddings: if encoding.input_embeddings.device().same_device(storage_device) {
+            input_embeddings: if encoding
+                .input_embeddings
+                .device()
+                .same_device(storage_device)
+            {
                 encoding.input_embeddings.clone()
             } else {
                 encoding.input_embeddings.to_device(storage_device)?
@@ -661,5 +665,46 @@ impl CachedTextPrompt {
                 self.input_embeddings.to_device(compute_device)?
             },
         })
+    }
+}
+
+#[cfg(feature = "sam3-parity-support")]
+impl Sam3VideoSessionParityExt for Sam3VideoSession {
+    fn parity_tracked_objects(&self) -> &BTreeMap<u32, TrackedObject> {
+        &self.tracked_objects
+    }
+
+    fn parity_tracked_objects_mut(&mut self) -> &mut BTreeMap<u32, TrackedObject> {
+        &mut self.tracked_objects
+    }
+
+    fn parity_frame_outputs(&self) -> &BTreeMap<usize, BTreeMap<u32, ObjectFrameOutput>> {
+        &self.frame_outputs
+    }
+
+    fn parity_frame_outputs_mut(
+        &mut self,
+    ) -> &mut BTreeMap<usize, BTreeMap<u32, ObjectFrameOutput>> {
+        &mut self.frame_outputs
+    }
+
+    fn parity_temporal_disambiguation_metadata(
+        &self,
+    ) -> BTreeMap<usize, ParityTemporalDisambiguationFrameMetadata> {
+        self.temporal_disambiguation_metadata
+            .iter()
+            .map(|(frame_idx, metadata)| {
+                (
+                    *frame_idx,
+                    ParityTemporalDisambiguationFrameMetadata {
+                        removed_obj_ids: metadata.removed_obj_ids.clone(),
+                        suppressed_obj_ids: metadata.suppressed_obj_ids.clone(),
+                        unconfirmed_obj_ids: metadata.unconfirmed_obj_ids.clone(),
+                        matched_obj_ids: metadata.matched_obj_ids.clone(),
+                        unmatched_obj_ids: metadata.unmatched_obj_ids.clone(),
+                    },
+                )
+            })
+            .collect()
     }
 }

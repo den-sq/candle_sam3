@@ -225,7 +225,8 @@ impl PackedPromptHistory {
                 maskmem_prompt_pos_enc.unsqueeze(0)?,
             )?;
             self.maskmem_frames.push(frame_idx);
-            self.maskmem_frame_slots.insert(frame_idx, next_maskmem_slot);
+            self.maskmem_frame_slots
+                .insert(frame_idx, next_maskmem_slot);
         }
 
         self.initialized = true;
@@ -281,7 +282,9 @@ impl PackedPromptHistory {
         }
         let slots = Tensor::from_vec(slots, frames.len(), device)?;
         let mut guard = cache.lock().expect("slot tensor cache lock poisoned");
-        Ok(Some(guard.entry(key).or_insert_with(|| slots.clone()).clone()))
+        Ok(Some(
+            guard.entry(key).or_insert_with(|| slots.clone()).clone(),
+        ))
     }
 }
 
@@ -311,7 +314,11 @@ pub(super) fn maybe_to_dtype(tensor: &Tensor, dtype: DType) -> Result<Tensor> {
     }
 }
 
-pub(super) fn maybe_to_device_dtype(tensor: &Tensor, device: &Device, dtype: DType) -> Result<Tensor> {
+pub(super) fn maybe_to_device_dtype(
+    tensor: &Tensor,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
     let tensor = maybe_to_device(tensor, device)?;
     maybe_to_dtype(&tensor, dtype)
 }
@@ -321,6 +328,94 @@ pub struct TrackerStepOutput {
     pub state: TrackerFrameState,
     pub prompt_frame_indices: Vec<usize>,
     pub memory_frame_indices: Vec<usize>,
+}
+
+#[cfg(feature = "sam3-parity-support")]
+#[derive(Debug, Clone)]
+pub struct ParityPreparedMemoryConditioning {
+    pub pix_feat_with_mem: Tensor,
+    pub selected_conditioning_frame_indices: Vec<usize>,
+    pub selected_memory_frame_indices: Vec<usize>,
+    pub selected_object_pointer_frame_indices: Vec<usize>,
+}
+
+#[cfg(feature = "sam3-parity-support")]
+#[derive(Debug, Clone)]
+pub struct ParityPreparedMemoryPrompt {
+    pub prompt: Option<Tensor>,
+    pub prompt_pos: Option<Tensor>,
+    pub num_obj_ptr_tokens: usize,
+    pub selected_conditioning_frame_indices: Vec<usize>,
+    pub selected_memory_frame_indices: Vec<usize>,
+    pub selected_object_pointer_frame_indices: Vec<usize>,
+}
+
+#[cfg(feature = "sam3-parity-support")]
+pub trait Sam3TrackerParityExt {
+    fn parity_compute_dtype(&self) -> DType;
+
+    fn parity_prepare_high_res_features(&self, high_res_features: &[Tensor])
+        -> Result<Vec<Tensor>>;
+
+    fn parity_use_multimask(&self, is_init_cond_frame: bool, point_count: usize) -> bool;
+
+    fn parity_get_tpos_enc(
+        &self,
+        rel_pos_list: &[i64],
+        device: &Device,
+        max_abs_pos: Option<usize>,
+        dummy: bool,
+    ) -> Result<Tensor>;
+
+    fn parity_forward_sam_heads(
+        &self,
+        backbone_features: &Tensor,
+        point_prompt: Option<&(Tensor, Tensor)>,
+        mask_inputs: Option<&Tensor>,
+        high_res_features: Option<&[Tensor]>,
+        multimask_output: bool,
+        is_cond_frame: bool,
+    ) -> Result<TrackerFrameState>;
+
+    fn parity_use_mask_as_output(
+        &self,
+        backbone_features: &Tensor,
+        high_res_features: Option<&[Tensor]>,
+        mask_inputs: &Tensor,
+        is_cond_frame: bool,
+    ) -> Result<TrackerFrameState>;
+
+    fn parity_prepare_memory_conditioned_features(
+        &self,
+        frame_idx: usize,
+        is_init_cond_frame: bool,
+        current_vision_feats: &[Tensor],
+        current_vision_pos_embeds: &[Tensor],
+        feat_sizes: &[(usize, usize)],
+        history: &BTreeMap<usize, TrackerFrameState>,
+        num_frames: usize,
+        track_in_reverse: bool,
+        use_prev_mem_frame: bool,
+        packed_history: Option<&PackedPromptHistory>,
+    ) -> Result<ParityPreparedMemoryConditioning>;
+
+    fn parity_build_memory_conditioning_prompt(
+        &self,
+        frame_idx: usize,
+        history: &BTreeMap<usize, TrackerFrameState>,
+        num_frames: usize,
+        track_in_reverse: bool,
+        packed_history: Option<&PackedPromptHistory>,
+    ) -> Result<ParityPreparedMemoryPrompt>;
+
+    fn parity_memory_transformer_forward(
+        &self,
+        src: &Tensor,
+        prompt: &Tensor,
+        src_pos: Option<&Tensor>,
+        prompt_pos: Option<&Tensor>,
+        num_obj_ptr_tokens: usize,
+    ) -> Result<Tensor>;
 }
 
 #[derive(Debug)]
@@ -349,4 +444,3 @@ pub(super) struct PreparedHighResFeatureCacheKey {
     pub feat_s1_id: TensorId,
     pub dtype: String,
 }
-
