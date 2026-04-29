@@ -5,7 +5,15 @@ use super::super::Sam3TrackerConfig;
 #[derive(Debug, Clone)]
 pub struct VideoConfig {
     pub score_threshold: f32,
+    pub score_threshold_detection: f32,
     pub hotstart_delay: usize,
+    pub hotstart_unmatch_thresh: usize,
+    pub suppress_unmatched_only_within_hotstart: bool,
+    pub init_trk_keep_alive: isize,
+    pub max_trk_keep_alive: isize,
+    pub min_trk_keep_alive: isize,
+    pub decrease_trk_keep_alive_for_empty_masklets: bool,
+    pub suppress_overlapping_based_on_recent_occlusion_threshold: f32,
     pub max_objects: usize,
     pub memory_frame_count: usize,
     pub max_memory_boxes: usize,
@@ -19,7 +27,15 @@ impl Default for VideoConfig {
     fn default() -> Self {
         Self {
             score_threshold: 0.5,
+            score_threshold_detection: 0.5,
             hotstart_delay: 0,
+            hotstart_unmatch_thresh: 0,
+            suppress_unmatched_only_within_hotstart: true,
+            init_trk_keep_alive: 0,
+            max_trk_keep_alive: 8,
+            min_trk_keep_alive: -4,
+            decrease_trk_keep_alive_for_empty_masklets: false,
+            suppress_overlapping_based_on_recent_occlusion_threshold: 0.7,
             max_objects: usize::MAX,
             memory_frame_count: 6,
             max_memory_boxes: 2,
@@ -35,7 +51,17 @@ impl VideoConfig {
     pub(crate) fn from_tracker_config(config: &Sam3TrackerConfig) -> Self {
         Self {
             score_threshold: 0.5,
+            score_threshold_detection: 0.5,
             hotstart_delay: config.predictor.hotstart_delay,
+            hotstart_unmatch_thresh: config.predictor.hotstart_unmatch_thresh,
+            suppress_unmatched_only_within_hotstart: true,
+            init_trk_keep_alive: 0,
+            max_trk_keep_alive: 8,
+            min_trk_keep_alive: -4,
+            decrease_trk_keep_alive_for_empty_masklets: false,
+            suppress_overlapping_based_on_recent_occlusion_threshold: config
+                .predictor
+                .suppress_overlapping_based_on_recent_occlusion_threshold,
             max_objects: usize::MAX,
             memory_frame_count: config.num_maskmem.saturating_sub(1),
             max_memory_boxes: 2,

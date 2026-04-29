@@ -111,3 +111,106 @@ pub trait Sam3VideoTrackerCoreParityExt {
 pub trait ObjectFrameOutputParityExt {
     fn parity_score_value(&self) -> Result<f32>;
 }
+
+#[cfg(feature = "sam3-parity-support")]
+pub fn parity_replay_temporal_disambiguation_for_outputs(
+    session: &mut Sam3VideoSession,
+    outputs: &[VideoFrameOutput],
+    matched_obj_ids_by_frame: &BTreeMap<usize, BTreeSet<u32>>,
+    direction: PropagationDirection,
+    video_config: &VideoConfig,
+    confirmation_threshold: usize,
+) -> Result<BTreeMap<usize, ParityTemporalDisambiguationFrameMetadata>> {
+    let mut temporal_disambiguation_state = TemporalDisambiguationState::default();
+    session.clear_temporal_disambiguation_metadata();
+    if let Some(first_output) = outputs.first() {
+        temporal_disambiguation_state.seed_prompt_frame_confirmation(
+            session,
+            first_output.frame_idx,
+            direction,
+            confirmation_threshold,
+        );
+    }
+    for output in outputs {
+        let frame_idx = output.frame_idx;
+        let matched_obj_ids = matched_obj_ids_by_frame
+            .get(&frame_idx)
+            .cloned()
+            .unwrap_or_default();
+        temporal_disambiguation_state.record_confirmation_status(
+            session,
+            frame_idx,
+            direction,
+            &matched_obj_ids,
+            confirmation_threshold,
+        );
+        let unmatched_obj_ids = output
+            .objects
+            .iter()
+            .map(|object| object.obj_id)
+            .filter(|obj_id| !matched_obj_ids.contains(obj_id))
+            .collect::<BTreeSet<_>>();
+        let empty_mask_obj_ids = output
+            .objects
+            .iter()
+            .filter_map(|object| match mask_has_foreground(&object.mask_logits, 0.0) {
+                Ok(true) => None,
+                Ok(false) => Some(Ok(object.obj_id)),
+                Err(err) => Some(Err(err)),
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        let previous_removed_obj_ids = temporal_disambiguation_state.hidden_obj_ids().clone();
+        let unmatched_suppressed_obj_ids = if video_config.hotstart_delay > 0 {
+            temporal_disambiguation_state.record_unmatched_outputs(
+                session,
+                frame_idx,
+                &matched_obj_ids,
+                &unmatched_obj_ids,
+                &empty_mask_obj_ids,
+                direction,
+                video_config.hotstart_delay,
+                video_config.hotstart_unmatch_thresh,
+                video_config.suppress_unmatched_only_within_hotstart,
+                video_config.max_trk_keep_alive,
+                video_config.min_trk_keep_alive,
+                video_config.decrease_trk_keep_alive_for_empty_masklets,
+            )
+        } else {
+            BTreeSet::new()
+        };
+        let current_removed_obj_ids = temporal_disambiguation_state.hidden_obj_ids().clone();
+        let newly_removed_obj_ids = current_removed_obj_ids
+            .difference(&previous_removed_obj_ids)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let current_suppressed_obj_ids = temporal_disambiguation_state
+            .record_recent_occlusion_suppression(
+                output,
+                frame_idx,
+                direction,
+                video_config.suppress_overlapping_based_on_recent_occlusion_threshold,
+                &newly_removed_obj_ids,
+            )?;
+        let effective_suppressed_obj_ids = current_suppressed_obj_ids
+            .union(&unmatched_suppressed_obj_ids)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut current_unconfirmed_obj_ids = temporal_disambiguation_state
+            .unconfirmed_obj_ids_per_frame
+            .get(&frame_idx)
+            .cloned()
+            .unwrap_or_default();
+        current_unconfirmed_obj_ids.retain(|obj_id| !current_removed_obj_ids.contains(obj_id));
+        session.temporal_disambiguation_metadata.insert(
+            frame_idx,
+            TemporalDisambiguationFrameMetadata {
+                removed_obj_ids: current_removed_obj_ids,
+                suppressed_obj_ids: effective_suppressed_obj_ids,
+                unconfirmed_obj_ids: current_unconfirmed_obj_ids,
+                matched_obj_ids: matched_obj_ids.clone(),
+                unmatched_obj_ids: unmatched_obj_ids.clone(),
+            },
+        );
+    }
+    Ok(session.parity_temporal_disambiguation_metadata())
+}

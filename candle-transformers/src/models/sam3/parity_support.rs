@@ -18,8 +18,9 @@ pub use super::tracker::{
 pub use super::video::{
     FrameSource, ObjectFrameOutput, ObjectFrameOutputParityExt,
     ParityTemporalDisambiguationFrameMetadata, PropagationDirection, PropagationOptions,
-    Sam3VideoPredictor, Sam3VideoPredictorParityExt, Sam3VideoSession, Sam3VideoSessionParityExt,
-    Sam3VideoTrackerCore, Sam3VideoTrackerCoreParityExt, SessionCacheStats, SessionPrompt,
-    TrackedObject, VideoConfig, VideoDebugConfig, VideoFrameOutput, VideoOutput,
-    VideoSessionOptions, VideoSource,
+    Sam3VideoPredictor, Sam3VideoPredictorParityExt, Sam3VideoSession,
+    Sam3VideoSessionParityExt, Sam3VideoTrackerCore, Sam3VideoTrackerCoreParityExt,
+    SessionCacheStats, SessionPrompt, TrackedObject, VideoConfig, VideoDebugConfig,
+    VideoFrameOutput, VideoOutput, VideoSessionOptions, VideoSource,
+    parity_replay_temporal_disambiguation_for_outputs,
 };

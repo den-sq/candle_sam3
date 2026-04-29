@@ -119,15 +119,12 @@ pub(super) fn ground_from_encoded_prompt(
     visual_features: &VisualBackboneOutput,
     prompt: &EncodedPrompt,
 ) -> Result<GroundingOutput> {
-    let fused = model.encode_fused_prompt(visual_features, prompt)?;
-    let decoder = model.decode_grounding(&fused, prompt)?;
-    let segmentation = model.segment_grounding(visual_features, &decoder, &fused, prompt)?;
-    let scores = model.text_detection_scores(&decoder)?;
+    let grounding = ground_all_from_encoded_prompt(model, visual_features, prompt)?;
     let (best_score, best_box, mask_logits, best_presence) = select_best_grounding_query(
-        &scores,
-        &decoder.pred_boxes_xyxy,
-        &segmentation.mask_logits,
-        segmentation.presence_logits.as_ref(),
+        &grounding.scores,
+        &grounding.boxes_xyxy,
+        &grounding.mask_logits,
+        grounding.presence_scores.as_ref(),
     )?;
     let mask = candle_nn::ops::sigmoid(&mask_logits)?;
     Ok(GroundingOutput {
@@ -136,6 +133,24 @@ pub(super) fn ground_from_encoded_prompt(
         boxes_xyxy: best_box,
         scores: best_score,
         presence_scores: best_presence,
+    })
+}
+
+pub(super) fn ground_all_from_encoded_prompt(
+    model: &Sam3ImageModel,
+    visual_features: &VisualBackboneOutput,
+    prompt: &EncodedPrompt,
+) -> Result<GroundingOutput> {
+    let fused = model.encode_fused_prompt(visual_features, prompt)?;
+    let decoder = model.decode_grounding(&fused, prompt)?;
+    let segmentation = model.segment_grounding(visual_features, &decoder, &fused, prompt)?;
+    let scores = model.text_detection_scores(&decoder)?;
+    Ok(GroundingOutput {
+        mask_logits: segmentation.mask_logits.clone(),
+        masks: candle_nn::ops::sigmoid(&segmentation.mask_logits)?,
+        boxes_xyxy: decoder.pred_boxes_xyxy.clone(),
+        scores,
+        presence_scores: segmentation.presence_logits.clone(),
     })
 }
 

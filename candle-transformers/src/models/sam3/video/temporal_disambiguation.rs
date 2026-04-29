@@ -4,6 +4,7 @@ use super::*;
 pub(super) struct TemporalDisambiguationObjectState {
     pub(super) first_frame_idx: usize,
     pub(super) unmatched_frame_indices: Vec<usize>,
+    pub(super) trk_keep_alive: isize,
     pub(super) consecutive_det_num: usize,
     pub(super) confirmed: bool,
     pub(super) removed: bool,
@@ -32,6 +33,7 @@ impl TemporalDisambiguationState {
             TemporalDisambiguationObjectState {
                 first_frame_idx: object.creation_frame,
                 unmatched_frame_indices: Vec::new(),
+                trk_keep_alive: 0,
                 consecutive_det_num: 0,
                 confirmed: false,
                 removed: false,
@@ -46,6 +48,7 @@ impl TemporalDisambiguationState {
             .or_insert_with(|| TemporalDisambiguationObjectState {
                 first_frame_idx,
                 unmatched_frame_indices: Vec::new(),
+                trk_keep_alive: 0,
                 consecutive_det_num: 0,
                 confirmed: false,
                 removed: false,
@@ -83,18 +86,33 @@ impl TemporalDisambiguationState {
         &mut self,
         session: &Sam3VideoSession,
         frame_idx: usize,
+        matched_obj_ids: &BTreeSet<u32>,
         unmatched_obj_ids: &BTreeSet<u32>,
+        empty_mask_obj_ids: &BTreeSet<u32>,
         direction: PropagationDirection,
         hotstart_delay: usize,
         hotstart_unmatch_thresh: usize,
-    ) {
+        suppress_unmatched_only_within_hotstart: bool,
+        max_trk_keep_alive: isize,
+        min_trk_keep_alive: isize,
+        decrease_trk_keep_alive_for_empty_masklets: bool,
+    ) -> BTreeSet<u32> {
         if hotstart_delay == 0 || hotstart_unmatch_thresh == 0 {
-            return;
+            return BTreeSet::new();
         }
         for object in session.tracked_objects.values() {
             if object.is_active_for_frame(frame_idx, direction) {
                 self.ensure_object(object);
             }
+        }
+        for obj_id in matched_obj_ids.iter().copied() {
+            let Some(state) = self.object_states.get_mut(&obj_id) else {
+                continue;
+            };
+            if state.removed {
+                continue;
+            }
+            state.trk_keep_alive = state.trk_keep_alive.saturating_add(1).min(max_trk_keep_alive);
         }
         for obj_id in unmatched_obj_ids.iter().copied() {
             let Some(state) = self.object_states.get_mut(&obj_id) else {
@@ -104,7 +122,33 @@ impl TemporalDisambiguationState {
                 continue;
             }
             state.unmatched_frame_indices.push(frame_idx);
+            state.trk_keep_alive = state.trk_keep_alive.saturating_sub(1).max(min_trk_keep_alive);
+        }
+        if decrease_trk_keep_alive_for_empty_masklets {
+            for obj_id in empty_mask_obj_ids.iter().copied() {
+                let Some(state) = self.object_states.get_mut(&obj_id) else {
+                    continue;
+                };
+                if state.removed {
+                    continue;
+                }
+                state.trk_keep_alive =
+                    state.trk_keep_alive.saturating_sub(1).max(min_trk_keep_alive);
+            }
+        }
+        let mut current_suppressed_obj_ids = BTreeSet::new();
+        let mut newly_removed_obj_ids = BTreeSet::new();
+        for (&obj_id, state) in self.object_states.iter_mut() {
+            if state.removed {
+                continue;
+            }
+            if state.unmatched_frame_indices.is_empty() {
+                continue;
+            }
             if state.unmatched_frame_indices.len() < hotstart_unmatch_thresh {
+                if state.trk_keep_alive <= 0 && !suppress_unmatched_only_within_hotstart {
+                    current_suppressed_obj_ids.insert(obj_id);
+                }
                 continue;
             }
             let hotstart_diff = match direction {
@@ -121,9 +165,15 @@ impl TemporalDisambiguationState {
             };
             if is_within_hotstart {
                 state.removed = true;
-                self.hotstart_removed_obj_ids.insert(obj_id);
+                newly_removed_obj_ids.insert(obj_id);
+                continue;
+            }
+            if state.trk_keep_alive <= 0 && !suppress_unmatched_only_within_hotstart {
+                current_suppressed_obj_ids.insert(obj_id);
             }
         }
+        self.hotstart_removed_obj_ids.extend(newly_removed_obj_ids);
+        current_suppressed_obj_ids
     }
 
     pub(super) fn hidden_obj_ids(&self) -> &BTreeSet<u32> {

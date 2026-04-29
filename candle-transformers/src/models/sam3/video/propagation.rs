@@ -392,10 +392,11 @@ impl<'a> Sam3VideoPredictor<'a> {
             .output_prob_threshold
             .unwrap_or(self.video_config.score_threshold);
         let predictor_config = &self.tracker_core.tracker.config().predictor;
-        let hotstart_delay = predictor_config.hotstart_delay;
-        let hotstart_unmatch_thresh = predictor_config.hotstart_unmatch_thresh;
-        let recent_occlusion_suppression_threshold =
-            predictor_config.suppress_overlapping_based_on_recent_occlusion_threshold;
+        let hotstart_delay = self.video_config.hotstart_delay;
+        let hotstart_unmatch_thresh = self.video_config.hotstart_unmatch_thresh;
+        let recent_occlusion_suppression_threshold = self
+            .video_config
+            .suppress_overlapping_based_on_recent_occlusion_threshold;
         let confirmation_threshold = if predictor_config.masklet_confirmation_enable {
             predictor_config.masklet_confirmation_consecutive_det_thresh
         } else {
@@ -435,16 +436,15 @@ impl<'a> Sam3VideoPredictor<'a> {
                 })
                 .map(|object| object.obj_id)
                 .collect::<BTreeSet<_>>();
-            if confirmation_threshold > 0 {
-                matched_obj_ids.extend(self.tracker_core.collect_text_detector_matched_obj_ids(
-                    self.model,
-                    self.device,
-                    session,
-                    frame_idx,
-                    options.direction,
-                    &output,
-                )?);
-            }
+            matched_obj_ids.extend(self.tracker_core.collect_text_detector_matched_obj_ids(
+                self.model,
+                self.device,
+                session,
+                frame_idx,
+                options.direction,
+                &output,
+                self.video_config.score_threshold_detection,
+            )?);
             temporal_disambiguation_state.record_confirmation_status(
                 session,
                 frame_idx,
@@ -458,18 +458,37 @@ impl<'a> Sam3VideoPredictor<'a> {
                 .map(|object| object.obj_id)
                 .filter(|obj_id| !matched_obj_ids.contains(obj_id))
                 .collect::<BTreeSet<_>>();
+            let empty_mask_obj_ids = output
+                .objects
+                .iter()
+                .filter_map(|object| match mask_has_foreground(&object.mask_logits, 0.0) {
+                    Ok(true) => None,
+                    Ok(false) => Some(Ok(object.obj_id)),
+                    Err(err) => Some(Err(err)),
+                })
+                .collect::<Result<BTreeSet<_>>>()?;
             let previous_removed_obj_ids = temporal_disambiguation_state.hidden_obj_ids().clone();
             let is_last_frame = order_idx + 1 == processing_order.len();
             let mut yield_list = Vec::new();
-            if hotstart_delay > 0 {
+            let unmatched_suppressed_obj_ids = if hotstart_delay > 0 {
                 temporal_disambiguation_state.record_unmatched_outputs(
                     session,
                     frame_idx,
+                    &matched_obj_ids,
                     &unmatched_obj_ids,
+                    &empty_mask_obj_ids,
                     options.direction,
                     hotstart_delay,
                     hotstart_unmatch_thresh,
-                );
+                    self.video_config.suppress_unmatched_only_within_hotstart,
+                    self.video_config.max_trk_keep_alive,
+                    self.video_config.min_trk_keep_alive,
+                    self.video_config.decrease_trk_keep_alive_for_empty_masklets,
+                )
+            } else {
+                BTreeSet::new()
+            };
+            if hotstart_delay > 0 {
                 let frame_has_prompt_input = session.prompt_frames().contains(&frame_idx);
                 if frame_has_prompt_input {
                     yield_list.push(output);
@@ -503,6 +522,10 @@ impl<'a> Sam3VideoPredictor<'a> {
                     recent_occlusion_suppression_threshold,
                     &newly_removed_obj_ids,
                 )?;
+            let effective_suppressed_obj_ids = current_suppressed_obj_ids
+                .union(&unmatched_suppressed_obj_ids)
+                .copied()
+                .collect::<BTreeSet<_>>();
             let mut current_unconfirmed_obj_ids = temporal_disambiguation_state
                 .unconfirmed_obj_ids_per_frame
                 .get(&frame_idx)
@@ -513,7 +536,7 @@ impl<'a> Sam3VideoPredictor<'a> {
                 frame_idx,
                 TemporalDisambiguationFrameMetadata {
                     removed_obj_ids: current_removed_obj_ids,
-                    suppressed_obj_ids: current_suppressed_obj_ids,
+                    suppressed_obj_ids: effective_suppressed_obj_ids,
                     unconfirmed_obj_ids: current_unconfirmed_obj_ids,
                     matched_obj_ids: matched_obj_ids.clone(),
                     unmatched_obj_ids: unmatched_obj_ids.clone(),
@@ -1520,6 +1543,7 @@ impl Sam3VideoTrackerCore<'_> {
         frame_idx: usize,
         direction: PropagationDirection,
         frame_output: &VideoFrameOutput,
+        score_threshold_detection: f32,
     ) -> Result<BTreeSet<u32>> {
         const ASSOCIATION_IOU_THRESHOLD: f32 = 0.5;
         let mut matched = BTreeSet::new();
@@ -1527,6 +1551,7 @@ impl Sam3VideoTrackerCore<'_> {
             return Ok(matched);
         }
         let visual_features = session.get_visual_features(model, compute_device, frame_idx)?;
+        let mut detector_planes_by_prompt = BTreeMap::<String, Vec<Vec<Vec<bool>>>>::new();
         for output in frame_output.objects.iter() {
             let Some(object) = session.tracked_objects.get(&output.obj_id) else {
                 continue;
@@ -1536,27 +1561,65 @@ impl Sam3VideoTrackerCore<'_> {
             else {
                 continue;
             };
-            let text_encoding =
-                session.cached_text_encoding(model, &text_prompt, compute_device)?;
-            let encoded_prompt =
-                combine_encoded_prompts(Some(&text_encoding), None)?.ok_or_else(|| {
-                    candle::Error::Msg("text detector path produced no encoded prompt".to_owned())
-                })?;
-            let grounding = ground_from_encoded_prompt(model, &visual_features, &encoded_prompt)?;
-            let detector_output = grounding_to_object_output(
-                output.obj_id,
-                &grounding,
-                Some(frame_idx),
-                Vec::new(),
-                Some(text_prompt),
-                false,
-                false,
-                session.video_size(),
-            )?;
-            let detector_plane =
-                mask_to_bool_plane(&detector_output.masks, VIDEO_DEBUG_MASK_THRESHOLD)?;
             let tracker_plane = mask_to_bool_plane(&output.masks, VIDEO_DEBUG_MASK_THRESHOLD)?;
-            if binary_planes_iou(&detector_plane, &tracker_plane) >= ASSOCIATION_IOU_THRESHOLD {
+            let detector_planes = if let Some(planes) = detector_planes_by_prompt.get(&text_prompt)
+            {
+                planes.clone()
+            } else {
+                let text_encoding =
+                    session.cached_text_encoding(model, &text_prompt, compute_device)?;
+                let encoded_prompt =
+                    combine_encoded_prompts(Some(&text_encoding), None)?.ok_or_else(|| {
+                        candle::Error::Msg(
+                            "text detector path produced no encoded prompt".to_owned(),
+                        )
+                    })?;
+                let grounding =
+                    ground_all_from_encoded_prompt(model, &visual_features, &encoded_prompt)?;
+                let query_count = match grounding.scores.rank() {
+                    3 => grounding.scores.dim(1)?,
+                    2 => grounding.scores.dim(1)?,
+                    1 => grounding.scores.dim(0)?,
+                    rank => {
+                        candle::bail!(
+                            "expected text detection score tensor rank 1/2/3, got {}",
+                            rank
+                        )
+                    }
+                };
+                let mut planes = Vec::new();
+                for query_idx in 0..query_count {
+                    let score = match grounding.scores.rank() {
+                        3 => grounding
+                            .scores
+                            .i((0, query_idx))?
+                            .flatten_all()?
+                            .to_vec1::<f32>()?
+                            .into_iter()
+                            .next()
+                            .unwrap_or(0.0),
+                        2 => grounding
+                            .scores
+                            .i((0, query_idx))?
+                            .to_vec0::<f32>()?,
+                        1 => grounding.scores.i(query_idx)?.to_vec0::<f32>()?,
+                        _ => 0.0,
+                    };
+                    if score < score_threshold_detection {
+                        continue;
+                    }
+                    let query_mask_logits = grounding.mask_logits.i((0, query_idx))?;
+                    let resized_logits =
+                        resize_mask_logits_to_video(&query_mask_logits, session.video_size())?;
+                    let masks = candle_nn::ops::sigmoid(&resized_logits)?;
+                    planes.push(mask_to_bool_plane(&masks, VIDEO_DEBUG_MASK_THRESHOLD)?);
+                }
+                detector_planes_by_prompt.insert(text_prompt.clone(), planes.clone());
+                planes
+            };
+            if detector_planes.iter().any(|detector_plane| {
+                binary_planes_iou(detector_plane, &tracker_plane) >= ASSOCIATION_IOU_THRESHOLD
+            }) {
                 matched.insert(output.obj_id);
             }
         }
