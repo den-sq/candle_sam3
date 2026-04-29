@@ -5,10 +5,14 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 mod interactive;
+mod sam3_agent;
+mod sam3_image_batched_inference;
+mod sam3_image_predictor_example;
+mod sam3_video_predictor_example;
 mod video;
 
 use anyhow::{bail, Context, Error as E, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use candle::{DType, Device, IndexOp, Tensor};
 use candle_transformers::models::sam3;
@@ -49,6 +53,14 @@ struct Args {
     /// Run the canned scenarios from `examples/sam3_image_predictor_example.ipynb`.
     #[arg(long)]
     image_predictor_example: bool,
+
+    /// Run one of the upstream SAM3 notebook examples using the Rust runtime.
+    #[arg(long, value_enum)]
+    notebook_example: Option<NotebookExample>,
+
+    /// Optional path to the upstream `sam3` repo root or its `assets/` directory.
+    #[arg(long)]
+    notebook_asset_root: Option<String>,
 
     /// Optional text prompt for the text-encoder smoke test.
     #[arg(long)]
@@ -127,6 +139,14 @@ struct Args {
 
     #[arg(long)]
     print_config: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum NotebookExample {
+    ImagePredictor,
+    ImageBatchedInference,
+    VideoPredictor,
+    Agent,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -250,6 +270,43 @@ fn resolve_repo_file(path: &str, expected_file: &str) -> std::path::PathBuf {
     } else {
         path
     }
+}
+
+fn notebook_asset_root_from_candidate(path: PathBuf) -> Option<PathBuf> {
+    if path.join("assets").is_dir() {
+        Some(path.join("assets"))
+    } else if path.join("images").is_dir() || path.join("videos").is_dir() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn resolve_notebook_asset_root(explicit: Option<&str>) -> Result<PathBuf> {
+    if let Some(explicit) = explicit {
+        return notebook_asset_root_from_candidate(PathBuf::from(explicit)).ok_or_else(|| {
+            E::msg(format!(
+                "`{explicit}` is not an upstream sam3 repo root or assets directory"
+            ))
+        });
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(env_root) = std::env::var("SAM3_UPSTREAM_ROOT") {
+        candidates.push(PathBuf::from(env_root));
+    }
+    candidates.push(PathBuf::from("/home/dnorthover/sam3"));
+    candidates.push(PathBuf::from("/home/dnorthover/extcode/sam3"));
+
+    for candidate in candidates {
+        if let Some(asset_root) = notebook_asset_root_from_candidate(candidate) {
+            return Ok(asset_root);
+        }
+    }
+
+    bail!(
+        "could not find upstream sam3 assets; pass `--notebook-asset-root <sam3-repo-or-assets-dir>`"
+    )
 }
 
 fn infer_video_tokenizer_path(tokenizer: Option<&str>, checkpoint: Option<&str>) -> Option<String> {
@@ -1069,59 +1126,6 @@ fn load_batch_manifest(path: &str) -> Result<Vec<BatchJob>> {
     Ok(jobs)
 }
 
-fn image_predictor_example_jobs() -> Vec<BatchJob> {
-    vec![
-        BatchJob {
-            name: Some("image_predictor_text_shoe".to_string()),
-            image: "/home/dnorthover/extcode/sam3_baseline/assets/images/test_image.jpg"
-                .to_string(),
-            prompt: Some("shoe".to_string()),
-            smoke_image_size: None,
-            points: vec![],
-            boxes: vec![],
-        },
-        BatchJob {
-            name: Some("image_predictor_single_positive_box".to_string()),
-            image: "/home/dnorthover/extcode/sam3_baseline/assets/images/test_image.jpg"
-                .to_string(),
-            prompt: None,
-            smoke_image_size: None,
-            points: vec![],
-            boxes: vec![BatchBox {
-                cx: 0.41796875,
-                cy: 0.6527777777777778,
-                w: 0.0859375,
-                h: 0.5,
-                label: 1,
-            }],
-        },
-        BatchJob {
-            name: Some("image_predictor_positive_negative_boxes".to_string()),
-            image: "/home/dnorthover/extcode/sam3_baseline/assets/images/test_image.jpg"
-                .to_string(),
-            prompt: None,
-            smoke_image_size: None,
-            points: vec![],
-            boxes: vec![
-                BatchBox {
-                    cx: 0.41796875,
-                    cy: 0.6527777777777778,
-                    w: 0.0859375,
-                    h: 0.5,
-                    label: 1,
-                },
-                BatchBox {
-                    cx: 0.333984375,
-                    cy: 0.6493055555555556,
-                    w: 0.08984375,
-                    h: 0.5208333333333334,
-                    label: 0,
-                },
-            ],
-        },
-    ]
-}
-
 fn geometry_inputs_from_job(job: &BatchJob, device: &Device) -> Result<Option<GeometryInputs>> {
     let points = job
         .points
@@ -1717,26 +1721,16 @@ fn run_batch_manifest(
     )
 }
 
-fn run_image_predictor_example(
-    model: &sam3::Sam3ImageModel,
-    tokenizer_path: Option<&str>,
-    output_dir: &Path,
-    device: &Device,
-) -> Result<()> {
-    let jobs = image_predictor_example_jobs();
-    run_batch_jobs(
-        model,
-        tokenizer_path,
-        "sam3_image_predictor_example.ipynb",
-        &jobs,
-        output_dir,
-        RenderStyle::NotebookImagePredictor,
-        device,
-    )
-}
-
 pub fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let notebook_example = match (args.notebook_example, args.image_predictor_example) {
+        (Some(_), true) => {
+            bail!("use either `--notebook-example image-predictor` or `--image-predictor-example`, not both")
+        }
+        (Some(example), false) => Some(example),
+        (None, true) => Some(NotebookExample::ImagePredictor),
+        (None, false) => None,
+    };
     let device = candle_examples::device(args.cpu)?;
     let config = sam3::Config::default();
     let checkpoint_source = args
@@ -1764,7 +1758,7 @@ pub fn main() -> anyhow::Result<()> {
         || !args.points.is_empty()
         || !args.boxes.is_empty()
         || args.batch_manifest.is_some()
-        || args.image_predictor_example)
+        || notebook_example.is_some())
         && checkpoint_source.is_none()
     {
         bail!("running implemented SAM3 stages currently requires `--checkpoint <sam3.pt>`")
@@ -1778,18 +1772,25 @@ pub fn main() -> anyhow::Result<()> {
             "`--point` and `--box` prompts require `--image`, `--interactive`, or `--video` so the geometry encoder has image features"
         )
     }
-    if (args.batch_manifest.is_some() || args.image_predictor_example)
+    if (args.batch_manifest.is_some() || notebook_example.is_some())
         && (args.image.is_some()
             || args.prompt.is_some()
             || !args.points.is_empty()
             || !args.boxes.is_empty())
     {
         bail!(
-            "`--batch-manifest` and `--image-predictor-example` describe their own jobs; omit `--image`, `--prompt`, `--point`, and `--box`"
+            "`--batch-manifest` and `--notebook-example` describe their own jobs; omit `--image`, `--prompt`, `--point`, and `--box`"
         )
     }
-    if args.batch_manifest.is_some() && args.image_predictor_example {
-        bail!("use either `--batch-manifest` or `--image-predictor-example`, not both")
+    if notebook_example.is_some()
+        && (args.video.is_some() || args.interactive.is_some() || args.interactive_script.is_some())
+    {
+        bail!(
+            "`--notebook-example` manages its own image/video flow; omit `--video`, `--interactive`, and `--interactive-script`"
+        )
+    }
+    if args.batch_manifest.is_some() && notebook_example.is_some() {
+        bail!("use either `--batch-manifest` or `--notebook-example`, not both")
     }
     if args.interactive_script.is_some() && args.interactive.is_none() {
         bail!("`--interactive-script` requires `--interactive <image>`")
@@ -1817,15 +1818,57 @@ pub fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if args.image_predictor_example {
-        run_image_predictor_example(
-            model
-                .as_ref()
-                .context("SAM3 image-predictor example mode requires `--checkpoint <sam3.pt>`")?,
-            args.tokenizer.as_deref(),
-            Path::new(&args.output_dir),
-            &device,
-        )?;
+    if let Some(notebook_example) = notebook_example {
+        match notebook_example {
+            NotebookExample::ImagePredictor => sam3_image_predictor_example::run(
+                model.as_ref().context(
+                    "SAM3 image-predictor example mode requires `--checkpoint <sam3.pt>`",
+                )?,
+                args.tokenizer.as_deref(),
+                args.notebook_asset_root.as_deref(),
+                Path::new(&args.output_dir),
+                &device,
+            )?,
+            NotebookExample::ImageBatchedInference => sam3_image_batched_inference::run(
+                model.as_ref().context(
+                    "SAM3 image-batched-inference example mode requires `--checkpoint <sam3.pt>`",
+                )?,
+                args.tokenizer.as_deref(),
+                args.notebook_asset_root.as_deref(),
+                Path::new(&args.output_dir),
+                &device,
+            )?,
+            NotebookExample::VideoPredictor => {
+                let checkpoint = checkpoint_source.as_ref().context(
+                    "SAM3 video-predictor example mode requires `--checkpoint <sam3.pt>`",
+                )?;
+                let tracker = sam3::Sam3TrackerModel::from_checkpoint_source(
+                    &config,
+                    checkpoint,
+                    DType::F32,
+                    &device,
+                )?;
+                sam3_video_predictor_example::run(
+                    model.as_ref().context(
+                        "SAM3 video-predictor example mode requires `--checkpoint <sam3.pt>`",
+                    )?,
+                    &tracker,
+                    args.tokenizer.as_deref(),
+                    args.notebook_asset_root.as_deref(),
+                    Path::new(&args.output_dir),
+                    &device,
+                )?;
+            }
+            NotebookExample::Agent => sam3_agent::run(
+                model
+                    .as_ref()
+                    .context("SAM3 agent example mode requires `--checkpoint <sam3.pt>`")?,
+                args.tokenizer.as_deref(),
+                args.notebook_asset_root.as_deref(),
+                Path::new(&args.output_dir),
+                &device,
+            )?,
+        }
         return Ok(());
     }
 
