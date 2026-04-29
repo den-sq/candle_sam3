@@ -272,6 +272,10 @@ fn resolve_repo_file(path: &str, expected_file: &str) -> std::path::PathBuf {
     }
 }
 
+fn env_path_string(name: &str) -> Option<String> {
+    std::env::var_os(name).map(|path| path.to_string_lossy().into_owned())
+}
+
 fn notebook_asset_root_from_candidate(path: PathBuf) -> Option<PathBuf> {
     if path.join("assets").is_dir() {
         Some(path.join("assets"))
@@ -1722,7 +1726,13 @@ fn run_batch_manifest(
 }
 
 pub fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    if args.checkpoint.is_none() {
+        args.checkpoint = env_path_string("SAM3_CHECKPOINT");
+    }
+    if args.tokenizer.is_none() {
+        args.tokenizer = env_path_string("SAM3_TOKENIZER");
+    }
     let notebook_example = match (args.notebook_example, args.image_predictor_example) {
         (Some(_), true) => {
             bail!("use either `--notebook-example image-predictor` or `--image-predictor-example`, not both")
