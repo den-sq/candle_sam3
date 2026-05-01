@@ -59,6 +59,7 @@ pub(crate) fn run(
     )?;
     let session_options = sam3::VideoSessionOptions {
         tokenizer_path: Some(PathBuf::from(&tokenizer_path)),
+        memory_profile: sam3::VideoMemoryProfile::Balanced,
         offload_frames_to_cpu: false,
         offload_state_to_cpu: false,
         prefetch_ahead: 2,

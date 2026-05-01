@@ -41,6 +41,7 @@ pub struct TrackerFrameState {
     pub low_res_masks: Tensor,
     pub high_res_masks: Tensor,
     pub iou_scores: Tensor,
+    pub memory_selection_score: Option<f32>,
     pub obj_ptr: Tensor,
     pub object_score_logits: Tensor,
     pub maskmem_features: Option<Tensor>,
@@ -72,11 +73,20 @@ impl TrackerFrameState {
         self.maskmem_prompt_pos_enc = None;
     }
 
+    pub fn has_high_res_masks(&self) -> bool {
+        self.high_res_masks.elem_count() > 0
+    }
+
+    pub fn has_iou_scores(&self) -> bool {
+        self.iou_scores.elem_count() > 0
+    }
+
     pub fn to_storage_device(&self, device: &candle::Device) -> Result<Self> {
         Ok(Self {
             low_res_masks: maybe_to_device(&self.low_res_masks, device)?,
             high_res_masks: maybe_to_device(&self.high_res_masks, device)?,
             iou_scores: maybe_to_device(&self.iou_scores, device)?,
+            memory_selection_score: self.memory_selection_score,
             obj_ptr: maybe_to_device(&self.obj_ptr, device)?,
             object_score_logits: maybe_to_device(&self.object_score_logits, device)?,
             maskmem_features: self
@@ -101,6 +111,29 @@ impl TrackerFrameState {
                 .transpose()?,
             is_cond_frame: self.is_cond_frame,
         })
+    }
+
+    pub fn memory_bytes(&self) -> (usize, usize) {
+        let mut cpu = 0usize;
+        let mut device = 0usize;
+        add_tensor_memory(&self.low_res_masks, &mut cpu, &mut device);
+        add_tensor_memory(&self.high_res_masks, &mut cpu, &mut device);
+        add_tensor_memory(&self.iou_scores, &mut cpu, &mut device);
+        add_tensor_memory(&self.obj_ptr, &mut cpu, &mut device);
+        add_tensor_memory(&self.object_score_logits, &mut cpu, &mut device);
+        if let Some(tensor) = self.maskmem_features.as_ref() {
+            add_tensor_memory(tensor, &mut cpu, &mut device);
+        }
+        if let Some(tensor) = self.maskmem_pos_enc.as_ref() {
+            add_tensor_memory(tensor, &mut cpu, &mut device);
+        }
+        if let Some(tensor) = self.maskmem_prompt_features.as_ref() {
+            add_tensor_memory(tensor, &mut cpu, &mut device);
+        }
+        if let Some(tensor) = self.maskmem_prompt_pos_enc.as_ref() {
+            add_tensor_memory(tensor, &mut cpu, &mut device);
+        }
+        (cpu, device)
     }
 }
 
@@ -285,6 +318,37 @@ impl PackedPromptHistory {
             guard.entry(key).or_insert_with(|| slots.clone()).clone(),
         ))
     }
+
+    pub fn memory_bytes(&self) -> (usize, usize) {
+        let mut cpu = 0usize;
+        let mut device = 0usize;
+        if let Some(tensor) = self.maskmem_prompt_features.as_ref() {
+            add_tensor_memory(tensor, &mut cpu, &mut device);
+        }
+        if let Some(tensor) = self.maskmem_prompt_pos_enc.as_ref() {
+            add_tensor_memory(tensor, &mut cpu, &mut device);
+        }
+        if let Some(tensor) = self.obj_ptrs.as_ref() {
+            add_tensor_memory(tensor, &mut cpu, &mut device);
+        }
+        for tensor in self
+            .maskmem_slot_tensor_cache
+            .lock()
+            .expect("slot tensor cache lock poisoned")
+            .values()
+        {
+            add_tensor_memory(tensor, &mut cpu, &mut device);
+        }
+        for tensor in self
+            .obj_ptr_slot_tensor_cache
+            .lock()
+            .expect("slot tensor cache lock poisoned")
+            .values()
+        {
+            add_tensor_memory(tensor, &mut cpu, &mut device);
+        }
+        (cpu, device)
+    }
 }
 
 pub(super) fn prepare_maskmem_prompt_tensors(
@@ -320,6 +384,15 @@ pub(super) fn maybe_to_device_dtype(
 ) -> Result<Tensor> {
     let tensor = maybe_to_device(tensor, device)?;
     maybe_to_dtype(&tensor, dtype)
+}
+
+pub(super) fn add_tensor_memory(tensor: &Tensor, cpu: &mut usize, device: &mut usize) {
+    let bytes = tensor.elem_count().saturating_mul(tensor.dtype().size_in_bytes());
+    if matches!(tensor.device(), Device::Cpu) {
+        *cpu = cpu.saturating_add(bytes);
+    } else {
+        *device = device.saturating_add(bytes);
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -8,6 +8,7 @@ use candle::{DType, Device, Result, Tensor};
 use image::ImageReader;
 
 use super::super::{image::ImageSize, Config};
+use super::VideoSessionOptions;
 
 #[derive(Debug, Clone)]
 pub enum VideoSource {
@@ -36,9 +37,16 @@ impl VideoSource {
         }
     }
 
-    pub(crate) fn into_frame_source(self, config: &Config) -> Result<Box<dyn FrameSource>> {
+    pub(crate) fn into_frame_source(
+        self,
+        config: &Config,
+        session_options: &VideoSessionOptions,
+    ) -> Result<Box<dyn FrameSource>> {
         match self {
-            Self::TensorFrames(frames) => Ok(Box::new(TensorFrameSource::new(frames)?)),
+            Self::TensorFrames(frames) => Ok(Box::new(TensorFrameSource::new(
+                frames,
+                session_options.offload_frames_to_cpu,
+            )?)),
             Self::ImageFolder(path) => Ok(Box::new(ImageFolderFrameSource::new(
                 sorted_image_paths(&path)?,
                 config.image.image_size,
@@ -68,6 +76,7 @@ pub trait FrameSource {
     fn prefetch(&mut self, frame_indices: &[usize]) -> Result<()>;
     fn evict_except(&mut self, keep_frame_indices: &BTreeSet<usize>);
     fn loaded_frame_count(&self) -> usize;
+    fn memory_bytes(&self) -> (usize, usize);
     fn close(&mut self);
 }
 
@@ -86,6 +95,10 @@ impl FrameBlob {
         )?
         .to_device(target_device)
     }
+
+    fn memory_bytes(&self) -> usize {
+        self.data.len().saturating_mul(std::mem::size_of::<f32>())
+    }
 }
 
 struct TensorFrameSource {
@@ -94,14 +107,19 @@ struct TensorFrameSource {
 }
 
 impl TensorFrameSource {
-    fn new(frames: Vec<Tensor>) -> Result<Self> {
+    fn new(frames: Vec<Tensor>, offload_to_cpu: bool) -> Result<Self> {
         if frames.is_empty() {
             candle::bail!("tensor frame source requires at least one frame")
         }
-        let (channels, height, width) = match frames[0].rank() {
-            3 => frames[0].dims3()?,
+        let first = if offload_to_cpu && !matches!(frames[0].device(), Device::Cpu) {
+            frames[0].to_device(&Device::Cpu)?
+        } else {
+            frames[0].clone()
+        };
+        let (channels, height, width) = match first.rank() {
+            3 => first.dims3()?,
             4 => {
-                let (_batch, channels, height, width) = frames[0].dims4()?;
+                let (_batch, channels, height, width) = first.dims4()?;
                 (channels, height, width)
             }
             rank => candle::bail!("expected CHW or BCHW frame tensor, got rank {}", rank),
@@ -112,6 +130,20 @@ impl TensorFrameSource {
                 channels
             )
         }
+        let frames = if offload_to_cpu {
+            frames
+                .into_iter()
+                .map(|frame| {
+                    if matches!(frame.device(), Device::Cpu) {
+                        Ok(frame)
+                    } else {
+                        frame.to_device(&Device::Cpu)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            frames
+        };
         Ok(Self {
             frames,
             video_size: ImageSize::new(height, width),
@@ -143,6 +175,22 @@ impl FrameSource for TensorFrameSource {
 
     fn loaded_frame_count(&self) -> usize {
         self.frames.len()
+    }
+
+    fn memory_bytes(&self) -> (usize, usize) {
+        let mut cpu = 0usize;
+        let mut device = 0usize;
+        for frame in self.frames.iter() {
+            let bytes = frame
+                .elem_count()
+                .saturating_mul(frame.dtype().size_in_bytes());
+            if matches!(frame.device(), Device::Cpu) {
+                cpu = cpu.saturating_add(bytes);
+            } else {
+                device = device.saturating_add(bytes);
+            }
+        }
+        (cpu, device)
     }
 
     fn close(&mut self) {}
@@ -236,6 +284,13 @@ impl FrameSource for ImageFolderFrameSource {
         self.cache.len()
     }
 
+    fn memory_bytes(&self) -> (usize, usize) {
+        (
+            self.cache.values().map(FrameBlob::memory_bytes).sum(),
+            0,
+        )
+    }
+
     fn close(&mut self) {
         self.cache.clear();
     }
@@ -325,6 +380,13 @@ impl FrameSource for VideoFileFrameSource {
 
     fn loaded_frame_count(&self) -> usize {
         self.cache.len()
+    }
+
+    fn memory_bytes(&self) -> (usize, usize) {
+        (
+            self.cache.values().map(FrameBlob::memory_bytes).sum(),
+            0,
+        )
     }
 
     fn close(&mut self) {
@@ -758,4 +820,25 @@ fn normalize_image_for_sam3(
     let mean = Tensor::from_vec(image_mean.to_vec(), (1, 3, 1, 1), device)?;
     let std = Tensor::from_vec(image_std.to_vec(), (1, 3, 1, 1), device)?;
     image_bchw.broadcast_sub(&mean)?.broadcast_div(&std)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tensor_frame_source_reports_cpu_memory_usage() -> Result<()> {
+        let frame_a = Tensor::zeros((3, 2, 2), DType::F32, &Device::Cpu)?;
+        let frame_b = Tensor::ones((3, 2, 2), DType::F32, &Device::Cpu)?;
+        let source = TensorFrameSource::new(vec![frame_a, frame_b], true)?;
+
+        let (cpu_bytes, device_bytes) = source.memory_bytes();
+
+        assert_eq!(device_bytes, 0);
+        assert_eq!(
+            cpu_bytes,
+            2 * 3 * 2 * 2 * std::mem::size_of::<f32>()
+        );
+        Ok(())
+    }
 }

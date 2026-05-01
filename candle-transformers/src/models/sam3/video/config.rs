@@ -74,8 +74,15 @@ impl VideoConfig {
 }
 
 #[derive(Debug, Clone)]
+pub enum VideoMemoryProfile {
+    Balanced,
+    LowMemory,
+}
+
+#[derive(Debug, Clone)]
 pub struct VideoSessionOptions {
     pub tokenizer_path: Option<PathBuf>,
+    pub memory_profile: VideoMemoryProfile,
     pub offload_frames_to_cpu: bool,
     pub offload_state_to_cpu: bool,
     pub prefetch_ahead: usize,
@@ -87,6 +94,7 @@ impl Default for VideoSessionOptions {
     fn default() -> Self {
         Self {
             tokenizer_path: None,
+            memory_profile: VideoMemoryProfile::Balanced,
             offload_frames_to_cpu: false,
             offload_state_to_cpu: false,
             prefetch_ahead: 2,

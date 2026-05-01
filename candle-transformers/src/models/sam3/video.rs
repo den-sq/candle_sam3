@@ -2,12 +2,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::Path;
-#[cfg(test)]
-use std::process::Command;
-#[cfg(test)]
-use std::time::{SystemTime, UNIX_EPOCH};
-#[cfg(test)]
-use std::{fs, path::PathBuf};
 
 use candle::{DType, Device, IndexOp, Result, Tensor};
 use tokenizers::{PaddingDirection, PaddingParams, Tokenizer, TruncationParams};

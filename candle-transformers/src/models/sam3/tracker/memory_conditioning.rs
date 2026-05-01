@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use super::*;
 use crate::models::sam3::torch_ops::tensor::{first_scalar_f32, repeat_interleave};
 
@@ -17,6 +19,27 @@ struct PreparedMemoryPrompt {
     selected_conditioning_frame_indices: Vec<usize>,
     selected_memory_frame_indices: Vec<usize>,
     selected_object_pointer_frame_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MemoryConditioningFrameSelection {
+    selected_conditioning_frame_indices: Vec<usize>,
+    selected_conditioning_frame_indices_ordered: Vec<usize>,
+    selected_memory_frame_indices: Vec<usize>,
+    selected_memory_frame_indices_ordered: Vec<usize>,
+    selected_object_pointer_frame_indices: Vec<usize>,
+    selected_maskmem_frames: Vec<usize>,
+    selected_maskmem_tpos_indices: Vec<usize>,
+}
+
+impl MemoryConditioningFrameSelection {
+    fn selected_history_frame_indices(&self) -> Vec<usize> {
+        let mut selected = BTreeSet::new();
+        selected.extend(self.selected_conditioning_frame_indices.iter().copied());
+        selected.extend(self.selected_memory_frame_indices.iter().copied());
+        selected.extend(self.selected_object_pointer_frame_indices.iter().copied());
+        selected.into_iter().collect()
+    }
 }
 
 #[cfg(feature = "sam3-parity-support")]
@@ -140,8 +163,15 @@ impl Sam3TrackerModel {
                 i += step;
                 continue;
             }
-            let iou_score = state.iou_scores.max(D::Minus1)?;
-            let score_per_frame = self.cal_mem_score(&state.object_score_logits, &iou_score)?;
+            let score_per_frame = if state.has_iou_scores() {
+                let iou_score = state.iou_scores.max(D::Minus1)?;
+                self.cal_mem_score(&state.object_score_logits, &iou_score)?
+            } else if let Some(score) = state.memory_selection_score {
+                score
+            } else {
+                i += step;
+                continue;
+            };
             if score_per_frame > self.config.mf_threshold {
                 valid_indices.insert(0, frame);
             }
@@ -229,6 +259,172 @@ impl Sam3TrackerModel {
         (selected, unselected)
     }
 
+    fn select_memory_conditioning_frames(
+        &self,
+        frame_idx: usize,
+        history: &BTreeMap<usize, TrackerFrameState>,
+        num_frames: usize,
+        track_in_reverse: bool,
+        cond_frame_outputs: &BTreeMap<usize, &TrackerFrameState>,
+    ) -> Result<MemoryConditioningFrameSelection> {
+        let (selected_cond_ordered, unselected_cond_indices) =
+            self.select_closest_cond_frame_indices(frame_idx, cond_frame_outputs);
+        let mut selected_conditioning_frame_indices = selected_cond_ordered.clone();
+        selected_conditioning_frame_indices.sort_unstable();
+        let unselected_cond_outputs = unselected_cond_indices
+            .iter()
+            .filter_map(|frame| cond_frame_outputs.get(frame).map(|state| (*frame, *state)))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut selected_memory_frame_indices_ordered = Vec::new();
+        let mut selected_object_pointer_frame_indices = Vec::new();
+        let mut selected_maskmem_frames = Vec::new();
+        let mut selected_maskmem_tpos_indices = Vec::new();
+
+        for &selected_frame in selected_cond_ordered.iter() {
+            let prev = cond_frame_outputs
+                .get(&selected_frame)
+                .expect("selected conditioning frame missing from history");
+            if prev.maskmem_features.is_none() || prev.maskmem_pos_enc.is_none() {
+                candle::bail!(
+                    "conditioning frame {selected_frame} is missing maskmem tensors required for tracker memory conditioning"
+                );
+            }
+            selected_maskmem_frames.push(selected_frame);
+            selected_maskmem_tpos_indices.push(self.config.num_maskmem - 1);
+        }
+
+        let r = self.config.memory_temporal_stride_for_eval.max(1);
+        let valid_indices = if self.config.use_memory_selection {
+            Some(self.frame_filter(history, track_in_reverse, frame_idx, num_frames, r)?)
+        } else {
+            None
+        };
+        for t_pos in 1..self.config.num_maskmem {
+            let t_rel = self.config.num_maskmem - t_pos;
+            let prev_frame_idx = if let Some(valid_indices) = valid_indices.as_ref() {
+                if t_rel > valid_indices.len() {
+                    continue;
+                }
+                valid_indices[valid_indices.len() - t_rel]
+            } else if t_rel == 1 {
+                if !track_in_reverse {
+                    frame_idx.saturating_sub(t_rel)
+                } else {
+                    frame_idx + t_rel
+                }
+            } else if !track_in_reverse {
+                let nearest = ((frame_idx.saturating_sub(2)) / r) * r;
+                nearest.saturating_sub((t_rel - 2) * r)
+            } else {
+                let nearest = (frame_idx + 1).div_ceil(r) * r;
+                nearest + (t_rel - 2) * r
+            };
+            let prev = history
+                .get(&prev_frame_idx)
+                .filter(|state| !state.is_cond_frame)
+                .or_else(|| unselected_cond_outputs.get(&prev_frame_idx).copied());
+            let Some(prev) = prev else {
+                continue;
+            };
+            if prev.maskmem_features.is_none() || prev.maskmem_pos_enc.is_none() {
+                continue;
+            }
+            selected_maskmem_frames.push(prev_frame_idx);
+            selected_maskmem_tpos_indices.push(self.config.num_maskmem - t_pos - 1);
+            selected_memory_frame_indices_ordered.push(prev_frame_idx);
+        }
+
+        let max_obj_ptrs_in_encoder = self.config.max_obj_ptrs_in_encoder.min(num_frames);
+        let ptr_cond_frames = if !track_in_reverse {
+            selected_cond_ordered
+                .iter()
+                .copied()
+                .filter(|t| *t <= frame_idx)
+                .collect::<Vec<_>>()
+        } else {
+            selected_cond_ordered
+                .iter()
+                .copied()
+                .filter(|t| *t >= frame_idx)
+                .collect::<Vec<_>>()
+        };
+        selected_object_pointer_frame_indices.extend(ptr_cond_frames.iter().copied());
+        for t_diff in 1..max_obj_ptrs_in_encoder {
+            let frame = if let Some(valid_indices) = valid_indices.as_ref() {
+                if t_diff > valid_indices.len().saturating_sub(1) {
+                    break;
+                }
+                valid_indices[valid_indices.len() - t_diff]
+            } else if !track_in_reverse {
+                let frame = frame_idx.saturating_sub(t_diff);
+                if frame_idx < t_diff {
+                    break;
+                }
+                frame
+            } else {
+                let frame = frame_idx + t_diff;
+                if frame >= num_frames {
+                    break;
+                }
+                frame
+            };
+            let prev = history
+                .get(&frame)
+                .filter(|state| !state.is_cond_frame)
+                .or_else(|| unselected_cond_outputs.get(&frame).copied());
+            if prev.is_some() {
+                selected_object_pointer_frame_indices.push(frame);
+            }
+        }
+
+        let mut selected_memory_frame_indices = selected_memory_frame_indices_ordered.clone();
+        selected_memory_frame_indices.sort_unstable();
+        Ok(MemoryConditioningFrameSelection {
+            selected_conditioning_frame_indices,
+            selected_conditioning_frame_indices_ordered: selected_cond_ordered,
+            selected_memory_frame_indices,
+            selected_memory_frame_indices_ordered,
+            selected_object_pointer_frame_indices,
+            selected_maskmem_frames,
+            selected_maskmem_tpos_indices,
+        })
+    }
+
+    pub(crate) fn selected_history_frame_indices_for_tracking(
+        &self,
+        frame_idx: usize,
+        is_init_cond_frame: bool,
+        history: &BTreeMap<usize, TrackerFrameState>,
+        num_frames: usize,
+        track_in_reverse: bool,
+        use_prev_mem_frame: bool,
+    ) -> Result<Vec<usize>> {
+        if history.is_empty()
+            || self.config.num_maskmem == 0
+            || is_init_cond_frame
+            || !use_prev_mem_frame
+        {
+            return Ok(Vec::new());
+        }
+        let cond_frame_outputs = history
+            .iter()
+            .filter_map(|(frame, state)| state.is_cond_frame.then_some((*frame, state)))
+            .collect::<BTreeMap<_, _>>();
+        if cond_frame_outputs.is_empty() {
+            candle::bail!("tracker memory conditioning expected at least one conditioning frame");
+        }
+        Ok(self
+            .select_memory_conditioning_frames(
+                frame_idx,
+                history,
+                num_frames,
+                track_in_reverse,
+                &cond_frame_outputs,
+            )?
+            .selected_history_frame_indices())
+    }
+
     pub(super) fn prepare_memory_conditioned_features(
         &self,
         frame_idx: usize,
@@ -274,6 +470,13 @@ impl Sam3TrackerModel {
         if cond_frame_outputs.is_empty() {
             candle::bail!("tracker memory conditioning expected at least one conditioning frame");
         }
+        let frame_selection = self.select_memory_conditioning_frames(
+            frame_idx,
+            history,
+            num_frames,
+            track_in_reverse,
+            &cond_frame_outputs,
+        )?;
         let prepared_prompt = self.build_memory_conditioning_prompt(
             frame_idx,
             history,
@@ -281,6 +484,7 @@ impl Sam3TrackerModel {
             track_in_reverse,
             &cond_frame_outputs,
             packed_history,
+            &frame_selection,
         )?;
         let selected_conditioning_frame_indices =
             prepared_prompt.selected_conditioning_frame_indices.clone();
@@ -345,6 +549,7 @@ impl Sam3TrackerModel {
         track_in_reverse: bool,
         cond_frame_outputs: &BTreeMap<usize, &TrackerFrameState>,
         packed_history: Option<&PackedPromptHistory>,
+        frame_selection: &MemoryConditioningFrameSelection,
     ) -> Result<PreparedMemoryPrompt> {
         let device = cond_frame_outputs
             .values()
@@ -366,94 +571,41 @@ impl Sam3TrackerModel {
                 )
             })?;
         let channels = self.config.hidden_dim;
-        let (selected_cond_ordered, unselected_cond_indices) =
-            self.select_closest_cond_frame_indices(frame_idx, cond_frame_outputs);
-        let mut selected_conditioning_frame_indices = selected_cond_ordered.clone();
-        selected_conditioning_frame_indices.sort_unstable();
-        let unselected_cond_outputs = unselected_cond_indices
-            .iter()
-            .filter_map(|frame| cond_frame_outputs.get(frame).map(|state| (*frame, *state)))
-            .collect::<BTreeMap<_, _>>();
-
         let tpos_sign_mul: i64 = if track_in_reverse { -1 } else { 1 };
-        let mut selected_memory_frame_indices_ordered = Vec::new();
-        let mut selected_object_pointer_frame_indices = Vec::new();
-        let mut selected_maskmem_frames = Vec::new();
-        let mut selected_maskmem_tpos_indices = Vec::new();
         let mut selected_maskmem_states = Vec::new();
-
-        for &selected_frame in selected_cond_ordered.iter() {
-            let prev = cond_frame_outputs
+        for selected_frame in frame_selection.selected_maskmem_frames.iter().copied() {
+            let state = history
                 .get(&selected_frame)
-                .expect("selected conditioning frame missing from history");
-            if prev.maskmem_features.is_none() || prev.maskmem_pos_enc.is_none() {
-                candle::bail!(
-                    "conditioning frame {selected_frame} is missing maskmem tensors required for tracker memory conditioning"
-                );
-            }
-            selected_maskmem_frames.push(selected_frame);
-            selected_maskmem_tpos_indices.push(self.config.num_maskmem - 1);
-            selected_maskmem_states.push(*prev);
+                .or_else(|| cond_frame_outputs.get(&selected_frame).copied())
+                .ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "tracker memory conditioning expected frame {} to exist in selected history",
+                        selected_frame
+                    ))
+                })?;
+            selected_maskmem_states.push(state);
         }
 
-        let r = self.config.memory_temporal_stride_for_eval.max(1);
-        let valid_indices = if self.config.use_memory_selection {
-            Some(self.frame_filter(history, track_in_reverse, frame_idx, num_frames, r)?)
-        } else {
-            None
-        };
-        for t_pos in 1..self.config.num_maskmem {
-            let t_rel = self.config.num_maskmem - t_pos;
-            let prev_frame_idx = if let Some(valid_indices) = valid_indices.as_ref() {
-                if t_rel > valid_indices.len() {
-                    continue;
-                }
-                valid_indices[valid_indices.len() - t_rel]
-            } else if t_rel == 1 {
-                if !track_in_reverse {
-                    frame_idx.saturating_sub(t_rel)
-                } else {
-                    frame_idx + t_rel
-                }
-            } else if !track_in_reverse {
-                let nearest = ((frame_idx.saturating_sub(2)) / r) * r;
-                nearest.saturating_sub((t_rel - 2) * r)
-            } else {
-                let nearest = (frame_idx + 1).div_ceil(r) * r;
-                nearest + (t_rel - 2) * r
-            };
-            let prev = history
-                .get(&prev_frame_idx)
-                .filter(|state| !state.is_cond_frame)
-                .or_else(|| unselected_cond_outputs.get(&prev_frame_idx).copied());
-            let Some(prev) = prev else {
-                continue;
-            };
-            if prev.maskmem_features.is_none() || prev.maskmem_pos_enc.is_none() {
-                continue;
-            }
-            selected_maskmem_frames.push(prev_frame_idx);
-            selected_maskmem_tpos_indices.push(self.config.num_maskmem - t_pos - 1);
-            selected_maskmem_states.push(prev);
-            selected_memory_frame_indices_ordered.push(prev_frame_idx);
-        }
-
-        let maskmem_block = if selected_maskmem_frames.is_empty() {
+        let maskmem_block = if frame_selection.selected_maskmem_frames.is_empty() {
             None
         } else if let Some(packed_history) = packed_history {
             match (
                 packed_history
-                    .maskmem_slot_indices_tensor(selected_maskmem_frames.as_slice(), device)?,
+                    .maskmem_slot_indices_tensor(
+                        frame_selection.selected_maskmem_frames.as_slice(),
+                        device,
+                    )?,
                 packed_history.maskmem_prompt_features(),
                 packed_history.maskmem_prompt_pos_enc(),
             ) {
                 (Some(slot_indices), Some(packed_features), Some(packed_pos)) => {
                     let tpos_indices = Tensor::from_vec(
-                        selected_maskmem_tpos_indices
+                        frame_selection
+                            .selected_maskmem_tpos_indices
                             .iter()
                             .map(|index| *index as u32)
                             .collect(),
-                        selected_maskmem_tpos_indices.len(),
+                        frame_selection.selected_maskmem_tpos_indices.len(),
                         device,
                     )?;
                     let prompt = packed_features
@@ -477,7 +629,7 @@ impl Sam3TrackerModel {
                 let mut prompt_pos_parts = Vec::with_capacity(selected_maskmem_states.len());
                 for (state, tpos_index) in selected_maskmem_states
                     .iter()
-                    .zip(selected_maskmem_tpos_indices.iter().copied())
+                    .zip(frame_selection.selected_maskmem_tpos_indices.iter().copied())
                 {
                     let (maskmem_features, maskmem_pos_enc) =
                         state_maskmem_prompt_tensors(state, device, self.no_obj_ptr.dtype())?;
@@ -497,13 +649,15 @@ impl Sam3TrackerModel {
 
         let max_obj_ptrs_in_encoder = self.config.max_obj_ptrs_in_encoder.min(num_frames);
         let ptr_cond_frames = if !track_in_reverse {
-            selected_cond_ordered
+            frame_selection
+                .selected_conditioning_frame_indices_ordered
                 .iter()
                 .copied()
                 .filter(|t| *t <= frame_idx)
                 .collect::<Vec<_>>()
         } else {
-            selected_cond_ordered
+            frame_selection
+                .selected_conditioning_frame_indices_ordered
                 .iter()
                 .copied()
                 .filter(|t| *t >= frame_idx)
@@ -512,7 +666,6 @@ impl Sam3TrackerModel {
         let mut obj_ptr_tensors = Vec::new();
         let mut obj_ptr_offsets = Vec::new();
         for selected_frame in ptr_cond_frames.iter().copied() {
-            selected_object_pointer_frame_indices.push(selected_frame);
             obj_ptr_offsets
                 .push(((frame_idx as i64 - selected_frame as i64) * tpos_sign_mul) as i64);
             obj_ptr_tensors.push(
@@ -523,44 +676,40 @@ impl Sam3TrackerModel {
                     .clone(),
             );
         }
-        for t_diff in 1..max_obj_ptrs_in_encoder {
-            let frame = if let Some(valid_indices) = valid_indices.as_ref() {
-                if t_diff > valid_indices.len().saturating_sub(1) {
-                    break;
-                }
-                valid_indices[valid_indices.len() - t_diff]
-            } else if !track_in_reverse {
-                let frame = frame_idx.saturating_sub(t_diff);
-                if frame_idx < t_diff {
-                    break;
-                }
-                frame
-            } else {
-                let frame = frame_idx + t_diff;
-                if frame >= num_frames {
-                    break;
-                }
-                frame
-            };
+        for frame in frame_selection
+            .selected_object_pointer_frame_indices
+            .iter()
+            .copied()
+            .filter(|frame| !ptr_cond_frames.contains(frame))
+        {
             let prev = history
                 .get(&frame)
-                .filter(|state| !state.is_cond_frame)
-                .or_else(|| unselected_cond_outputs.get(&frame).copied());
-            if let Some(prev) = prev {
-                selected_object_pointer_frame_indices.push(frame);
-                obj_ptr_offsets.push(t_diff as i64);
-                obj_ptr_tensors.push(prev.obj_ptr.clone());
+                .ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "tracker memory conditioning expected object-pointer frame {} in selected history",
+                        frame
+                    ))
+                })?;
+            let t_diff = if track_in_reverse {
+                frame.saturating_sub(frame_idx)
+            } else {
+                frame_idx.saturating_sub(frame)
+            };
+            if t_diff >= max_obj_ptrs_in_encoder {
+                continue;
             }
+            obj_ptr_offsets.push(t_diff as i64);
+            obj_ptr_tensors.push(prev.obj_ptr.clone());
         }
 
         let mut num_obj_ptr_tokens = 0usize;
-        let obj_ptr_block = if selected_object_pointer_frame_indices.is_empty() {
+        let obj_ptr_block = if frame_selection.selected_object_pointer_frame_indices.is_empty() {
             None
         } else {
             let mut obj_ptrs = if let Some(packed_history) = packed_history {
                 match (
                     packed_history.obj_ptr_slot_indices_tensor(
-                        selected_object_pointer_frame_indices.as_slice(),
+                        frame_selection.selected_object_pointer_frame_indices.as_slice(),
                         device,
                     )?,
                     packed_history.obj_ptrs(),
@@ -599,8 +748,6 @@ impl Sam3TrackerModel {
             Some((obj_ptrs, obj_pos))
         };
 
-        let mut selected_memory_frame_indices = selected_memory_frame_indices_ordered;
-        selected_memory_frame_indices.sort_unstable();
         let mut prompt_blocks = Vec::new();
         let mut prompt_pos_blocks = Vec::new();
         if let Some((prompt, prompt_pos)) = maskmem_block {
@@ -616,9 +763,13 @@ impl Sam3TrackerModel {
                 prompt: None,
                 prompt_pos: None,
                 num_obj_ptr_tokens,
-                selected_conditioning_frame_indices,
-                selected_memory_frame_indices,
-                selected_object_pointer_frame_indices,
+                selected_conditioning_frame_indices: frame_selection
+                    .selected_conditioning_frame_indices
+                    .clone(),
+                selected_memory_frame_indices: frame_selection.selected_memory_frame_indices.clone(),
+                selected_object_pointer_frame_indices: frame_selection
+                    .selected_object_pointer_frame_indices
+                    .clone(),
             });
         }
 
@@ -626,9 +777,13 @@ impl Sam3TrackerModel {
             prompt: combine_prompt_blocks(prompt_blocks)?,
             prompt_pos: combine_prompt_blocks(prompt_pos_blocks)?,
             num_obj_ptr_tokens,
-            selected_conditioning_frame_indices,
-            selected_memory_frame_indices,
-            selected_object_pointer_frame_indices,
+            selected_conditioning_frame_indices: frame_selection
+                .selected_conditioning_frame_indices
+                .clone(),
+            selected_memory_frame_indices: frame_selection.selected_memory_frame_indices.clone(),
+            selected_object_pointer_frame_indices: frame_selection
+                .selected_object_pointer_frame_indices
+                .clone(),
         })
     }
 }
@@ -734,6 +889,13 @@ impl Sam3TrackerParityExt for Sam3TrackerModel {
             .iter()
             .filter_map(|(frame, state)| state.is_cond_frame.then_some((*frame, state)))
             .collect::<BTreeMap<_, _>>();
+        let frame_selection = self.select_memory_conditioning_frames(
+            frame_idx,
+            history,
+            num_frames,
+            track_in_reverse,
+            &cond_frame_outputs,
+        )?;
         self.build_memory_conditioning_prompt(
             frame_idx,
             history,
@@ -741,6 +903,7 @@ impl Sam3TrackerParityExt for Sam3TrackerModel {
             track_in_reverse,
             &cond_frame_outputs,
             packed_history,
+            &frame_selection,
         )
         .map(Into::into)
     }

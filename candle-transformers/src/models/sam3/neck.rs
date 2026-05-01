@@ -5,6 +5,7 @@ use candle::{DType, Device, Result, Tensor};
 use candle_nn::{Conv2d, Conv2dConfig, ConvTranspose2d, ConvTranspose2dConfig, Module, VarBuilder};
 
 use super::config::NeckConfig;
+use super::tracker::add_tensor_memory;
 use super::torch_ops::position::build_2d_sine_position_encoding_grid;
 use super::vitdet::ViTDetTrunkOutput;
 
@@ -25,7 +26,71 @@ pub struct VisualBackboneOutput {
     pub tracker_sam2_sequences: Option<TrackerVisualSequences>,
 }
 
-fn build_tracker_visual_sequences(
+impl VisualBackboneOutput {
+    pub(crate) fn ensure_tracker_sequences(&mut self) -> Result<()> {
+        if self.tracker_sequences.is_none() {
+            self.tracker_sequences = Some(build_tracker_visual_sequences(
+                self.backbone_fpn.as_slice(),
+                self.vision_pos_enc.as_slice(),
+            )?);
+        }
+        if self.tracker_sam2_sequences.is_none() {
+            self.tracker_sam2_sequences = match (&self.sam2_backbone_fpn, &self.sam2_pos_enc) {
+                (Some(backbone_fpn), Some(vision_pos_enc)) => Some(build_tracker_visual_sequences(
+                    backbone_fpn.as_slice(),
+                    vision_pos_enc.as_slice(),
+                )?),
+                _ => None,
+            };
+        }
+        Ok(())
+    }
+
+    pub(crate) fn strip_tracker_sequences(&mut self) {
+        self.tracker_sequences = None;
+        self.tracker_sam2_sequences = None;
+    }
+
+    pub(crate) fn memory_bytes(&self) -> (usize, usize) {
+        let mut cpu = 0usize;
+        let mut device = 0usize;
+        for tensor in self.backbone_fpn.iter() {
+            add_tensor_memory(tensor, &mut cpu, &mut device);
+        }
+        for tensor in self.vision_pos_enc.iter() {
+            add_tensor_memory(tensor, &mut cpu, &mut device);
+        }
+        if let Some(levels) = self.sam2_backbone_fpn.as_ref() {
+            for tensor in levels.iter() {
+                add_tensor_memory(tensor, &mut cpu, &mut device);
+            }
+        }
+        if let Some(levels) = self.sam2_pos_enc.as_ref() {
+            for tensor in levels.iter() {
+                add_tensor_memory(tensor, &mut cpu, &mut device);
+            }
+        }
+        if let Some(sequences) = self.tracker_sequences.as_ref() {
+            for tensor in sequences.vision_feats.iter() {
+                add_tensor_memory(tensor, &mut cpu, &mut device);
+            }
+            for tensor in sequences.vision_pos_embeds.iter() {
+                add_tensor_memory(tensor, &mut cpu, &mut device);
+            }
+        }
+        if let Some(sequences) = self.tracker_sam2_sequences.as_ref() {
+            for tensor in sequences.vision_feats.iter() {
+                add_tensor_memory(tensor, &mut cpu, &mut device);
+            }
+            for tensor in sequences.vision_pos_embeds.iter() {
+                add_tensor_memory(tensor, &mut cpu, &mut device);
+            }
+        }
+        (cpu, device)
+    }
+}
+
+pub(crate) fn build_tracker_visual_sequences(
     backbone_fpn: &[Tensor],
     vision_pos_enc: &[Tensor],
 ) -> Result<TrackerVisualSequences> {
@@ -448,4 +513,3 @@ fn stage_input_channels(kind: PyramidStageKind, d_model: usize) -> Result<usize>
         }
     }
 }
-

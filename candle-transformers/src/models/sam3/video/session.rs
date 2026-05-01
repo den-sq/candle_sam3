@@ -1,5 +1,26 @@
 use super::*;
-use crate::models::sam3::tracker::PackedPromptHistory;
+use crate::models::sam3::tracker::{add_tensor_memory, PackedPromptHistory};
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionCacheByteBreakdown {
+    pub frames: usize,
+    pub visual_features: usize,
+    pub tracker_states: usize,
+    pub packed_prompt_history: usize,
+    pub text_cache: usize,
+    pub cached_outputs: usize,
+}
+
+impl SessionCacheByteBreakdown {
+    pub fn total(&self) -> usize {
+        self.frames
+            .saturating_add(self.visual_features)
+            .saturating_add(self.tracker_states)
+            .saturating_add(self.packed_prompt_history)
+            .saturating_add(self.text_cache)
+            .saturating_add(self.cached_outputs)
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionCacheStats {
@@ -7,6 +28,8 @@ pub struct SessionCacheStats {
     pub cached_feature_entries: usize,
     pub cached_output_frames: usize,
     pub tracked_objects: usize,
+    pub cpu_bytes: SessionCacheByteBreakdown,
+    pub device_bytes: SessionCacheByteBreakdown,
 }
 
 #[derive(Debug, Clone)]
@@ -20,7 +43,7 @@ pub struct TrackedObject {
     pub confirmation_confirmed: bool,
     pub prompt_frames: BTreeMap<usize, SessionPrompt>,
     pub mask_prompt_frames: BTreeMap<usize, Tensor>,
-    pub frame_outputs: BTreeMap<usize, ObjectFrameOutput>,
+    pub frame_outputs: BTreeSet<usize>,
     pub tracker_states: BTreeMap<usize, TrackerFrameState>,
     pub prompt_history_cache: PackedPromptHistory,
 }
@@ -37,7 +60,7 @@ impl TrackedObject {
             confirmation_confirmed: false,
             prompt_frames: BTreeMap::new(),
             mask_prompt_frames: BTreeMap::new(),
-            frame_outputs: BTreeMap::new(),
+            frame_outputs: BTreeSet::new(),
             tracker_states: BTreeMap::new(),
             prompt_history_cache: PackedPromptHistory::default(),
         }
@@ -162,13 +185,13 @@ impl TrackedObject {
                 .range(..frame_idx)
                 .rev()
                 .take(limit)
-                .map(|(idx, _)| *idx)
+                .copied()
                 .collect(),
             PropagationDirection::Backward => self
                 .frame_outputs
                 .range((frame_idx + 1)..)
                 .take(limit)
-                .map(|(idx, _)| *idx)
+                .copied()
                 .collect(),
         }
     }
@@ -215,6 +238,18 @@ impl TrackedObject {
 
     pub(crate) fn clear_prompt_history_cache(&mut self) {
         self.prompt_history_cache.clear();
+    }
+
+    pub(crate) fn retain_output_frames_up_to(&mut self, frame_idx: usize) {
+        self.frame_outputs.retain(|idx| *idx <= frame_idx);
+    }
+
+    pub(crate) fn record_output_frame(&mut self, frame_idx: usize) {
+        self.frame_outputs.insert(frame_idx);
+    }
+
+    pub(crate) fn remove_output_frame(&mut self, frame_idx: usize) {
+        self.frame_outputs.remove(&frame_idx);
     }
 
     pub(crate) fn ensure_prompt_history_cache(&mut self) -> Result<()> {
@@ -322,11 +357,60 @@ impl Sam3VideoSession {
     }
 
     pub fn cache_stats(&self) -> SessionCacheStats {
+        let (frame_cpu_bytes, frame_device_bytes) = self.frame_source.memory_bytes();
+        let mut cpu_bytes = SessionCacheByteBreakdown {
+            frames: frame_cpu_bytes,
+            ..Default::default()
+        };
+        let mut device_bytes = SessionCacheByteBreakdown {
+            frames: frame_device_bytes,
+            ..Default::default()
+        };
+
+        for visual in self.feature_cache.values() {
+            let (cpu, device) = visual.memory_bytes();
+            cpu_bytes.visual_features = cpu_bytes.visual_features.saturating_add(cpu);
+            device_bytes.visual_features = device_bytes.visual_features.saturating_add(device);
+        }
+        for output_by_object in self.frame_outputs.values() {
+            for output in output_by_object.values() {
+                let (cpu, device) = output.memory_bytes();
+                cpu_bytes.cached_outputs = cpu_bytes.cached_outputs.saturating_add(cpu);
+                device_bytes.cached_outputs = device_bytes.cached_outputs.saturating_add(device);
+            }
+        }
+        for object in self.tracked_objects.values() {
+            for mask in object.mask_prompt_frames.values() {
+                add_tensor_memory(
+                    mask,
+                    &mut cpu_bytes.tracker_states,
+                    &mut device_bytes.tracker_states,
+                );
+            }
+            for state in object.tracker_states.values() {
+                let (cpu, device) = state.memory_bytes();
+                cpu_bytes.tracker_states = cpu_bytes.tracker_states.saturating_add(cpu);
+                device_bytes.tracker_states = device_bytes.tracker_states.saturating_add(device);
+            }
+            let (cpu, device) = object.prompt_history_cache.memory_bytes();
+            cpu_bytes.packed_prompt_history =
+                cpu_bytes.packed_prompt_history.saturating_add(cpu);
+            device_bytes.packed_prompt_history =
+                device_bytes.packed_prompt_history.saturating_add(device);
+        }
+        for cached in self.text_cache.values() {
+            let (cpu, device) = cached.memory_bytes();
+            cpu_bytes.text_cache = cpu_bytes.text_cache.saturating_add(cpu);
+            device_bytes.text_cache = device_bytes.text_cache.saturating_add(device);
+        }
+
         SessionCacheStats {
             loaded_frame_count: self.frame_source.loaded_frame_count(),
             cached_feature_entries: self.feature_cache.len(),
             cached_output_frames: self.frame_outputs.len(),
             tracked_objects: self.tracked_objects.len(),
+            cpu_bytes,
+            device_bytes,
         }
     }
 
@@ -346,6 +430,14 @@ impl Sam3VideoSession {
 
     pub(crate) fn storage_device(&self) -> &Device {
         &self.storage_device
+    }
+
+    pub(crate) fn memory_profile(&self) -> &VideoMemoryProfile {
+        &self.session_options.memory_profile
+    }
+
+    pub(crate) fn low_memory_mode(&self) -> bool {
+        matches!(self.session_options.memory_profile, VideoMemoryProfile::LowMemory)
     }
 
     pub(super) fn debug_recorder_mut(&mut self) -> Option<&mut VideoDebugRecorder> {
@@ -459,7 +551,7 @@ impl Sam3VideoSession {
 
     pub(crate) fn invalidate_object_outputs_from(&mut self, obj_id: u32, frame_idx: usize) {
         if let Some(object) = self.tracked_objects.get_mut(&obj_id) {
-            object.frame_outputs.retain(|idx, _| *idx <= frame_idx);
+            object.retain_output_frames_up_to(frame_idx);
             object.tracker_states.retain(|idx, _| *idx <= frame_idx);
             object.clear_prompt_history_cache();
         }
@@ -528,9 +620,15 @@ impl Sam3VideoSession {
     }
 
     pub(crate) fn evict_for_frame(&mut self, frame_idx: usize, direction: PropagationDirection) {
-        let mut keep = self.prompt_frames();
-        keep.extend(self.prefetch_window(frame_idx, direction));
+        let mut keep = self.prefetch_window(frame_idx, direction);
+        if !self.low_memory_mode() {
+            keep.extend(self.prompt_frames());
+        }
         self.frame_source.evict_except(&keep);
+    }
+
+    pub(crate) fn evict_cached_output_frame(&mut self, frame_idx: usize) {
+        self.frame_outputs.remove(&frame_idx);
     }
 
     fn prefetch_window(
@@ -560,14 +658,20 @@ impl Sam3VideoSession {
         frame_idx: usize,
     ) -> Result<VisualBackboneOutput> {
         if let Some(cached) = self.feature_cache.get(&frame_idx) {
-            let visual = move_visual_output(cached, compute_device)?;
+            let mut visual = move_visual_output(cached, compute_device)?;
+            if self.low_memory_mode() {
+                visual.ensure_tracker_sequences()?;
+            }
             self.touch_feature_cache_entry(frame_idx);
             return Ok(visual);
         }
 
         let image = self.get_frame(frame_idx, compute_device)?;
         let visual = model.encode_image_features(&image)?;
-        let stored = move_visual_output(&visual, self.storage_device())?;
+        let mut stored = move_visual_output(&visual, self.storage_device())?;
+        if self.low_memory_mode() {
+            stored.strip_tracker_sequences();
+        }
         self.feature_cache.insert(frame_idx, stored);
         self.touch_feature_cache_entry(frame_idx);
         self.evict_feature_cache(frame_idx);
@@ -666,6 +770,15 @@ impl CachedTextPrompt {
             },
         })
     }
+
+    fn memory_bytes(&self) -> (usize, usize) {
+        let mut cpu = 0usize;
+        let mut device = 0usize;
+        add_tensor_memory(&self.attention_mask, &mut cpu, &mut device);
+        add_tensor_memory(&self.memory, &mut cpu, &mut device);
+        add_tensor_memory(&self.input_embeddings, &mut cpu, &mut device);
+        (cpu, device)
+    }
 }
 
 #[cfg(feature = "sam3-parity-support")]
@@ -706,5 +819,162 @@ impl Sam3VideoSessionParityExt for Sam3VideoSession {
                 )
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::postprocess::persist_visible_frame_output;
+    use super::*;
+
+    struct DummyFrameSource {
+        frame: Tensor,
+    }
+
+    impl DummyFrameSource {
+        fn new() -> Result<Self> {
+            Ok(Self {
+                frame: Tensor::zeros((3, 2, 2), DType::F32, &Device::Cpu)?,
+            })
+        }
+    }
+
+    impl FrameSource for DummyFrameSource {
+        fn frame_count(&self) -> usize {
+            1
+        }
+
+        fn video_size(&self) -> ImageSize {
+            ImageSize::new(2, 2)
+        }
+
+        fn get_frame(&mut self, frame_idx: usize, target_device: &Device) -> Result<Tensor> {
+            if frame_idx > 0 {
+                candle::bail!("frame_idx {} out of bounds", frame_idx);
+            }
+            self.frame.to_device(target_device)
+        }
+
+        fn prefetch(&mut self, _frame_indices: &[usize]) -> Result<()> {
+            Ok(())
+        }
+
+        fn evict_except(&mut self, _keep_frame_indices: &BTreeSet<usize>) {}
+
+        fn loaded_frame_count(&self) -> usize {
+            1
+        }
+
+        fn memory_bytes(&self) -> (usize, usize) {
+            (self.frame.elem_count() * std::mem::size_of::<f32>(), 0)
+        }
+
+        fn close(&mut self) {}
+    }
+
+    fn test_session(memory_profile: VideoMemoryProfile) -> Result<Sam3VideoSession> {
+        Ok(Sam3VideoSession {
+            session_id: "test".to_owned(),
+            frame_source: Box::new(DummyFrameSource::new()?),
+            session_options: VideoSessionOptions {
+                memory_profile,
+                ..VideoSessionOptions::default()
+            },
+            tokenizer: None,
+            debug_recorder: None,
+            storage_device: Device::Cpu,
+            tracked_objects: BTreeMap::new(),
+            next_obj_id: 1,
+            frame_outputs: BTreeMap::new(),
+            temporal_disambiguation_metadata: BTreeMap::new(),
+            feature_cache: HashMap::new(),
+            feature_cache_order: VecDeque::new(),
+            text_cache: HashMap::new(),
+        })
+    }
+
+    fn test_tracker_state() -> Result<TrackerFrameState> {
+        Ok(TrackerFrameState {
+            low_res_masks: Tensor::zeros((1, 1, 1, 1), DType::F32, &Device::Cpu)?,
+            high_res_masks: Tensor::zeros((1, 1, 2, 2), DType::F32, &Device::Cpu)?,
+            iou_scores: Tensor::ones((1, 1), DType::F32, &Device::Cpu)?,
+            memory_selection_score: None,
+            obj_ptr: Tensor::zeros((1, 4), DType::F32, &Device::Cpu)?,
+            object_score_logits: Tensor::zeros((1, 1), DType::F32, &Device::Cpu)?,
+            maskmem_features: None,
+            maskmem_pos_enc: None,
+            maskmem_prompt_features: None,
+            maskmem_prompt_pos_enc: None,
+            is_cond_frame: false,
+        })
+    }
+
+    fn test_output(obj_id: u32) -> Result<ObjectFrameOutput> {
+        let mask_logits = Tensor::zeros((1, 1, 2, 2), DType::F32, &Device::Cpu)?;
+        let masks = candle_nn::ops::sigmoid(&mask_logits)?;
+        Ok(ObjectFrameOutput {
+            obj_id,
+            mask_logits,
+            masks: masks.clone(),
+            boxes_xyxy: mask_to_normalized_xyxy(&masks)?,
+            scores: Tensor::ones((1,), DType::F32, &Device::Cpu)?,
+            presence_scores: Some(Tensor::ones((1,), DType::F32, &Device::Cpu)?),
+            prompt_frame_idx: Some(0),
+            memory_frame_indices: vec![0],
+            text_prompt: None,
+            used_explicit_geometry: false,
+            reused_previous_output: false,
+        })
+    }
+
+    #[test]
+    fn low_memory_persist_stores_compact_outputs_and_keeps_output_index() -> Result<()> {
+        let mut session = test_session(VideoMemoryProfile::LowMemory)?;
+        let mut object = TrackedObject::new(7, 0);
+        object.tracker_states.insert(0, test_tracker_state()?);
+        session.tracked_objects.insert(7, object);
+        let frame_output = VideoFrameOutput {
+            frame_idx: 0,
+            objects: vec![test_output(7)?],
+        };
+
+        persist_visible_frame_output(&mut session, &frame_output)?;
+
+        let stored = session
+            .frame_outputs
+            .get(&0)
+            .and_then(|outputs| outputs.get(&7))
+            .expect("stored output should exist");
+        assert_eq!(stored.masks.elem_count(), 0);
+        assert_eq!(stored.boxes_xyxy.elem_count(), 0);
+        assert!(session
+            .tracked_objects
+            .get(&7)
+            .expect("tracked object should exist")
+            .frame_outputs
+            .contains(&0));
+        Ok(())
+    }
+
+    #[test]
+    fn evict_cached_output_frame_preserves_lightweight_output_metadata() -> Result<()> {
+        let mut session = test_session(VideoMemoryProfile::LowMemory)?;
+        let mut object = TrackedObject::new(7, 0);
+        object.record_output_frame(0);
+        session.tracked_objects.insert(7, object);
+        let mut outputs = BTreeMap::new();
+        outputs.insert(7, test_output(7)?);
+        session.frame_outputs.insert(0, outputs);
+
+        session.evict_cached_output_frame(0);
+
+        assert!(!session.frame_outputs.contains_key(&0));
+        assert!(session
+            .tracked_objects
+            .get(&7)
+            .expect("tracked object should exist")
+            .frame_outputs
+            .contains(&0));
+        Ok(())
     }
 }

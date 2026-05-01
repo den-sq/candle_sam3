@@ -501,8 +501,9 @@ impl Sam3TrackerModel {
             low_res_masks: maybe_to_device(&state.low_res_masks, storage)?,
             high_res_masks: maybe_to_device(&state.high_res_masks, storage)?,
             iou_scores: maybe_to_device(&state.iou_scores, storage)?,
-            obj_ptr: state.obj_ptr,
-            object_score_logits: state.object_score_logits,
+            memory_selection_score: state.memory_selection_score,
+            obj_ptr: maybe_to_device(&state.obj_ptr, storage)?,
+            object_score_logits: maybe_to_device(&state.object_score_logits, storage)?,
             maskmem_features: state
                 .maskmem_features
                 .as_ref()

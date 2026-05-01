@@ -585,9 +585,14 @@ pub(super) fn persist_visible_frame_output(
 ) -> Result<()> {
     let mut stored_outputs = BTreeMap::new();
     for output in frame_output.objects.iter() {
+        let stored_output = if session.low_memory_mode() {
+            output.to_storage_device_compact(session.storage_device())?
+        } else {
+            output.to_storage_device(session.storage_device())?
+        };
         stored_outputs.insert(
             output.obj_id,
-            output.to_storage_device(session.storage_device())?,
+            stored_output,
         );
     }
     if stored_outputs.is_empty() {
@@ -599,12 +604,10 @@ pub(super) fn persist_visible_frame_output(
     }
     for object in session.tracked_objects.values_mut() {
         if object.tracker_states.contains_key(&frame_output.frame_idx) {
-            if let Some(output) = stored_outputs.get(&object.obj_id) {
-                object
-                    .frame_outputs
-                    .insert(frame_output.frame_idx, output.clone());
+            if stored_outputs.contains_key(&object.obj_id) {
+                object.record_output_frame(frame_output.frame_idx);
             } else {
-                object.frame_outputs.remove(&frame_output.frame_idx);
+                object.remove_output_frame(frame_output.frame_idx);
             }
         }
     }

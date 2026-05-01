@@ -1,5 +1,6 @@
 use super::*;
 use crate::models::sam3::neck::TrackerVisualSequences;
+use crate::models::sam3::tracker::add_tensor_memory;
 use crate::models::sam3::torch_ops::tensor::first_scalar_f32;
 use crate::models::sam3::tracker::PackedPromptHistory;
 
@@ -188,6 +189,47 @@ impl ObjectFrameOutput {
         })
     }
 
+    pub(super) fn to_storage_device_compact(&self, storage_device: &Device) -> Result<Self> {
+        Ok(Self {
+            obj_id: self.obj_id,
+            mask_logits: move_tensor_to_device_if_needed(&self.mask_logits, storage_device)?,
+            masks: Tensor::zeros(0, DType::F32, storage_device)?,
+            boxes_xyxy: Tensor::zeros(0, DType::F32, storage_device)?,
+            scores: move_tensor_to_device_if_needed(&self.scores, storage_device)?,
+            presence_scores: self
+                .presence_scores
+                .as_ref()
+                .map(|tensor| move_tensor_to_device_if_needed(tensor, storage_device))
+                .transpose()?,
+            prompt_frame_idx: self.prompt_frame_idx,
+            memory_frame_indices: self.memory_frame_indices.clone(),
+            text_prompt: self.text_prompt.clone(),
+            used_explicit_geometry: self.used_explicit_geometry,
+            reused_previous_output: self.reused_previous_output,
+        })
+    }
+
+    pub(super) fn materialize_cached(&self) -> Result<Self> {
+        if self.masks.elem_count() > 0 && self.boxes_xyxy.elem_count() > 0 {
+            return Ok(self.clone());
+        }
+        let masks = candle_nn::ops::sigmoid(&self.mask_logits)?;
+        let boxes_xyxy = mask_to_normalized_xyxy(&masks)?;
+        Ok(Self {
+            obj_id: self.obj_id,
+            mask_logits: self.mask_logits.clone(),
+            masks,
+            boxes_xyxy,
+            scores: self.scores.clone(),
+            presence_scores: self.presence_scores.clone(),
+            prompt_frame_idx: self.prompt_frame_idx,
+            memory_frame_indices: self.memory_frame_indices.clone(),
+            text_prompt: self.text_prompt.clone(),
+            used_explicit_geometry: self.used_explicit_geometry,
+            reused_previous_output: self.reused_previous_output,
+        })
+    }
+
     pub(super) fn grounding(&self) -> GroundingOutput {
         GroundingOutput {
             mask_logits: self.mask_logits.clone(),
@@ -196,6 +238,19 @@ impl ObjectFrameOutput {
             scores: self.scores.clone(),
             presence_scores: self.presence_scores.clone(),
         }
+    }
+
+    pub(super) fn memory_bytes(&self) -> (usize, usize) {
+        let mut cpu = 0usize;
+        let mut device = 0usize;
+        add_tensor_memory(&self.mask_logits, &mut cpu, &mut device);
+        add_tensor_memory(&self.masks, &mut cpu, &mut device);
+        add_tensor_memory(&self.boxes_xyxy, &mut cpu, &mut device);
+        add_tensor_memory(&self.scores, &mut cpu, &mut device);
+        if let Some(tensor) = self.presence_scores.as_ref() {
+            add_tensor_memory(tensor, &mut cpu, &mut device);
+        }
+        (cpu, device)
     }
 }
 
@@ -261,7 +316,7 @@ impl<'a> Sam3VideoPredictor<'a> {
     ) -> Result<String> {
         let session_id = format!("session_{}", self.next_session_id);
         self.next_session_id += 1;
-        let frame_source = source.into_frame_source(self.model.config())?;
+        let frame_source = source.into_frame_source(self.model.config(), &options)?;
         let mut session = Sam3VideoSession::new(
             session_id.clone(),
             frame_source,
@@ -546,6 +601,9 @@ impl<'a> Sam3VideoPredictor<'a> {
                 let is_prompt_frame = session.prompt_frames().contains(&yielded.frame_idx);
                 if hotstart_delay > 0 && is_prompt_frame {
                     on_frame(&yielded)?;
+                    if session.low_memory_mode() {
+                        session.evict_cached_output_frame(yielded.frame_idx);
+                    }
                     continue;
                 }
                 let mut hidden_obj_ids = temporal_disambiguation_state.hidden_obj_ids().clone();
@@ -566,6 +624,9 @@ impl<'a> Sam3VideoPredictor<'a> {
                 let filtered = filter_video_frame_output(&yielded, &hidden_obj_ids);
                 persist_visible_frame_output(session, &filtered)?;
                 on_frame(&filtered)?;
+                if session.low_memory_mode() {
+                    session.evict_cached_output_frame(filtered.frame_idx);
+                }
             }
             session.evict_for_frame(frame_idx, options.direction);
         }
@@ -668,6 +729,39 @@ impl Sam3VideoTrackerCoreParityExt for Sam3VideoTrackerCore<'_> {
 }
 
 impl Sam3VideoTrackerCore<'_> {
+    fn tracker_state_memory_selection_score(
+        &self,
+        state: &TrackerFrameState,
+    ) -> Result<Option<f32>> {
+        if state.has_iou_scores() {
+            return Ok(Some(first_scalar_f32(
+                &state.iou_scores.max(candle::D::Minus1)?,
+            )?));
+        }
+        Ok(state.memory_selection_score)
+    }
+
+    fn compact_tracker_state_for_storage(
+        &self,
+        state: &TrackerFrameState,
+        storage_device: &Device,
+        low_memory_mode: bool,
+    ) -> Result<TrackerFrameState> {
+        let mut state = move_tracker_state(state, storage_device)?;
+        state.memory_selection_score = self.tracker_state_memory_selection_score(&state)?;
+        let can_drop_render_tensors = !state.is_cond_frame
+            || (state.maskmem_features.is_some() && state.maskmem_pos_enc.is_some());
+        if can_drop_render_tensors {
+            state.high_res_masks = Tensor::zeros(0, DType::F32, storage_device)?;
+            state.iou_scores = Tensor::zeros(0, DType::F32, storage_device)?;
+        }
+        if low_memory_mode {
+            state.maskmem_prompt_features = None;
+            state.maskmem_prompt_pos_enc = None;
+        }
+        Ok(state)
+    }
+
     fn correction_frame_is_cond_frame(&self) -> bool {
         self.tracker
             .config()
@@ -738,7 +832,11 @@ impl Sam3VideoTrackerCore<'_> {
             )?;
             let mut updated_state = move_tracker_state(&state, compute_device)?;
             updated_state.set_maskmem_state(maskmem_features, maskmem_pos_enc)?;
-            let updated_state = move_tracker_state(&updated_state, session.storage_device())?;
+            let updated_state = self.compact_tracker_state_for_storage(
+                &updated_state,
+                session.storage_device(),
+                session.low_memory_mode(),
+            )?;
             if let Some(tracked) = session.tracked_objects.get_mut(&object.obj_id) {
                 tracked.clear_prompt_history_cache();
                 tracked
@@ -824,6 +922,8 @@ impl Sam3VideoTrackerCore<'_> {
         frame_idx: usize,
         direction: PropagationDirection,
         compute_device: &Device,
+        is_init_cond_frame: bool,
+        use_prev_mem_frame: bool,
     ) -> Result<BTreeMap<usize, TrackerFrameState>> {
         let object = session.tracked_objects.get(&obj_id).ok_or_else(|| {
             candle::Error::Msg(format!(
@@ -831,9 +931,18 @@ impl Sam3VideoTrackerCore<'_> {
                 obj_id
             ))
         })?;
-        object
-            .tracker_history(frame_idx, direction)
+        let history = object.tracker_history(frame_idx, direction);
+        let selected_frames = self.tracker.selected_history_frame_indices_for_tracking(
+            frame_idx,
+            is_init_cond_frame,
+            &history,
+            session.num_frames(),
+            matches!(direction, PropagationDirection::Backward),
+            use_prev_mem_frame,
+        )?;
+        history
             .into_iter()
+            .filter(|(history_frame_idx, _)| selected_frames.contains(history_frame_idx))
             .map(|(history_frame_idx, state)| {
                 Ok((
                     history_frame_idx,
@@ -849,6 +958,9 @@ impl Sam3VideoTrackerCore<'_> {
         obj_id: u32,
         compute_device: &Device,
     ) -> Result<Option<PackedPromptHistory>> {
+        if session.low_memory_mode() {
+            return Ok(None);
+        }
         if !session.storage_device().same_device(compute_device) {
             return Ok(None);
         }
@@ -953,6 +1065,8 @@ impl Sam3VideoTrackerCore<'_> {
             frame_idx,
             direction,
             compute_device,
+            false,
+            true,
         )?;
         let packed_history =
             self.packed_prompt_history_on_compute_device(session, object.obj_id, compute_device)?;
@@ -1035,6 +1149,7 @@ impl Sam3VideoTrackerCore<'_> {
             frame_idx,
             direction,
         )?;
+        let is_cond_frame = self.correction_frame_is_cond_frame();
         let history = if self.tracker.config().predictor.use_stateless_refinement {
             BTreeMap::new()
         } else {
@@ -1044,6 +1159,8 @@ impl Sam3VideoTrackerCore<'_> {
                 frame_idx,
                 direction,
                 compute_device,
+                is_cond_frame,
+                self.tracker.config().predictor.use_prev_mem_frame,
             )?
         };
         let packed_history = if self.tracker.config().predictor.use_stateless_refinement {
@@ -1092,7 +1209,6 @@ impl Sam3VideoTrackerCore<'_> {
         };
         let prev_mask_input =
             self.previous_frame_low_res_mask_input(object, frame_idx, compute_device)?;
-        let is_cond_frame = self.correction_frame_is_cond_frame();
         let mut tracker_state = self
             .tracker
             .track_frame_with_storage_device(
@@ -1156,6 +1272,7 @@ impl Sam3VideoTrackerCore<'_> {
             frame_idx,
             direction,
         )?;
+        let is_cond_frame = self.correction_frame_is_cond_frame();
         let history = if self.tracker.config().predictor.use_stateless_refinement {
             BTreeMap::new()
         } else {
@@ -1165,6 +1282,8 @@ impl Sam3VideoTrackerCore<'_> {
                 frame_idx,
                 direction,
                 compute_device,
+                is_cond_frame,
+                self.tracker.config().predictor.use_prev_mem_frame,
             )?
         };
         let packed_history = if self.tracker.config().predictor.use_stateless_refinement {
@@ -1188,7 +1307,6 @@ impl Sam3VideoTrackerCore<'_> {
         )?
         .ge(0.5f32)?
         .to_dtype(DType::F32)?;
-        let is_cond_frame = self.correction_frame_is_cond_frame();
         let mut tracker_state = self
             .tracker
             .track_frame_with_storage_device(
@@ -1230,7 +1348,7 @@ impl Sam3VideoTrackerCore<'_> {
         let box_count = prompt.boxes.as_ref().map(Vec::len).unwrap_or(0);
         let is_new_visual_prompt = box_count > 0
             && !object.has_inference_history
-            && !object.frame_outputs.contains_key(&frame_idx);
+            && !object.frame_outputs.contains(&frame_idx);
         if !is_new_visual_prompt {
             return Ok((prompt.clone(), false));
         }
@@ -1653,7 +1771,7 @@ impl Sam3VideoTrackerCore<'_> {
             {
                 pending_results.push((
                     obj_id,
-                    cached.to_storage_device(compute_device)?,
+                    cached.materialize_cached()?,
                     session
                         .tracked_objects
                         .get(&obj_id)
@@ -1677,7 +1795,7 @@ impl Sam3VideoTrackerCore<'_> {
                 .get(&obj_id)
                 .map(|object| {
                     object.tracker_states.contains_key(&frame_idx)
-                        && !object.frame_outputs.contains_key(&frame_idx)
+                        && !object.frame_outputs.contains(&frame_idx)
                 })
                 .unwrap_or(false)
             {
@@ -1819,9 +1937,14 @@ impl Sam3VideoTrackerCore<'_> {
         )?;
         let mut stored_outputs = BTreeMap::new();
         for output in frame_objects.iter() {
+            let stored_output = if session.low_memory_mode() {
+                output.to_storage_device_compact(session.storage_device())?
+            } else {
+                output.to_storage_device(session.storage_device())?
+            };
             stored_outputs.insert(
                 output.obj_id,
-                output.to_storage_device(session.storage_device())?,
+                stored_output,
             );
         }
         if stored_outputs.is_empty() {
@@ -1832,14 +1955,19 @@ impl Sam3VideoTrackerCore<'_> {
                 .insert(frame_idx, stored_outputs.clone());
         }
 
+        let low_memory_mode = session.low_memory_mode();
         for (obj_id, _output, tracker_state, display_score) in pending_results {
-            let tracker_storage = move_tracker_state(&tracker_state, session.storage_device())?;
+            let tracker_storage = self.compact_tracker_state_for_storage(
+                &tracker_state,
+                session.storage_device(),
+                low_memory_mode,
+            )?;
             if let Some(object) = session.tracked_objects.get_mut(&obj_id) {
                 let replaced = object
                     .tracker_states
                     .insert(frame_idx, tracker_storage.clone())
                     .is_some();
-                if replaced {
+                if low_memory_mode || replaced {
                     object.clear_prompt_history_cache();
                 } else {
                     object.maybe_append_prompt_history_cache(frame_idx, &tracker_storage)?;
@@ -1849,12 +1977,10 @@ impl Sam3VideoTrackerCore<'_> {
                 if let Some(display_score) = display_score {
                     object.display_score = Some(display_score);
                 }
-                if let Some(stored_output) = stored_outputs.get(&obj_id) {
-                    object
-                        .frame_outputs
-                        .insert(frame_idx, stored_output.clone());
+                if stored_outputs.contains_key(&obj_id) {
+                    object.record_output_frame(frame_idx);
                 } else {
-                    object.frame_outputs.remove(&frame_idx);
+                    object.remove_output_frame(frame_idx);
                 }
             }
         }
@@ -1966,6 +2092,7 @@ pub(super) fn move_tracker_state(
         low_res_masks: move_tensor_to_device_if_needed(&state.low_res_masks, device)?,
         high_res_masks: move_tensor_to_device_if_needed(&state.high_res_masks, device)?,
         iou_scores: move_tensor_to_device_if_needed(&state.iou_scores, device)?,
+        memory_selection_score: state.memory_selection_score,
         obj_ptr: move_tensor_to_device_if_needed(&state.obj_ptr, device)?,
         object_score_logits: move_tensor_to_device_if_needed(&state.object_score_logits, device)?,
         maskmem_features: state
@@ -2077,4 +2204,45 @@ pub(super) fn build_processing_order(
             (end..=start_frame_idx).rev().collect()
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_cached_output_materializes_masks_and_boxes() -> Result<()> {
+        let mask_logits = Tensor::from_vec(
+            vec![0.0f32, 1.0, -1.0, 0.5],
+            (1, 1, 2, 2),
+            &Device::Cpu,
+        )?;
+        let masks = candle_nn::ops::sigmoid(&mask_logits)?;
+        let output = ObjectFrameOutput {
+            obj_id: 1,
+            mask_logits,
+            masks: masks.clone(),
+            boxes_xyxy: mask_to_normalized_xyxy(&masks)?,
+            scores: Tensor::ones((1,), DType::F32, &Device::Cpu)?,
+            presence_scores: Some(Tensor::ones((1,), DType::F32, &Device::Cpu)?),
+            prompt_frame_idx: Some(0),
+            memory_frame_indices: vec![0],
+            text_prompt: Some("test".to_owned()),
+            used_explicit_geometry: true,
+            reused_previous_output: false,
+        };
+
+        let compact = output.to_storage_device_compact(&Device::Cpu)?;
+        assert_eq!(compact.masks.elem_count(), 0);
+        assert_eq!(compact.boxes_xyxy.elem_count(), 0);
+
+        let materialized = compact.materialize_cached()?;
+        assert_eq!(materialized.masks.dims4()?, (1, 1, 2, 2));
+        assert!(materialized.boxes_xyxy.elem_count() > 0);
+        assert_eq!(
+            materialized.masks.sum_all()?.to_scalar::<f32>()?,
+            output.masks.sum_all()?.to_scalar::<f32>()?
+        );
+        Ok(())
+    }
 }

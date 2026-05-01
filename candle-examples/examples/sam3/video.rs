@@ -156,6 +156,7 @@ pub fn run_video_prediction(
     let source = sam3::VideoSource::from_path(&video_mode.video_path)?;
     let session_options = sam3::VideoSessionOptions {
         tokenizer_path: video_mode.tokenizer_path.as_ref().map(PathBuf::from),
+        memory_profile: sam3::VideoMemoryProfile::Balanced,
         offload_frames_to_cpu: video_mode.offload_frames_to_cpu,
         offload_state_to_cpu: video_mode.offload_state_to_cpu,
         prefetch_ahead: video_mode.prefetch_ahead,

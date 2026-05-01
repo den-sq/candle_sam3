@@ -142,20 +142,15 @@ impl Sam3TrackerModel {
             feat_s1_id: feat_s1.id(),
             dtype: format!("{:?}", compute_dtype),
         };
-        if let Some(cached) = self
-            .prepared_high_res_feature_cache
-            .lock()
-            .expect("tracker high-res feature cache lock poisoned")
-            .get(&key)
-            .cloned()
-        {
-            return Ok(cached);
-        }
-        let prepared = self.prepare_high_res_features_uncached(high_res_features)?;
         let mut cache = self
             .prepared_high_res_feature_cache
             .lock()
             .expect("tracker high-res feature cache lock poisoned");
+        cache.retain(|cached_key, _| cached_key == &key);
+        if let Some(cached) = cache.get(&key).cloned() {
+            return Ok(cached);
+        }
+        let prepared = self.prepare_high_res_features_uncached(high_res_features)?;
         Ok(cache.entry(key).or_insert_with(|| prepared.clone()).clone())
     }
 
