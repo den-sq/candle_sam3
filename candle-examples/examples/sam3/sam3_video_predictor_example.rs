@@ -20,14 +20,13 @@ pub(crate) fn run(
     output_dir: &Path,
     device: &Device,
 ) -> Result<()> {
-    let asset_root = super::resolve_notebook_asset_root(notebook_asset_root)?;
-    let video_path = asset_root.join("videos/0001");
-    if !video_path.is_dir() {
-        bail!(
-            "video notebook expects a frame directory at {}",
-            video_path.display()
-        );
-    }
+    let asset_root = super::resolve_notebook_asset_root(notebook_asset_root, output_dir)?;
+    let video_path = super::ensure_notebook_video_frames(
+        &asset_root,
+        "0001",
+        super::NOTEBOOK_BEDROOM_VIDEO_URL,
+        "SAM3 notebook bedroom.mp4",
+    )?;
     let tokenizer_path = tokenizer_path
         .map(ToOwned::to_owned)
         .context("video notebook example requires `--tokenizer <tokenizer.json>`")?;
@@ -45,6 +44,8 @@ pub(crate) fn run(
             "notebook": "sam3_video_predictor_example.ipynb",
             "asset_root": asset_root.display().to_string(),
             "video_path": video_path.display().to_string(),
+            "source_video_url": super::NOTEBOOK_BEDROOM_VIDEO_URL,
+            "cached_video_path": asset_root.join("videos/bedroom.mp4").display().to_string(),
             "frame_count": frame_paths.len(),
             "frame_stride": FRAME_STRIDE,
             "runtime_note": "The Candle predictor currently tracks one object per add_prompt call, so the upstream remove_object(2) branch is executed only when object id 2 is present in the current runtime output.",
@@ -64,8 +65,8 @@ pub(crate) fn run(
         prefetch_behind: 1,
         max_feature_cache_entries: 2,
     };
-    let mut predictor = sam3::Sam3VideoPredictor::new(model, tracker, device);
-    let session_id = predictor.start_session(source, session_options)?;
+    let mut predictor: sam3::Sam3VideoPredictor<'_> = sam3::Sam3VideoPredictor::new(model, tracker, device);
+    let session_id: String = predictor.start_session(source, session_options)?;
     predictor.reset_session(&session_id)?;
 
     let seed_obj_id = predictor.add_prompt(

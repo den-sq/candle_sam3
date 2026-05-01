@@ -49,6 +49,34 @@ The helper downloads `sam3.pt` and `tokenizer.json` from the gated
 `SAM3_TOKENIZER`, and writes a reusable `sam3-paths.env` file next to the
 downloads.
 
+## Build Modes
+
+Use these commands when you want to build the SAM3 example binary without
+launching it. Cargo's default build mode is debug unless `--release` is
+included.
+
+```bash
+cargo build -p candle-examples --example sam3
+```
+
+The matching optimized release build is:
+
+```bash
+cargo build -p candle-examples --release --example sam3
+```
+
+For CUDA, add the feature flag:
+
+```bash
+cargo build -p candle-examples --features cuda --example sam3
+```
+
+For an optimized CUDA build:
+
+```bash
+cargo build -p candle-examples --features cuda --release --example sam3
+```
+
 ## Example Commands
 
 CPU image inference:
@@ -151,7 +179,6 @@ Notebook example port execution:
 
 ```bash
 cargo run -p candle-examples --example sam3 -- \
-  --notebook-asset-root /path/to/upstream/sam3 \
   --notebook-example image-predictor \
   --output-dir candle-examples/examples/sam3/output
 ```
@@ -163,13 +190,13 @@ PATH="/usr/local/cuda-12.9/bin:$PATH" \
 CUDA_HOME=/usr/local/cuda-12.9 \
 LD_LIBRARY_PATH="/usr/local/cuda-12.9/lib64:${LD_LIBRARY_PATH:-}" \
 cargo run -p candle-examples --features cuda --example sam3 -- \
-  --notebook-asset-root /path/to/upstream/sam3 \
   --notebook-example image-predictor \
   --output-dir candle-examples/examples/sam3/output
 ```
 
 The notebook runners write under:
 
+- `output/_notebook_assets/`
 - `output/sam3_image_predictor_example/`
 - `output/sam3_image_batched_inference/`
 - `output/sam3_video_predictor_example/`
@@ -224,6 +251,8 @@ The example accepts either:
 - a direct `tokenizer.json` path, or a repo directory containing `tokenizer.json`
 - `SAM3_CHECKPOINT` and `SAM3_TOKENIZER` environment variables when the flags
   are omitted
+- `--notebook-asset-root` only when you want to override the default downloaded
+  notebook asset cache
 
 ## Repo Split
 
@@ -242,6 +271,9 @@ and non-parity smoke/unit coverage.
 
 - `sam3_image_batched_inference` caches the two COCO notebook images under its
   output subdirectory before running the Rust port.
+- `sam3_image_predictor_example` and `sam3_video_predictor_example` download
+  their required notebook assets into `output/_notebook_assets/` when
+  `--notebook-asset-root` is omitted.
 - `sam3_video_predictor_example` follows the upstream sequence as closely as
   the current Candle predictor API allows and records any multi-object
   incompatibility in the phase summaries.

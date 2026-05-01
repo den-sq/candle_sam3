@@ -14,8 +14,13 @@ pub(crate) fn run(
     output_dir: &Path,
     device: &Device,
 ) -> Result<()> {
-    let asset_root = super::resolve_notebook_asset_root(notebook_asset_root)?;
-    let image_path = asset_root.join("images/test_image.jpg");
+    let asset_root = super::resolve_notebook_asset_root(notebook_asset_root, output_dir)?;
+    let image_path = super::ensure_notebook_asset_file(
+        &asset_root,
+        "images/test_image.jpg",
+        super::NOTEBOOK_TEST_IMAGE_URL,
+        "SAM3 notebook test image",
+    )?;
     let image_path_str = image_path
         .to_str()
         .context("test_image.jpg path is not valid UTF-8")?;
@@ -27,6 +32,7 @@ pub(crate) fn run(
             "notebook": "sam3_image_predictor_example.ipynb",
             "asset_root": asset_root.display().to_string(),
             "image_path": image_path.display().to_string(),
+            "source_url": super::NOTEBOOK_TEST_IMAGE_URL,
             "jobs": [
                 "image_predictor_text_shoe",
                 "image_predictor_single_positive_box",

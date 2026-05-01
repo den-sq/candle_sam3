@@ -21,7 +21,9 @@ use imageproc::drawing::{draw_filled_circle_mut, draw_hollow_rect_mut};
 use imageproc::rect::Rect;
 use serde::Deserialize;
 use serde_json::json;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use tokenizers::{PaddingDirection, PaddingParams, Tokenizer, TruncationParams};
 
 #[derive(Parser, Debug)]
@@ -58,7 +60,9 @@ struct Args {
     #[arg(long, value_enum)]
     notebook_example: Option<NotebookExample>,
 
-    /// Optional path to the upstream `sam3` repo root or its `assets/` directory.
+    /// Optional path to a local `sam3` repo root or `assets/` directory.
+    /// When omitted, notebook examples download and cache the required assets
+    /// under `<output-dir>/_notebook_assets`.
     #[arg(long)]
     notebook_asset_root: Option<String>,
 
@@ -224,6 +228,10 @@ struct BatchBox {
 }
 
 const CLIP_EOT_TOKEN: &str = "<|endoftext|>";
+pub(crate) const NOTEBOOK_TEST_IMAGE_URL: &str =
+    "https://raw.githubusercontent.com/facebookresearch/sam3/main/assets/images/test_image.jpg";
+pub(crate) const NOTEBOOK_BEDROOM_VIDEO_URL: &str =
+    "https://raw.githubusercontent.com/facebookresearch/sam3/main/assets/videos/bedroom.mp4";
 const DEFAULT_CONFIDENCE_THRESHOLD: f32 = 0.5;
 
 fn default_positive_label() -> u32 {
@@ -286,7 +294,7 @@ fn notebook_asset_root_from_candidate(path: PathBuf) -> Option<PathBuf> {
     }
 }
 
-fn resolve_notebook_asset_root(explicit: Option<&str>) -> Result<PathBuf> {
+pub(crate) fn resolve_notebook_asset_root(explicit: Option<&str>, output_dir: &Path) -> Result<PathBuf> {
     if let Some(explicit) = explicit {
         return notebook_asset_root_from_candidate(PathBuf::from(explicit)).ok_or_else(|| {
             E::msg(format!(
@@ -295,22 +303,115 @@ fn resolve_notebook_asset_root(explicit: Option<&str>) -> Result<PathBuf> {
         });
     }
 
-    let mut candidates = Vec::new();
     if let Ok(env_root) = std::env::var("SAM3_UPSTREAM_ROOT") {
-        candidates.push(PathBuf::from(env_root));
-    }
-    candidates.push(PathBuf::from("/home/dnorthover/sam3"));
-    candidates.push(PathBuf::from("/home/dnorthover/extcode/sam3"));
-
-    for candidate in candidates {
-        if let Some(asset_root) = notebook_asset_root_from_candidate(candidate) {
+        if let Some(asset_root) = notebook_asset_root_from_candidate(PathBuf::from(env_root)) {
             return Ok(asset_root);
         }
     }
 
-    bail!(
-        "could not find upstream sam3 assets; pass `--notebook-asset-root <sam3-repo-or-assets-dir>`"
-    )
+    let asset_root = output_dir.join("_notebook_assets");
+    fs::create_dir_all(asset_root.join("images"))?;
+    fs::create_dir_all(asset_root.join("videos"))?;
+    Ok(asset_root)
+}
+
+pub(crate) fn ensure_notebook_asset_file(
+    asset_root: &Path,
+    relative_path: &str,
+    url: &str,
+    label: &str,
+) -> Result<PathBuf> {
+    let path = asset_root.join(relative_path);
+    if path.exists() {
+        return Ok(path);
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp_path = path.with_file_name(format!(
+        "{}.part",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("download")
+    ));
+    let output = Command::new("curl")
+        .args(["-L", "--fail", "--retry", "3", "--output"])
+        .arg(&temp_path)
+        .arg(url)
+        .output()
+        .with_context(|| format!("failed to run curl while downloading {label} from {url}"))?;
+    if !output.status.success() {
+        bail!(
+            "curl failed while downloading {label} from {url}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::rename(&temp_path, &path)?;
+    Ok(path)
+}
+
+fn directory_has_jpeg_frames(dir_path: &Path) -> Result<bool> {
+    Ok(fs::read_dir(dir_path)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .any(|path| {
+            matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("jpg") | Some("jpeg") | Some("JPG") | Some("JPEG")
+            )
+        }))
+}
+
+pub(crate) fn ensure_notebook_video_frames(
+    asset_root: &Path,
+    frame_dir_name: &str,
+    video_url: &str,
+    label: &str,
+) -> Result<PathBuf> {
+    let videos_root = asset_root.join("videos");
+    let frame_dir = videos_root.join(frame_dir_name);
+    if frame_dir.is_dir() && directory_has_jpeg_frames(&frame_dir)? {
+        return Ok(frame_dir);
+    }
+
+    let video_path = ensure_notebook_asset_file(asset_root, "videos/bedroom.mp4", video_url, label)?;
+    if frame_dir.exists() {
+        fs::remove_dir_all(&frame_dir)?;
+    }
+    fs::create_dir_all(&frame_dir)?;
+
+    let pattern = frame_dir.join("%d.jpg");
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&video_path)
+        .args(["-start_number", "0", "-q:v", "2"])
+        .arg(&pattern)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to run ffmpeg while extracting notebook frames from {}",
+                video_path.display()
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "ffmpeg failed while extracting notebook frames from {}: {}",
+            video_path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if !directory_has_jpeg_frames(&frame_dir)? {
+        bail!(
+            "ffmpeg did not produce any notebook frames under {}",
+            frame_dir.display()
+        );
+    }
+    fs::write(
+        frame_dir.join(".complete"),
+        format!("source_video={}\n", video_path.display()),
+    )?;
+    Ok(frame_dir)
 }
 
 fn infer_video_tokenizer_path(tokenizer: Option<&str>, checkpoint: Option<&str>) -> Option<String> {
