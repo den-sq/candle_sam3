@@ -11,6 +11,9 @@ use serde_json::json;
 const FRAME_STRIDE: usize = 60;
 const MASK_THRESHOLD: f32 = 0.5;
 const MASK_COLOR: [u8; 3] = [56, 201, 84];
+const NOTEBOOK_PREFETCH_AHEAD: usize = 0;
+const NOTEBOOK_PREFETCH_BEHIND: usize = 0;
+const NOTEBOOK_MAX_FEATURE_CACHE_ENTRIES: usize = 1;
 
 pub(crate) fn run(
     model: &sam3::Sam3ImageModel,
@@ -23,9 +26,9 @@ pub(crate) fn run(
     let asset_root = super::resolve_notebook_asset_root(notebook_asset_root, output_dir)?;
     let video_path = super::ensure_notebook_video_frames(
         &asset_root,
-        "0001",
-        super::NOTEBOOK_BEDROOM_VIDEO_URL,
-        "SAM3 notebook bedroom.mp4",
+        super::NOTEBOOK_VIDEO_FRAME_DIR_RELATIVE_PATH,
+        super::NOTEBOOK_VIDEO_FRAME_DIR_API_URL,
+        "SAM3 notebook video frames 0001",
     )?;
     let tokenizer_path = tokenizer_path
         .map(ToOwned::to_owned)
@@ -34,6 +37,7 @@ pub(crate) fn run(
     let first_frame = load_rgba_frame(&frame_paths, 0)?;
     let frame_width = first_frame.width() as f32;
     let frame_height = first_frame.height() as f32;
+    let notebook_uses_device_offload = !matches!(device, Device::Cpu);
 
     let example_root = output_dir.join("sam3_video_predictor_example");
     clear_dir(&example_root)?;
@@ -44,10 +48,17 @@ pub(crate) fn run(
             "notebook": "sam3_video_predictor_example.ipynb",
             "asset_root": asset_root.display().to_string(),
             "video_path": video_path.display().to_string(),
-            "source_video_url": super::NOTEBOOK_BEDROOM_VIDEO_URL,
-            "cached_video_path": asset_root.join("videos/bedroom.mp4").display().to_string(),
+            "source_video_asset_dir": "assets/videos/0001",
+            "source_directory_listing_url": super::NOTEBOOK_VIDEO_FRAME_DIR_API_URL,
+            "cached_frame_dir": asset_root.join(super::NOTEBOOK_VIDEO_FRAME_DIR_RELATIVE_PATH).display().to_string(),
             "frame_count": frame_paths.len(),
             "frame_stride": FRAME_STRIDE,
+            "session_memory_profile": "LowMemory",
+            "offload_frames_to_cpu": notebook_uses_device_offload,
+            "offload_state_to_cpu": notebook_uses_device_offload,
+            "prefetch_ahead": NOTEBOOK_PREFETCH_AHEAD,
+            "prefetch_behind": NOTEBOOK_PREFETCH_BEHIND,
+            "max_feature_cache_entries": NOTEBOOK_MAX_FEATURE_CACHE_ENTRIES,
             "runtime_note": "The Candle predictor currently tracks one object per add_prompt call, so the upstream remove_object(2) branch is executed only when object id 2 is present in the current runtime output.",
         }))?,
     )?;
@@ -59,12 +70,12 @@ pub(crate) fn run(
     )?;
     let session_options = sam3::VideoSessionOptions {
         tokenizer_path: Some(PathBuf::from(&tokenizer_path)),
-        memory_profile: sam3::VideoMemoryProfile::Balanced,
-        offload_frames_to_cpu: false,
-        offload_state_to_cpu: false,
-        prefetch_ahead: 2,
-        prefetch_behind: 1,
-        max_feature_cache_entries: 2,
+        memory_profile: sam3::VideoMemoryProfile::LowMemory,
+        offload_frames_to_cpu: notebook_uses_device_offload,
+        offload_state_to_cpu: notebook_uses_device_offload,
+        prefetch_ahead: NOTEBOOK_PREFETCH_AHEAD,
+        prefetch_behind: NOTEBOOK_PREFETCH_BEHIND,
+        max_feature_cache_entries: NOTEBOOK_MAX_FEATURE_CACHE_ENTRIES,
     };
     let mut predictor: sam3::Sam3VideoPredictor<'_> = sam3::Sam3VideoPredictor::new(model, tracker, device);
     let session_id: String = predictor.start_session(source, session_options)?;
@@ -85,51 +96,30 @@ pub(crate) fn run(
         true,
     )?;
 
-    let phase1_prompt_frame = propagate(
-        &mut predictor,
-        &session_id,
-        Some(0),
-        Some(0),
-        Some(MASK_THRESHOLD),
-    )?;
-    export_phase(
-        &example_root,
-        "01_text_prompt_frame0",
-        &frame_paths,
-        &phase1_prompt_frame,
-        1,
-        json!({
-            "phase": "text_prompt_frame0",
-            "prompt": "person",
-            "seed_obj_id": seed_obj_id,
-        }),
-    )?;
+    {
+        let phase1_prompt_frame = propagate(
+            &mut predictor,
+            &session_id,
+            Some(0),
+            Some(0),
+            Some(MASK_THRESHOLD),
+        )?;
+        export_phase(
+            &example_root,
+            "01_text_prompt_frame0",
+            &frame_paths,
+            &phase1_prompt_frame,
+            1,
+            json!({
+                "phase": "text_prompt_frame0",
+                "prompt": "person",
+                "seed_obj_id": seed_obj_id,
+            }),
+        )?;
+    }
 
-    let phase1_full = propagate(
-        &mut predictor,
-        &session_id,
-        Some(0),
-        None,
-        Some(MASK_THRESHOLD),
-    )?;
-    let observed_obj_ids = export_phase(
-        &example_root,
-        "02_text_prompt_propagation",
-        &frame_paths,
-        &phase1_full,
-        FRAME_STRIDE,
-        json!({
-            "phase": "text_prompt_propagation",
-            "prompt": "person",
-            "seed_obj_id": seed_obj_id,
-        }),
-    )?;
-
-    let multi_object_target = 2u32;
-    let remove_target_available = observed_obj_ids.contains(&multi_object_target);
-    if remove_target_available {
-        predictor.remove_object(&session_id, multi_object_target)?;
-        let removed_full = propagate(
+    let observed_obj_ids = {
+        let phase1_full = propagate(
             &mut predictor,
             &session_id,
             Some(0),
@@ -138,15 +128,42 @@ pub(crate) fn run(
         )?;
         export_phase(
             &example_root,
-            "03_remove_object_2_propagation",
+            "02_text_prompt_propagation",
             &frame_paths,
-            &removed_full,
+            &phase1_full,
             FRAME_STRIDE,
             json!({
-                "phase": "remove_object_2_propagation",
-                "removed_obj_id": multi_object_target,
+                "phase": "text_prompt_propagation",
+                "prompt": "person",
+                "seed_obj_id": seed_obj_id,
             }),
-        )?;
+        )?
+    };
+
+    let multi_object_target = 2u32;
+    let remove_target_available = observed_obj_ids.contains(&multi_object_target);
+    if remove_target_available {
+        predictor.remove_object(&session_id, multi_object_target)?;
+        {
+            let removed_full = propagate(
+                &mut predictor,
+                &session_id,
+                Some(0),
+                None,
+                Some(MASK_THRESHOLD),
+            )?;
+            export_phase(
+                &example_root,
+                "03_remove_object_2_propagation",
+                &frame_paths,
+                &removed_full,
+                FRAME_STRIDE,
+                json!({
+                    "phase": "remove_object_2_propagation",
+                    "removed_obj_id": multi_object_target,
+                }),
+            )?;
+        }
     } else {
         write_phase_note(
             &example_root.join("03_remove_object_2_propagation"),
@@ -180,44 +197,48 @@ pub(crate) fn run(
         true,
         true,
     )?;
-    let phase2_prompt_frame = propagate(
-        &mut predictor,
-        &session_id,
-        Some(0),
-        Some(0),
-        Some(MASK_THRESHOLD),
-    )?;
-    export_phase(
-        &example_root,
-        "04_single_click_frame0",
-        &frame_paths,
-        &phase2_prompt_frame,
-        1,
-        json!({
-            "phase": "single_click_frame0",
-            "obj_id": tracked_obj_id,
-            "points_xy_normalized": single_click_points,
-            "point_labels": single_click_labels,
-        }),
-    )?;
-    let phase2_full = propagate(
-        &mut predictor,
-        &session_id,
-        Some(0),
-        None,
-        Some(MASK_THRESHOLD),
-    )?;
-    export_phase(
-        &example_root,
-        "05_single_click_propagation",
-        &frame_paths,
-        &phase2_full,
-        FRAME_STRIDE,
-        json!({
-            "phase": "single_click_propagation",
-            "obj_id": tracked_obj_id,
-        }),
-    )?;
+    {
+        let phase2_prompt_frame = propagate(
+            &mut predictor,
+            &session_id,
+            Some(0),
+            Some(0),
+            Some(MASK_THRESHOLD),
+        )?;
+        export_phase(
+            &example_root,
+            "04_single_click_frame0",
+            &frame_paths,
+            &phase2_prompt_frame,
+            1,
+            json!({
+                "phase": "single_click_frame0",
+                "obj_id": tracked_obj_id,
+                "points_xy_normalized": single_click_points,
+                "point_labels": single_click_labels,
+            }),
+        )?;
+    }
+    {
+        let phase2_full = propagate(
+            &mut predictor,
+            &session_id,
+            Some(0),
+            None,
+            Some(MASK_THRESHOLD),
+        )?;
+        export_phase(
+            &example_root,
+            "05_single_click_propagation",
+            &frame_paths,
+            &phase2_full,
+            FRAME_STRIDE,
+            json!({
+                "phase": "single_click_propagation",
+                "obj_id": tracked_obj_id,
+            }),
+        )?;
+    }
 
     let refinement_points = vec![
         (740.0 / frame_width, 450.0 / frame_height),
@@ -240,44 +261,48 @@ pub(crate) fn run(
         true,
         true,
     )?;
-    let phase3_prompt_frame = propagate(
-        &mut predictor,
-        &session_id,
-        Some(0),
-        Some(0),
-        Some(MASK_THRESHOLD),
-    )?;
-    export_phase(
-        &example_root,
-        "06_refined_clicks_frame0",
-        &frame_paths,
-        &phase3_prompt_frame,
-        1,
-        json!({
-            "phase": "refined_clicks_frame0",
-            "obj_id": tracked_obj_id,
-            "points_xy_normalized": refinement_points,
-            "point_labels": refinement_labels,
-        }),
-    )?;
-    let phase3_full = propagate(
-        &mut predictor,
-        &session_id,
-        Some(0),
-        None,
-        Some(MASK_THRESHOLD),
-    )?;
-    export_phase(
-        &example_root,
-        "07_refined_clicks_propagation",
-        &frame_paths,
-        &phase3_full,
-        FRAME_STRIDE,
-        json!({
-            "phase": "refined_clicks_propagation",
-            "obj_id": tracked_obj_id,
-        }),
-    )?;
+    {
+        let phase3_prompt_frame = propagate(
+            &mut predictor,
+            &session_id,
+            Some(0),
+            Some(0),
+            Some(MASK_THRESHOLD),
+        )?;
+        export_phase(
+            &example_root,
+            "06_refined_clicks_frame0",
+            &frame_paths,
+            &phase3_prompt_frame,
+            1,
+            json!({
+                "phase": "refined_clicks_frame0",
+                "obj_id": tracked_obj_id,
+                "points_xy_normalized": refinement_points,
+                "point_labels": refinement_labels,
+            }),
+        )?;
+    }
+    {
+        let phase3_full = propagate(
+            &mut predictor,
+            &session_id,
+            Some(0),
+            None,
+            Some(MASK_THRESHOLD),
+        )?;
+        export_phase(
+            &example_root,
+            "07_refined_clicks_propagation",
+            &frame_paths,
+            &phase3_full,
+            FRAME_STRIDE,
+            json!({
+                "phase": "refined_clicks_propagation",
+                "obj_id": tracked_obj_id,
+            }),
+        )?;
+    }
 
     predictor.close_session(&session_id)?;
     Ok(())

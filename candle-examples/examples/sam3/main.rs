@@ -230,9 +230,24 @@ struct BatchBox {
 const CLIP_EOT_TOKEN: &str = "<|endoftext|>";
 pub(crate) const NOTEBOOK_TEST_IMAGE_URL: &str =
     "https://raw.githubusercontent.com/facebookresearch/sam3/main/assets/images/test_image.jpg";
-pub(crate) const NOTEBOOK_BEDROOM_VIDEO_URL: &str =
-    "https://raw.githubusercontent.com/facebookresearch/sam3/main/assets/videos/bedroom.mp4";
+pub(crate) const NOTEBOOK_VIDEO_FRAME_DIR_RELATIVE_PATH: &str = "videos/0001";
+pub(crate) const NOTEBOOK_VIDEO_FRAME_DIR_API_URL: &str =
+    "https://api.github.com/repos/facebookresearch/sam3/contents/assets/videos/0001?ref=main";
 const DEFAULT_CONFIDENCE_THRESHOLD: f32 = 0.5;
+
+#[derive(Debug, Deserialize)]
+struct GitHubDirectoryEntry {
+    name: String,
+    #[serde(rename = "type")]
+    entry_type: String,
+    download_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NotebookAssetDownload {
+    name: String,
+    url: String,
+}
 
 fn default_positive_label() -> u32 {
     1
@@ -329,6 +344,11 @@ pub(crate) fn ensure_notebook_asset_file(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    download_notebook_asset_file(url, &path, label)?;
+    Ok(path)
+}
+
+fn download_notebook_asset_file(url: &str, path: &Path, label: &str) -> Result<()> {
     let temp_path = path.with_file_name(format!(
         "{}.part",
         path.file_name()
@@ -348,7 +368,62 @@ pub(crate) fn ensure_notebook_asset_file(
         );
     }
     fs::rename(&temp_path, &path)?;
-    Ok(path)
+    Ok(())
+}
+
+fn fetch_notebook_asset_text(url: &str, label: &str, extra_headers: &[&str]) -> Result<String> {
+    let mut command = Command::new("curl");
+    command.args(["-L", "--fail", "--retry", "3"]);
+    for header in extra_headers {
+        command.arg("-H").arg(header);
+    }
+    let output = command
+        .arg(url)
+        .output()
+        .with_context(|| format!("failed to run curl while fetching {label} from {url}"))?;
+    if !output.status.success() {
+        bail!(
+            "curl failed while fetching {label} from {url}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    String::from_utf8(output.stdout)
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("curl returned non-UTF8 data while fetching {label} from {url}"))
+}
+
+fn frame_name_sort_key(name: &str) -> (Option<usize>, &str) {
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(name);
+    (stem.parse::<usize>().ok(), name)
+}
+
+fn parse_github_directory_downloads(contents_json: &str, label: &str) -> Result<Vec<NotebookAssetDownload>> {
+    let mut downloads = serde_json::from_str::<Vec<GitHubDirectoryEntry>>(contents_json)
+        .with_context(|| format!("failed to parse GitHub directory listing for {label}"))?
+        .into_iter()
+        .filter_map(|entry| {
+            let is_jpeg = Path::new(&entry.name)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg"))
+                .unwrap_or(false);
+            if entry.entry_type != "file" || !is_jpeg {
+                return None;
+            }
+            entry.download_url.map(|url| NotebookAssetDownload {
+                name: entry.name,
+                url,
+            })
+        })
+        .collect::<Vec<_>>();
+    downloads.sort_by(|lhs, rhs| frame_name_sort_key(&lhs.name).cmp(&frame_name_sort_key(&rhs.name)));
+    if downloads.is_empty() {
+        bail!("GitHub directory listing for {label} did not contain any JPEG frames");
+    }
+    Ok(downloads)
 }
 
 fn directory_has_jpeg_frames(dir_path: &Path) -> Result<bool> {
@@ -365,51 +440,45 @@ fn directory_has_jpeg_frames(dir_path: &Path) -> Result<bool> {
 
 pub(crate) fn ensure_notebook_video_frames(
     asset_root: &Path,
-    frame_dir_name: &str,
-    video_url: &str,
+    relative_frame_dir: &str,
+    directory_listing_url: &str,
     label: &str,
 ) -> Result<PathBuf> {
-    let videos_root = asset_root.join("videos");
-    let frame_dir = videos_root.join(frame_dir_name);
+    let frame_dir = asset_root.join(relative_frame_dir);
     if frame_dir.is_dir() && directory_has_jpeg_frames(&frame_dir)? {
         return Ok(frame_dir);
     }
 
-    let video_path = ensure_notebook_asset_file(asset_root, "videos/bedroom.mp4", video_url, label)?;
     if frame_dir.exists() {
         fs::remove_dir_all(&frame_dir)?;
     }
     fs::create_dir_all(&frame_dir)?;
 
-    let pattern = frame_dir.join("%d.jpg");
-    let output = Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(&video_path)
-        .args(["-start_number", "0", "-q:v", "2"])
-        .arg(&pattern)
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to run ffmpeg while extracting notebook frames from {}",
-                video_path.display()
-            )
-        })?;
-    if !output.status.success() {
-        bail!(
-            "ffmpeg failed while extracting notebook frames from {}: {}",
-            video_path.display(),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    let listing = fetch_notebook_asset_text(
+        directory_listing_url,
+        label,
+        &[
+            "Accept: application/vnd.github+json",
+            "User-Agent: candle-sam3-notebook-loader",
+        ],
+    )?;
+    let frame_downloads = parse_github_directory_downloads(&listing, label)?;
+    for download in &frame_downloads {
+        download_notebook_asset_file(
+            &download.url,
+            &frame_dir.join(&download.name),
+            &format!("{label} frame {}", download.name),
+        )?;
     }
     if !directory_has_jpeg_frames(&frame_dir)? {
         bail!(
-            "ffmpeg did not produce any notebook frames under {}",
+            "failed to cache notebook frames under {}",
             frame_dir.display()
         );
     }
     fs::write(
         frame_dir.join(".complete"),
-        format!("source_video={}\n", video_path.display()),
+        format!("directory_listing_url={directory_listing_url}\n"),
     )?;
     Ok(frame_dir)
 }
@@ -1483,6 +1552,25 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("--point-label"));
         assert!(message.contains("must match"));
+    }
+
+    #[test]
+    fn parse_github_directory_downloads_keeps_only_jpeg_files_in_frame_order() {
+        let contents_json = r#"
+[
+  {"name":"10.jpg","type":"file","download_url":"https://example.com/10.jpg"},
+  {"name":"2.jpg","type":"file","download_url":"https://example.com/2.jpg"},
+  {"name":"README.md","type":"file","download_url":"https://example.com/README.md"},
+  {"name":"subdir","type":"dir","download_url":null},
+  {"name":"0.jpeg","type":"file","download_url":"https://example.com/0.jpeg"}
+]
+"#;
+        let downloads = parse_github_directory_downloads(contents_json, "test frames").unwrap();
+        let names = downloads
+            .into_iter()
+            .map(|download| download.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["0.jpeg", "2.jpg", "10.jpg"]);
     }
 
     #[test]

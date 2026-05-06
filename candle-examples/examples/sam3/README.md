@@ -274,6 +274,12 @@ and non-parity smoke/unit coverage.
 - `sam3_image_predictor_example` and `sam3_video_predictor_example` download
   their required notebook assets into `output/_notebook_assets/` when
   `--notebook-asset-root` is omitted.
+- `sam3_image_predictor_example` uses the upstream SAM3 notebook image
+  `assets/images/test_image.jpg`.
+- `sam3_video_predictor_example` uses the upstream SAM3 notebook frame
+  directory `assets/videos/0001` rather than the old `bedroom.mp4` asset.
+- `sam3_image_batched_inference` uses the same two COCO image URLs referenced
+  by the upstream SAM3 notebook.
 - `sam3_video_predictor_example` follows the upstream sequence as closely as
   the current Candle predictor API allows and records any multi-object
   incompatibility in the phase summaries.

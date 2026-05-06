@@ -1137,8 +1137,15 @@ impl Sam3VideoTrackerCore<'_> {
         direction: PropagationDirection,
     ) -> Result<(ObjectFrameOutput, TrackerFrameState, Option<f32>)> {
         if prompt.text.is_some() {
-            candle::bail!(
-                "SAM3 video tracker correction prompts currently accept point/box geometry only; text refinement is not implemented in this runtime."
+            return self.run_refined_visual_prompt_frame(
+                config,
+                model,
+                compute_device,
+                session,
+                frame_idx,
+                object,
+                prompt,
+                direction,
             );
         }
         self.ensure_history_states_have_memory(
@@ -1251,6 +1258,143 @@ impl Sam3VideoTrackerCore<'_> {
         output.presence_scores = None;
         apply_prompt_frame_output_postprocess(&mut output, config, Some(session.storage_device()))?;
         Ok((output, tracker_state, object.display_score.or(Some(1.0))))
+    }
+
+    fn run_refined_visual_prompt_frame(
+        &self,
+        config: &VideoConfig,
+        model: &Sam3ImageModel,
+        compute_device: &Device,
+        session: &mut Sam3VideoSession,
+        frame_idx: usize,
+        object: &TrackedObject,
+        prompt: &SessionPrompt,
+        direction: PropagationDirection,
+    ) -> Result<(ObjectFrameOutput, TrackerFrameState, Option<f32>)> {
+        self.ensure_history_states_have_memory(
+            model,
+            compute_device,
+            session,
+            object,
+            frame_idx,
+            direction,
+        )?;
+        let is_cond_frame = self.correction_frame_is_cond_frame();
+        let history = if self.tracker.config().predictor.use_stateless_refinement {
+            BTreeMap::new()
+        } else {
+            self.history_on_compute_device(
+                session,
+                object.obj_id,
+                frame_idx,
+                direction,
+                compute_device,
+                is_cond_frame,
+                self.tracker.config().predictor.use_prev_mem_frame,
+            )?
+        };
+        let packed_history = if self.tracker.config().predictor.use_stateless_refinement {
+            None
+        } else {
+            self.packed_prompt_history_on_compute_device(session, object.obj_id, compute_device)?
+        };
+        let visual_features = session.get_visual_features(model, compute_device, frame_idx)?;
+        let tracker_visual_features = tracker_visual_output(&visual_features);
+        let geometry_prompt = session_prompt_to_geometry(prompt, compute_device)?;
+        let geometry_encoding = if geometry_prompt.is_empty() {
+            None
+        } else {
+            Some(model.encode_geometry_prompt(&geometry_prompt, &visual_features)?)
+        };
+        let text_encoding = prompt
+            .text
+            .as_ref()
+            .map(|text| session.cached_text_encoding(model, text, compute_device))
+            .transpose()?;
+        let encoded_prompt =
+            combine_encoded_prompts(text_encoding.as_ref(), geometry_encoding.as_ref())?
+                .ok_or_else(|| {
+                    candle::Error::Msg(
+                        "refined visual prompt path produced no encoded prompt".to_owned(),
+                    )
+                })?;
+        let grounding = ground_from_encoded_prompt(model, &visual_features, &encoded_prompt)?;
+        let detector_output = grounding_to_object_output(
+            object.obj_id,
+            &grounding,
+            Some(frame_idx),
+            Vec::new(),
+            prompt.text.clone(),
+            true,
+            false,
+            session.video_size(),
+        )?;
+        if let Some(recorder) = session.debug_recorder_mut() {
+            recorder.record_detector_grounding(
+                object,
+                frame_idx,
+                direction,
+                debug_prompt_metadata(prompt, false)?,
+                &detector_output,
+            )?;
+        }
+        let mut tracker_mask_input =
+            normalize_video_mask_prompt(&grounding.mask_logits, compute_device)?;
+        let (_, _, height, width) = tracker_mask_input.dims4()?;
+        let tracker_input_size = self.tracker.input_mask_size();
+        if height != tracker_input_size || width != tracker_input_size {
+            tracker_mask_input = tracker_mask_input.upsample_bilinear2d(
+                tracker_input_size,
+                tracker_input_size,
+                false,
+            )?;
+        }
+        let tracker_mask_input = tracker_mask_input.gt(0f64)?.to_dtype(DType::F32)?;
+        let mut tracker_state = self
+            .tracker
+            .track_frame_with_storage_device(
+                &tracker_visual_features,
+                frame_idx,
+                session.num_frames(),
+                None,
+                None,
+                None,
+                Some(&tracker_mask_input),
+                &history,
+                is_cond_frame,
+                matches!(direction, PropagationDirection::Backward),
+                self.tracker.config().predictor.use_prev_mem_frame,
+                false,
+                Some(session.storage_device()),
+                packed_history.as_ref(),
+            )?
+            .state;
+        tracker_state = self.attach_state_memory(&tracker_visual_features, &tracker_state, false)?;
+        let detector_score = detector_output.score_value()?;
+        let mut output = tracker_state_to_object_output(
+            object.obj_id,
+            &tracker_state,
+            Some(detector_score),
+            Some(frame_idx),
+            Vec::new(),
+            prompt.text.clone(),
+            true,
+            false,
+            session.video_size(),
+        )?;
+        output.presence_scores = None;
+        apply_prompt_frame_output_postprocess(&mut output, config, Some(session.storage_device()))?;
+        if let Some(recorder) = session.debug_recorder_mut() {
+            recorder.record_tracker_seed(
+                object,
+                frame_idx,
+                direction,
+                debug_prompt_metadata(prompt, false)?,
+                &output,
+                &tracker_state,
+            )?;
+        }
+        Ok((output, tracker_state, Some(detector_score)))
     }
 
     fn run_refined_mask_prompt_frame(
