@@ -118,6 +118,10 @@ struct Args {
     #[arg(long)]
     video_offload_state_to_cpu: bool,
 
+    /// Use the SAM3 low-memory video session profile instead of the default balanced profile.
+    #[arg(long)]
+    video_low_memory_profile: bool,
+
     /// Write a focused frame-0/frame-1 video tracker debug bundle under `<output-dir>/debug`.
     #[arg(long)]
     video_debug_bundle: bool,
@@ -2053,6 +2057,7 @@ pub fn main() -> anyhow::Result<()> {
                     )?,
                     &tracker,
                     args.tokenizer.as_deref(),
+                    args.video_low_memory_profile,
                     args.notebook_asset_root.as_deref(),
                     Path::new(&args.output_dir),
                     &device,
@@ -2112,6 +2117,7 @@ pub fn main() -> anyhow::Result<()> {
             max_feature_cache_entries: args.video_max_feature_cache_entries,
             offload_frames_to_cpu: args.video_offload_frames_to_cpu,
             offload_state_to_cpu: args.video_offload_state_to_cpu,
+            use_low_memory_profile: args.video_low_memory_profile,
             debug_bundle: args.video_debug_bundle,
             debug_obj_ids: args.video_debug_obj_ids.clone(),
             debug_frame_indices: args.video_debug_frames.clone(),

@@ -35,6 +35,7 @@ pub struct VideoMode {
     pub max_feature_cache_entries: usize,
     pub offload_frames_to_cpu: bool,
     pub offload_state_to_cpu: bool,
+    pub use_low_memory_profile: bool,
     pub debug_bundle: bool,
     pub debug_obj_ids: Vec<u32>,
     pub debug_frame_indices: Vec<usize>,
@@ -154,9 +155,14 @@ pub fn run_video_prediction(
 
     let source_path = PathBuf::from(&video_mode.video_path);
     let source = sam3::VideoSource::from_path(&video_mode.video_path)?;
+    let memory_profile = if video_mode.use_low_memory_profile {
+        sam3::VideoMemoryProfile::LowMemory
+    } else {
+        sam3::VideoMemoryProfile::Balanced
+    };
     let session_options = sam3::VideoSessionOptions {
         tokenizer_path: video_mode.tokenizer_path.as_ref().map(PathBuf::from),
-        memory_profile: sam3::VideoMemoryProfile::Balanced,
+        memory_profile,
         offload_frames_to_cpu: video_mode.offload_frames_to_cpu,
         offload_state_to_cpu: video_mode.offload_state_to_cpu,
         prefetch_ahead: video_mode.prefetch_ahead,

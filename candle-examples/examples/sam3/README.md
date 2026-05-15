@@ -280,6 +280,9 @@ and non-parity smoke/unit coverage.
   directory `assets/videos/0001` rather than the old `bedroom.mp4` asset.
 - `sam3_image_batched_inference` uses the same two COCO image URLs referenced
   by the upstream SAM3 notebook.
+- Video flows use the faster `Balanced` memory profile by default; pass
+  `--video-low-memory-profile` when you need the more aggressive low-memory
+  session behavior.
 - `sam3_video_predictor_example` follows the upstream sequence as closely as
   the current Candle predictor API allows and records any multi-object
   incompatibility in the phase summaries.

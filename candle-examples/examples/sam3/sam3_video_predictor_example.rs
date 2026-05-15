@@ -11,6 +11,9 @@ use serde_json::json;
 const FRAME_STRIDE: usize = 60;
 const MASK_THRESHOLD: f32 = 0.5;
 const MASK_COLOR: [u8; 3] = [56, 201, 84];
+const BALANCED_NOTEBOOK_PREFETCH_AHEAD: usize = 2;
+const BALANCED_NOTEBOOK_PREFETCH_BEHIND: usize = 1;
+const BALANCED_NOTEBOOK_MAX_FEATURE_CACHE_ENTRIES: usize = 2;
 const NOTEBOOK_PREFETCH_AHEAD: usize = 0;
 const NOTEBOOK_PREFETCH_BEHIND: usize = 0;
 const NOTEBOOK_MAX_FEATURE_CACHE_ENTRIES: usize = 1;
@@ -19,6 +22,7 @@ pub(crate) fn run(
     model: &sam3::Sam3ImageModel,
     tracker: &sam3::Sam3TrackerModel,
     tokenizer_path: Option<&str>,
+    use_low_memory_profile: bool,
     notebook_asset_root: Option<&str>,
     output_dir: &Path,
     device: &Device,
@@ -37,7 +41,32 @@ pub(crate) fn run(
     let first_frame = load_rgba_frame(&frame_paths, 0)?;
     let frame_width = first_frame.width() as f32;
     let frame_height = first_frame.height() as f32;
-    let notebook_uses_device_offload = !matches!(device, Device::Cpu);
+    let notebook_uses_device_offload = use_low_memory_profile && !matches!(device, Device::Cpu);
+    let session_memory_profile = if use_low_memory_profile {
+        sam3::VideoMemoryProfile::LowMemory
+    } else {
+        sam3::VideoMemoryProfile::Balanced
+    };
+    let session_memory_profile_name = if use_low_memory_profile {
+        "LowMemory"
+    } else {
+        "Balanced"
+    };
+    let prefetch_ahead = if use_low_memory_profile {
+        NOTEBOOK_PREFETCH_AHEAD
+    } else {
+        BALANCED_NOTEBOOK_PREFETCH_AHEAD
+    };
+    let prefetch_behind = if use_low_memory_profile {
+        NOTEBOOK_PREFETCH_BEHIND
+    } else {
+        BALANCED_NOTEBOOK_PREFETCH_BEHIND
+    };
+    let max_feature_cache_entries = if use_low_memory_profile {
+        NOTEBOOK_MAX_FEATURE_CACHE_ENTRIES
+    } else {
+        BALANCED_NOTEBOOK_MAX_FEATURE_CACHE_ENTRIES
+    };
 
     let example_root = output_dir.join("sam3_video_predictor_example");
     clear_dir(&example_root)?;
@@ -53,12 +82,12 @@ pub(crate) fn run(
             "cached_frame_dir": asset_root.join(super::NOTEBOOK_VIDEO_FRAME_DIR_RELATIVE_PATH).display().to_string(),
             "frame_count": frame_paths.len(),
             "frame_stride": FRAME_STRIDE,
-            "session_memory_profile": "LowMemory",
+            "session_memory_profile": session_memory_profile_name,
             "offload_frames_to_cpu": notebook_uses_device_offload,
             "offload_state_to_cpu": notebook_uses_device_offload,
-            "prefetch_ahead": NOTEBOOK_PREFETCH_AHEAD,
-            "prefetch_behind": NOTEBOOK_PREFETCH_BEHIND,
-            "max_feature_cache_entries": NOTEBOOK_MAX_FEATURE_CACHE_ENTRIES,
+            "prefetch_ahead": prefetch_ahead,
+            "prefetch_behind": prefetch_behind,
+            "max_feature_cache_entries": max_feature_cache_entries,
             "runtime_note": "The Candle predictor currently tracks one object per add_prompt call, so the upstream remove_object(2) branch is executed only when object id 2 is present in the current runtime output.",
         }))?,
     )?;
@@ -70,12 +99,12 @@ pub(crate) fn run(
     )?;
     let session_options = sam3::VideoSessionOptions {
         tokenizer_path: Some(PathBuf::from(&tokenizer_path)),
-        memory_profile: sam3::VideoMemoryProfile::LowMemory,
+        memory_profile: session_memory_profile,
         offload_frames_to_cpu: notebook_uses_device_offload,
         offload_state_to_cpu: notebook_uses_device_offload,
-        prefetch_ahead: NOTEBOOK_PREFETCH_AHEAD,
-        prefetch_behind: NOTEBOOK_PREFETCH_BEHIND,
-        max_feature_cache_entries: NOTEBOOK_MAX_FEATURE_CACHE_ENTRIES,
+        prefetch_ahead,
+        prefetch_behind,
+        max_feature_cache_entries,
     };
     let mut predictor: sam3::Sam3VideoPredictor<'_> = sam3::Sam3VideoPredictor::new(model, tracker, device);
     let session_id: String = predictor.start_session(source, session_options)?;
