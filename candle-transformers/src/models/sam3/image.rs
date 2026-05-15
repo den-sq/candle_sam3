@@ -488,6 +488,8 @@ fn encoded_prompt_from_text(text: &TextEncoding) -> EncodedPrompt {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{GroundingOutput, ImageSize, Sam3ImageState};
     use candle::{Device, Result, Tensor};
     use candle_nn::VarBuilder;
@@ -625,6 +627,191 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    #[ignore = "manual vision trunk parity investigation"]
+    fn image_trunk_blocks_7_and_8_debug_bundle_match_reference() -> Result<()> {
+        let dev = Device::Cpu;
+        let checkpoint_dir = sam3_test_checkpoint_dir();
+        let model = Sam3ImageModel::from_upstream_pth(
+            &Config::default(),
+            checkpoint_dir.join("sam3.pt"),
+            candle::DType::F32,
+            &dev,
+        )?;
+
+        for block_index in [7usize, 8] {
+            let reference = candle::safetensors::load(
+                vision_trunk_debug_bundle_dir(block_index).join("reference.safetensors"),
+                &dev,
+            )?;
+            let input_name = format!("vision.block_debug.{block_index}.input");
+            let input = reference
+                .get(&input_name)
+                .ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "vision trunk debug bundle is missing required tensor {input_name}"
+                    ))
+                })?
+                .permute((0, 2, 3, 1))?;
+            let (_output, debug_tensors) = model
+                .vision_trunk
+                .forward_block_with_debug_from_hidden_states(&input, block_index)?;
+
+            for stage_suffix in [
+                "input",
+                "norm1",
+                "attn_output",
+                "post_attn",
+                "norm2",
+                "mlp_fc1",
+                "mlp_gelu",
+                "mlp_output",
+                "output",
+            ] {
+                let stage_name = format!("vision.block_debug.{block_index}.{stage_suffix}");
+                let actual = debug_tensors
+                    .get(&stage_name)
+                    .ok_or_else(|| {
+                        candle::Error::Msg(format!(
+                            "runtime trunk debug output is missing required tensor {stage_name}"
+                        ))
+                    })?
+                    .permute((0, 3, 1, 2))?;
+                let expected = reference.get(&stage_name).ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "vision trunk debug bundle is missing required tensor {stage_name}"
+                    ))
+                })?;
+                assert_tensor_close(&actual, expected, 1e-4, &stage_name)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "manual vision trunk parity investigation"]
+    fn image_trunk_block_8_from_baseline_actual_input_prints_stage_diffs() -> Result<()> {
+        let dev = Device::Cpu;
+        let checkpoint_dir = sam3_test_checkpoint_dir();
+        let model = Sam3ImageModel::from_upstream_pth(
+            &Config::default(),
+            checkpoint_dir.join("sam3.pt"),
+            candle::DType::F32,
+            &dev,
+        )?;
+        let reference = candle::safetensors::load(
+            vision_trunk_debug_bundle_dir(8).join("reference.safetensors"),
+            &dev,
+        )?;
+        let actual = candle::safetensors::load(
+            vision_trunk_debug_actual_dir(8).join("actual.safetensors"),
+            &dev,
+        )?;
+        let input = actual
+            .get("vision.block_debug.8.input")
+            .ok_or_else(|| {
+                candle::Error::Msg(
+                    "baseline actual report is missing vision.block_debug.8.input".to_owned(),
+                )
+            })?
+            .permute((0, 2, 3, 1))?;
+        let (_output, debug_tensors) = model
+            .vision_trunk
+            .forward_block_with_debug_from_hidden_states(&input, 8)?;
+
+        for stage_suffix in [
+            "input",
+            "norm1",
+            "attn_output",
+            "post_attn",
+            "norm2",
+            "mlp_fc1",
+            "mlp_gelu",
+            "mlp_output",
+            "output",
+        ] {
+            let stage_name = format!("vision.block_debug.8.{stage_suffix}");
+            let actual = debug_tensors
+                .get(&stage_name)
+                .ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "runtime trunk debug output is missing required tensor {stage_name}"
+                    ))
+                })?
+                .permute((0, 3, 1, 2))?;
+            let expected = reference.get(&stage_name).ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "vision trunk debug bundle is missing required tensor {stage_name}"
+                ))
+            })?;
+            let max_abs_diff = tensor_max_abs_diff(&actual, expected)?;
+            println!("{stage_name}: max_abs_diff={max_abs_diff:.9}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "manual vision trunk parity investigation"]
+    fn image_trunk_block_7_from_baseline_actual_input_prints_stage_diffs() -> Result<()> {
+        let dev = Device::Cpu;
+        let checkpoint_dir = sam3_test_checkpoint_dir();
+        let model = Sam3ImageModel::from_upstream_pth(
+            &Config::default(),
+            checkpoint_dir.join("sam3.pt"),
+            candle::DType::F32,
+            &dev,
+        )?;
+        let reference = candle::safetensors::load(
+            vision_trunk_debug_bundle_dir(7).join("reference.safetensors"),
+            &dev,
+        )?;
+        let actual = candle::safetensors::load(
+            vision_trunk_debug_actual_dir(7).join("actual.safetensors"),
+            &dev,
+        )?;
+        let input = actual
+            .get("vision.block_debug.7.input")
+            .ok_or_else(|| {
+                candle::Error::Msg(
+                    "baseline actual report is missing vision.block_debug.7.input".to_owned(),
+                )
+            })?
+            .permute((0, 2, 3, 1))?;
+        let (_output, debug_tensors) = model
+            .vision_trunk
+            .forward_block_with_debug_from_hidden_states(&input, 7)?;
+
+        for stage_suffix in [
+            "input",
+            "norm1",
+            "attn_output",
+            "post_attn",
+            "norm2",
+            "mlp_fc1",
+            "mlp_gelu",
+            "mlp_output",
+            "output",
+        ] {
+            let stage_name = format!("vision.block_debug.7.{stage_suffix}");
+            let actual = debug_tensors
+                .get(&stage_name)
+                .ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "runtime trunk debug output is missing required tensor {stage_name}"
+                    ))
+                })?
+                .permute((0, 3, 1, 2))?;
+            let expected = reference.get(&stage_name).ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "vision trunk debug bundle is missing required tensor {stage_name}"
+                ))
+            })?;
+            let max_abs_diff = tensor_max_abs_diff(&actual, expected)?;
+            println!("{stage_name}: max_abs_diff={max_abs_diff:.9}");
+        }
+        Ok(())
+    }
+
     fn assert_all_close_to_scalar(
         tensor: &Tensor,
         expected: f32,
@@ -653,9 +840,17 @@ mod tests {
         atol: f32,
         name: &str,
     ) -> Result<()> {
+        let max_abs_diff = tensor_max_abs_diff(actual, expected)?;
+        if max_abs_diff > atol {
+            candle::bail!("{name}: max_abs_diff={max_abs_diff} exceeded atol={atol}");
+        }
+        Ok(())
+    }
+
+    fn tensor_max_abs_diff(actual: &Tensor, expected: &Tensor) -> Result<f32> {
         if actual.dims() != expected.dims() {
             candle::bail!(
-                "{name}: shape mismatch actual={:?} expected={:?}",
+                "shape mismatch actual={:?} expected={:?}",
                 actual.dims(),
                 expected.dims()
             );
@@ -673,10 +868,43 @@ mod tests {
             .zip(expected.iter())
             .map(|(lhs, rhs)| (lhs - rhs).abs())
             .fold(0f32, f32::max);
-        if max_abs_diff > atol {
-            candle::bail!("{name}: max_abs_diff={max_abs_diff} exceeded atol={atol}");
-        }
-        Ok(())
+        Ok(max_abs_diff)
+    }
+
+    fn sam3_test_checkpoint_dir() -> PathBuf {
+        std::env::var("SAM3_TEST_CHECKPOINT_DIR")
+            .map(PathBuf::from)
+            .expect("SAM3_TEST_CHECKPOINT_DIR must point at a directory containing sam3.pt")
+    }
+
+    fn vision_trunk_debug_bundle_dir(block_index: usize) -> PathBuf {
+        let env_var = match block_index {
+            7 => "SAM3_VITDET_DEBUG_BLOCK7_BUNDLE_DIR",
+            8 => "SAM3_VITDET_DEBUG_BLOCK8_BUNDLE_DIR",
+            _ => panic!("unsupported vision trunk debug bundle block {block_index}"),
+        };
+        std::env::var(env_var)
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| match block_index {
+                7 => PathBuf::from("/tmp/reference_box_positive_debug_b7_current"),
+                8 => PathBuf::from("/tmp/reference_box_positive_debug_b8_b9_current"),
+                _ => unreachable!(),
+            })
+    }
+
+    fn vision_trunk_debug_actual_dir(block_index: usize) -> PathBuf {
+        let env_var = match block_index {
+            7 => "SAM3_VITDET_DEBUG_BLOCK7_ACTUAL_DIR",
+            8 => "SAM3_VITDET_DEBUG_BLOCK8_ACTUAL_DIR",
+            _ => panic!("unsupported vision trunk debug actual block {block_index}"),
+        };
+        std::env::var(env_var)
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| match block_index {
+                7 => PathBuf::from("/tmp/parity_box_positive_debug_b7_report"),
+                8 => PathBuf::from("/tmp/parity_box_positive_debug_b8_b9_report"),
+                _ => unreachable!(),
+            })
     }
 
     fn tiny_config() -> Config {

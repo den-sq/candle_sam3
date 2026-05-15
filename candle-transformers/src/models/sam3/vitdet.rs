@@ -481,6 +481,18 @@ impl Sam3ViTDetTrunk {
         Ok((output, block_outputs.unwrap_or_default(), debug_tensors))
     }
 
+    pub(crate) fn forward_block_with_debug_from_hidden_states(
+        &self,
+        hidden_states: &Tensor,
+        block_index: usize,
+    ) -> Result<(Tensor, BTreeMap<String, Tensor>)> {
+        let block = self
+            .blocks
+            .get(block_index)
+            .ok_or_else(|| candle::Error::Msg(format!("sam3 vision block {block_index} is out of range")))?;
+        block.forward_with_debug(hidden_states, block_index)
+    }
+
     fn forward_blocks_fast(&self, mut hidden_states: Tensor) -> Result<Tensor> {
         let mut block_index = 0;
         while block_index < self.blocks.len() {
@@ -581,4 +593,3 @@ impl Sam3ViTDetTrunk {
         ))
     }
 }
-
