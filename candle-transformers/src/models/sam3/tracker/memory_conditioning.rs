@@ -834,6 +834,30 @@ impl Sam3TrackerParityExt for Sam3TrackerModel {
         )
     }
 
+    fn parity_forward_sam_heads_with_multimasks(
+        &self,
+        backbone_features: &Tensor,
+        point_prompt: Option<&(Tensor, Tensor)>,
+        mask_inputs: Option<&Tensor>,
+        high_res_features: Option<&[Tensor]>,
+        multimask_output: bool,
+        is_cond_frame: bool,
+    ) -> Result<ParityForwardSamHeadsOutput> {
+        let (low_res_multimasks, high_res_multimasks, state) = self.forward_sam_heads_internal(
+            backbone_features,
+            point_prompt,
+            mask_inputs,
+            high_res_features,
+            multimask_output,
+            is_cond_frame,
+        )?;
+        Ok(ParityForwardSamHeadsOutput {
+            low_res_multimasks,
+            high_res_multimasks,
+            state,
+        })
+    }
+
     fn parity_use_mask_as_output(
         &self,
         backbone_features: &Tensor,
@@ -847,6 +871,35 @@ impl Sam3TrackerParityExt for Sam3TrackerModel {
             mask_inputs,
             is_cond_frame,
         )
+    }
+
+    fn parity_mask_decoder_forward(
+        &self,
+        image_embeddings: &Tensor,
+        image_pe: &Tensor,
+        sparse_prompt_embeddings: &Tensor,
+        dense_prompt_embeddings: &Tensor,
+        multimask_output: bool,
+        repeat_image: bool,
+        high_res_features: Option<&[Tensor]>,
+    ) -> Result<ParityMaskDecoderOutput> {
+        let (low_res_multimasks, iou_scores, sam_output_tokens, object_score_logits) = self
+            .sam_mask_decoder
+            .forward(
+                image_embeddings,
+                image_pe,
+                sparse_prompt_embeddings,
+                dense_prompt_embeddings,
+                multimask_output,
+                repeat_image,
+                high_res_features,
+            )?;
+        Ok(ParityMaskDecoderOutput {
+            low_res_multimasks,
+            iou_scores,
+            sam_output_tokens,
+            object_score_logits,
+        })
     }
 
     fn parity_prepare_memory_conditioned_features(

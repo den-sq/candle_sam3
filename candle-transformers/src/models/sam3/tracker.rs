@@ -423,6 +423,23 @@ pub struct ParityPreparedMemoryPrompt {
 }
 
 #[cfg(feature = "sam3-parity-support")]
+#[derive(Debug, Clone)]
+pub struct ParityForwardSamHeadsOutput {
+    pub low_res_multimasks: Tensor,
+    pub high_res_multimasks: Tensor,
+    pub state: TrackerFrameState,
+}
+
+#[cfg(feature = "sam3-parity-support")]
+#[derive(Debug, Clone)]
+pub struct ParityMaskDecoderOutput {
+    pub low_res_multimasks: Tensor,
+    pub iou_scores: Tensor,
+    pub sam_output_tokens: Tensor,
+    pub object_score_logits: Tensor,
+}
+
+#[cfg(feature = "sam3-parity-support")]
 pub trait Sam3TrackerParityExt {
     fn parity_compute_dtype(&self) -> DType;
 
@@ -449,6 +466,16 @@ pub trait Sam3TrackerParityExt {
         is_cond_frame: bool,
     ) -> Result<TrackerFrameState>;
 
+    fn parity_forward_sam_heads_with_multimasks(
+        &self,
+        backbone_features: &Tensor,
+        point_prompt: Option<&(Tensor, Tensor)>,
+        mask_inputs: Option<&Tensor>,
+        high_res_features: Option<&[Tensor]>,
+        multimask_output: bool,
+        is_cond_frame: bool,
+    ) -> Result<ParityForwardSamHeadsOutput>;
+
     fn parity_use_mask_as_output(
         &self,
         backbone_features: &Tensor,
@@ -456,6 +483,17 @@ pub trait Sam3TrackerParityExt {
         mask_inputs: &Tensor,
         is_cond_frame: bool,
     ) -> Result<TrackerFrameState>;
+
+    fn parity_mask_decoder_forward(
+        &self,
+        image_embeddings: &Tensor,
+        image_pe: &Tensor,
+        sparse_prompt_embeddings: &Tensor,
+        dense_prompt_embeddings: &Tensor,
+        multimask_output: bool,
+        repeat_image: bool,
+        high_res_features: Option<&[Tensor]>,
+    ) -> Result<ParityMaskDecoderOutput>;
 
     fn parity_prepare_memory_conditioned_features(
         &self,

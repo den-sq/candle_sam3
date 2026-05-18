@@ -200,14 +200,20 @@ impl Sam3TrackerMaskDecoder {
             None
         };
         let output_tokens = {
-            let mut tokens = vec![iou_token.embeddings().i(0)?];
             if let Some(obj_score_token) = &obj_score_token {
-                tokens.push(obj_score_token.embeddings().i(0)?);
+                let mut tokens = vec![obj_score_token.embeddings().i(0)?];
+                tokens.push(iou_token.embeddings().i(0)?);
+                for index in 0..num_mask_tokens {
+                    tokens.push(mask_tokens.embeddings().i(index)?);
+                }
+                Tensor::stack(tokens.as_slice(), 0)?
+            } else {
+                let mut tokens = vec![iou_token.embeddings().i(0)?];
+                for index in 0..num_mask_tokens {
+                    tokens.push(mask_tokens.embeddings().i(index)?);
+                }
+                Tensor::stack(tokens.as_slice(), 0)?
             }
-            for index in 0..num_mask_tokens {
-                tokens.push(mask_tokens.embeddings().i(index)?);
-            }
-            Tensor::stack(tokens.as_slice(), 0)?
         };
         let output_token_count = output_tokens.dim(0)?;
         let deconv_cfg = ConvTranspose2dConfig {
@@ -320,7 +326,7 @@ impl Sam3TrackerMaskDecoder {
         })
     }
 
-    fn forward(
+    pub(super) fn forward(
         &self,
         image_embeddings: &Tensor,
         image_pe: &Tensor,
@@ -398,13 +404,19 @@ impl Sam3TrackerMaskDecoder {
         };
 
         let (hs, src) = self.transformer.forward(&src, &pos_src, &tokens)?;
-        let iou_token_out = hs.i((.., 0, ..))?;
+        let token_offset = if self.pred_obj_score_head.is_some() {
+            1
+        } else {
+            0
+        };
+        let iou_token_out = hs.i((.., token_offset, ..))?;
         let obj_score_token_out = if self.pred_obj_score_head.is_some() {
-            Some(hs.i((.., 1, ..))?)
+            Some(hs.i((.., 0, ..))?)
         } else {
             None
         };
-        let mask_tokens_out = hs.i((.., hs.dim(1)? - self.num_mask_tokens.., ..))?;
+        let mask_tokens_out =
+            hs.i((.., token_offset + 1..token_offset + 1 + self.num_mask_tokens, ..))?;
         let (_, channels, height, width) = image_embeddings.dims4()?;
         let src = src
             .transpose(1, 2)?
@@ -455,7 +467,7 @@ impl Sam3TrackerMaskDecoder {
 }
 
 impl Sam3TrackerModel {
-    pub(super) fn forward_sam_heads(
+    pub(super) fn forward_sam_heads_internal(
         &self,
         backbone_features: &Tensor,
         point_prompt: Option<&(Tensor, Tensor)>,
@@ -463,7 +475,7 @@ impl Sam3TrackerModel {
         high_res_features: Option<&[Tensor]>,
         multimask_output: bool,
         is_cond_frame: bool,
-    ) -> Result<TrackerFrameState> {
+    ) -> Result<(Tensor, Tensor, TrackerFrameState)> {
         let batch_size = backbone_features.dim(0)?;
         let device = backbone_features.device();
         let (sam_point_coords, sam_point_labels) = match point_prompt {
@@ -515,6 +527,11 @@ impl Sam3TrackerModel {
                 false,
                 high_res_features,
             )?;
+        let high_res_multimasks = low_res_multimasks.upsample_bilinear2d(
+            self.config.image_size,
+            self.config.image_size,
+            false,
+        )?;
         let object_present = object_score_logits.gt(0f64)?;
         let (low_res_masks, high_res_masks, sam_output_token) = if multimask_output {
             let best_iou_indices = ious.argmax(1)?.contiguous()?;
@@ -558,19 +575,43 @@ impl Sam3TrackerModel {
         };
         let obj_ptr = self.obj_ptr_proj.forward(&sam_output_token)?;
         let object_present_for_ptr = gate_object_ptr(&obj_ptr, &object_present, &self.no_obj_ptr)?;
-        Ok(TrackerFrameState {
-            low_res_masks,
-            high_res_masks,
-            iou_scores: ious,
-            memory_selection_score: None,
-            obj_ptr: object_present_for_ptr,
-            object_score_logits,
-            maskmem_features: None,
-            maskmem_pos_enc: None,
-            maskmem_prompt_features: None,
-            maskmem_prompt_pos_enc: None,
+        Ok((
+            low_res_multimasks,
+            high_res_multimasks,
+            TrackerFrameState {
+                low_res_masks,
+                high_res_masks,
+                iou_scores: ious,
+                memory_selection_score: None,
+                obj_ptr: object_present_for_ptr,
+                object_score_logits,
+                maskmem_features: None,
+                maskmem_pos_enc: None,
+                maskmem_prompt_features: None,
+                maskmem_prompt_pos_enc: None,
+                is_cond_frame,
+            },
+        ))
+    }
+
+    pub(super) fn forward_sam_heads(
+        &self,
+        backbone_features: &Tensor,
+        point_prompt: Option<&(Tensor, Tensor)>,
+        mask_inputs: Option<&Tensor>,
+        high_res_features: Option<&[Tensor]>,
+        multimask_output: bool,
+        is_cond_frame: bool,
+    ) -> Result<TrackerFrameState> {
+        let (_, _, state) = self.forward_sam_heads_internal(
+            backbone_features,
+            point_prompt,
+            mask_inputs,
+            high_res_features,
+            multimask_output,
             is_cond_frame,
-        })
+        )?;
+        Ok(state)
     }
 
     pub(super) fn use_mask_as_output(
