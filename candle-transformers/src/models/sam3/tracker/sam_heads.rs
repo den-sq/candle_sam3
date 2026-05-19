@@ -349,8 +349,19 @@ impl Sam3TrackerMaskDecoder {
         } else {
             (0..1, 0..1)
         };
-        let masks = all_masks.i((.., mask_slice, .., ..))?;
-        let iou_pred = all_iou_pred.i((.., iou_slice))?;
+        let (masks, iou_pred) = if multimask_output {
+            (
+                all_masks.i((.., mask_slice, .., ..))?,
+                all_iou_pred.i((.., iou_slice))?,
+            )
+        } else if self.dynamic_multimask_via_stability {
+            self.select_masks_via_stability(&all_masks, &all_iou_pred)?
+        } else {
+            (
+                all_masks.i((.., mask_slice, .., ..))?,
+                all_iou_pred.i((.., iou_slice))?,
+            )
+        };
         let sam_tokens = if multimask_output {
             if self.use_multimask_token_for_obj_ptr {
                 mask_tokens_out.i((.., 1..self.num_mask_tokens, ..))?
@@ -367,6 +378,207 @@ impl Sam3TrackerMaskDecoder {
         };
         let object_score_logits = object_score_logits.i((.., 0..1))?;
         Ok((masks, iou_pred, sam_tokens, object_score_logits))
+    }
+
+    #[cfg(feature = "sam3-parity-support")]
+    pub(super) fn forward_debug(
+        &self,
+        image_embeddings: &Tensor,
+        image_pe: &Tensor,
+        sparse_prompt_embeddings: &Tensor,
+        dense_prompt_embeddings: &Tensor,
+        multimask_output: bool,
+        repeat_image: bool,
+        high_res_features: Option<&[Tensor]>,
+    ) -> Result<super::ParityMaskDecoderDebugOutput> {
+        let batch_size = sparse_prompt_embeddings.dim(0)?;
+        let output_tokens = self.output_tokens.unsqueeze(0)?.expand((
+            batch_size,
+            self.output_token_count,
+            self.transformer_dim,
+        ))?;
+        let tokens = Tensor::cat(&[&output_tokens, sparse_prompt_embeddings], 1)?;
+
+        let src = if repeat_image {
+            repeat_interleave(image_embeddings, batch_size, 0)?
+        } else if image_embeddings.dim(0)? == batch_size {
+            image_embeddings.clone()
+        } else {
+            candle::bail!(
+                "tracker mask decoder expected image embeddings batch {} to match prompt batch {batch_size}",
+                image_embeddings.dim(0)?
+            );
+        };
+        let src = src.broadcast_add(dense_prompt_embeddings)?;
+        let pos_src = if repeat_image {
+            repeat_interleave(image_pe, batch_size, 0)?
+        } else {
+            image_pe.broadcast_as(src.shape())?
+        };
+
+        let (transformer_hs, transformer_src) = self.transformer.forward(&src, &pos_src, &tokens)?;
+        let token_offset = if self.pred_obj_score_head.is_some() {
+            1
+        } else {
+            0
+        };
+        let iou_token_out = transformer_hs.i((.., token_offset, ..))?;
+        let obj_score_token_out = if self.pred_obj_score_head.is_some() {
+            Some(transformer_hs.i((.., 0, ..))?)
+        } else {
+            None
+        };
+        let mask_tokens_out = transformer_hs
+            .i((.., token_offset + 1..token_offset + 1 + self.num_mask_tokens, ..))?;
+        let (_, channels, height, width) = image_embeddings.dims4()?;
+        let src_4d = transformer_src
+            .transpose(1, 2)?
+            .reshape((batch_size, channels, height, width))?;
+        let upscaled_embedding = match (self.use_high_res_features, high_res_features) {
+            (true, Some(high_res_features)) => {
+                if high_res_features.len() < 2 {
+                    candle::bail!(
+                        "tracker mask decoder expected two high-resolution feature levels, got {}",
+                        high_res_features.len()
+                    );
+                }
+                let feat_s0 = &high_res_features[0];
+                let feat_s1 = &high_res_features[1];
+                let x = src_4d.apply(&self.output_upscaling_conv1)?;
+                let x = x.broadcast_add(feat_s1)?;
+                let x = self.output_upscaling_ln.forward(&x)?.gelu_erf()?;
+                let x = x.apply(&self.output_upscaling_conv2)?;
+                x.broadcast_add(feat_s0)?.gelu_erf()?
+            }
+            _ => {
+                let x = src_4d.apply(&self.output_upscaling_conv1)?;
+                let x = self.output_upscaling_ln.forward(&x)?.gelu_erf()?;
+                x.apply(&self.output_upscaling_conv2)?.gelu_erf()?
+            }
+        };
+        let (_, upscaled_dim, upscaled_height, upscaled_width) = upscaled_embedding.dims4()?;
+        let hyper_in = self.output_hypernetworks_mlps.forward(&mask_tokens_out)?;
+        let all_low_res_masks = hyper_in
+            .matmul(&upscaled_embedding.reshape((
+                batch_size,
+                upscaled_dim,
+                upscaled_height * upscaled_width,
+            ))?)?
+            .reshape((
+                batch_size,
+                self.num_mask_tokens,
+                upscaled_height,
+                upscaled_width,
+            ))?;
+        let all_iou_scores = self.iou_prediction_head.forward(&iou_token_out)?;
+        let object_score_logits = match (&self.pred_obj_score_head, obj_score_token_out.as_ref()) {
+            (Some(head), Some(token)) => head.forward(token)?,
+            _ => Tensor::ones((batch_size, 1), DType::F32, image_embeddings.device())?,
+        };
+        let (mask_slice, iou_slice) = if multimask_output {
+            (1..self.num_mask_tokens, 1..self.num_mask_tokens)
+        } else {
+            (0..1, 0..1)
+        };
+        let (low_res_multimasks, iou_scores) = if multimask_output {
+            (
+                all_low_res_masks.i((.., mask_slice, .., ..))?,
+                all_iou_scores.i((.., iou_slice))?,
+            )
+        } else if self.dynamic_multimask_via_stability {
+            self.select_masks_via_stability(&all_low_res_masks, &all_iou_scores)?
+        } else {
+            (
+                all_low_res_masks.i((.., mask_slice, .., ..))?,
+                all_iou_scores.i((.., iou_slice))?,
+            )
+        };
+        let sam_output_tokens = if multimask_output {
+            if self.use_multimask_token_for_obj_ptr {
+                mask_tokens_out.i((.., 1..self.num_mask_tokens, ..))?
+            } else {
+                mask_tokens_out.i((.., 0..1, ..))?
+            }
+        } else {
+            mask_tokens_out.i((.., 0..1, ..))?
+        };
+        let sam_output_tokens = if sam_output_tokens.rank() == 2 {
+            sam_output_tokens.unsqueeze(1)?
+        } else {
+            sam_output_tokens
+        };
+        let object_score_logits = object_score_logits.i((.., 0..1))?;
+        Ok(super::ParityMaskDecoderDebugOutput {
+            tokens,
+            transformer_hs,
+            transformer_src,
+            iou_token_out,
+            mask_tokens_out,
+            src_4d,
+            upscaled_embedding,
+            hyper_in,
+            all_low_res_masks,
+            all_iou_scores,
+            low_res_multimasks,
+            iou_scores,
+            sam_output_tokens,
+            object_score_logits,
+        })
+    }
+
+    fn get_stability_scores(&self, mask_logits: &Tensor) -> Result<Tensor> {
+        let mask_logits = mask_logits.flatten(2, 3)?;
+        let stability_delta = self.dynamic_multimask_stability_delta as f64;
+        let area_i = mask_logits
+            .gt(stability_delta)?
+            .to_dtype(DType::F32)?
+            .sum(D::Minus1)?;
+        let area_u = mask_logits
+            .gt(-stability_delta)?
+            .to_dtype(DType::F32)?
+            .sum(D::Minus1)?;
+        let ones = Tensor::ones(area_u.shape(), DType::F32, area_u.device())?;
+        let stability_scores = area_i.broadcast_div(&area_u.maximum(&ones)?)?;
+        area_u.gt(0f64)?.where_cond(&stability_scores, &ones)
+    }
+
+    fn select_masks_via_stability(
+        &self,
+        all_mask_logits: &Tensor,
+        all_iou_scores: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let multimask_logits = all_mask_logits.i((.., 1..self.num_mask_tokens, .., ..))?;
+        let multimask_iou_scores = all_iou_scores.i((.., 1..self.num_mask_tokens))?;
+        let best_scores_inds = multimask_iou_scores.argmax(1)?.contiguous()?;
+        let batch_size = multimask_iou_scores.dim(0)?;
+        let (_, _, height, width) = multimask_logits.dims4()?;
+        let best_mask_index = best_scores_inds
+            .unsqueeze(1)?
+            .unsqueeze(2)?
+            .unsqueeze(3)?
+            .broadcast_as((batch_size, 1, height, width))?
+            .contiguous()?;
+        let best_multimask_logits = multimask_logits
+            .contiguous()?
+            .gather(&best_mask_index, 1)?;
+        let best_iou_index = best_scores_inds.unsqueeze(1)?.contiguous()?;
+        let best_multimask_iou_scores = multimask_iou_scores
+            .contiguous()?
+            .gather(&best_iou_index, 1)?;
+
+        let singlemask_logits = all_mask_logits.i((.., 0..1, .., ..))?;
+        let singlemask_iou_scores = all_iou_scores.i((.., 0..1))?;
+        let stability_scores = self.get_stability_scores(&singlemask_logits)?;
+        let is_stable = stability_scores.ge(self.dynamic_multimask_stability_thresh as f64)?;
+        let stable_mask = is_stable
+            .unsqueeze(2)?
+            .unsqueeze(3)?
+            .broadcast_as(singlemask_logits.shape())?;
+        let stable_iou = is_stable.broadcast_as(singlemask_iou_scores.shape())?;
+        Ok((
+            stable_mask.where_cond(&singlemask_logits, &best_multimask_logits)?,
+            stable_iou.where_cond(&singlemask_iou_scores, &best_multimask_iou_scores)?,
+        ))
     }
 
     fn predict_masks(

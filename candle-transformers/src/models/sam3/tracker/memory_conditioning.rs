@@ -902,6 +902,41 @@ impl Sam3TrackerParityExt for Sam3TrackerModel {
         })
     }
 
+    fn parity_mask_decoder_forward_debug(
+        &self,
+        image_embeddings: &Tensor,
+        image_pe: &Tensor,
+        sparse_prompt_embeddings: &Tensor,
+        dense_prompt_embeddings: &Tensor,
+        multimask_output: bool,
+        repeat_image: bool,
+        high_res_features: Option<&[Tensor]>,
+    ) -> Result<ParityMaskDecoderDebugOutput> {
+        self.sam_mask_decoder.forward_debug(
+            image_embeddings,
+            image_pe,
+            sparse_prompt_embeddings,
+            dense_prompt_embeddings,
+            multimask_output,
+            repeat_image,
+            high_res_features,
+        )
+    }
+
+    fn parity_prompt_encoder_forward(
+        &self,
+        points: Option<(&Tensor, &Tensor)>,
+        boxes: Option<&Tensor>,
+        masks: Option<&Tensor>,
+    ) -> Result<ParityPromptEncoderOutput> {
+        let (sparse_embeddings, dense_embeddings) =
+            self.sam_prompt_encoder.forward(points, boxes, masks)?;
+        Ok(ParityPromptEncoderOutput {
+            sparse_embeddings,
+            dense_embeddings,
+        })
+    }
+
     fn parity_prepare_memory_conditioned_features(
         &self,
         frame_idx: usize,
