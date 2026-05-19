@@ -102,8 +102,9 @@ impl<'a> Sam3VideoTrackerCore<'a> {
         };
 
         let mut final_outputs = Vec::new();
-        for output in visible_outputs {
+        for mut output in visible_outputs {
             if mask_has_foreground(&output.masks, output_threshold)? {
+                output.boxes_xyxy = mask_to_normalized_xyxy(&output.masks)?;
                 final_outputs.push(output);
             } else {
                 hidden_obj_ids.insert(output.obj_id);
@@ -145,19 +146,18 @@ pub(super) fn apply_prompt_frame_output_postprocess(
     config: &VideoConfig,
     postprocess_device: Option<&Device>,
 ) -> Result<()> {
-    if config.fill_hole_area == 0 {
-        return Ok(());
-    }
-    if let Some(postprocess_device) = postprocess_device {
-        if matches!(postprocess_device, Device::Cpu)
-            && !output.mask_logits.device().same_device(postprocess_device)
-        {
-            *output = output.to_storage_device(postprocess_device)?;
+    if config.fill_hole_area > 0 {
+        if let Some(postprocess_device) = postprocess_device {
+            if matches!(postprocess_device, Device::Cpu)
+                && !output.mask_logits.device().same_device(postprocess_device)
+            {
+                *output = output.to_storage_device(postprocess_device)?;
+            }
         }
+        output.mask_logits =
+            postprocess_low_res_mask_logits_for_video(&output.mask_logits, config.fill_hole_area)?;
+        output.masks = candle_nn::ops::sigmoid(&output.mask_logits)?;
     }
-    output.mask_logits =
-        postprocess_low_res_mask_logits_for_video(&output.mask_logits, config.fill_hole_area)?;
-    output.masks = candle_nn::ops::sigmoid(&output.mask_logits)?;
     output.boxes_xyxy = mask_to_normalized_xyxy(&output.masks)?;
     Ok(())
 }
@@ -174,7 +174,10 @@ pub(super) fn tracker_state_presence_score(state: &TrackerFrameState) -> Result<
     first_scalar_f32(&candle_nn::ops::sigmoid(&state.object_score_logits)?)
 }
 
-fn tracker_state_presence_score_on_device(state: &TrackerFrameState, device: &Device) -> Result<f32> {
+fn tracker_state_presence_score_on_device(
+    state: &TrackerFrameState,
+    device: &Device,
+) -> Result<f32> {
     let logits = if state.object_score_logits.device().same_device(device) {
         state.object_score_logits.clone()
     } else {
@@ -275,6 +278,7 @@ fn apply_object_wise_non_overlapping_constraints(
 }
 
 pub(super) fn mask_to_normalized_xyxy(mask: &Tensor) -> Result<Tensor> {
+    let original_device = mask.device().clone();
     let mask = match mask.rank() {
         4 => mask.i((0, 0))?,
         3 => mask.i(0)?,
@@ -283,41 +287,52 @@ pub(super) fn mask_to_normalized_xyxy(mask: &Tensor) -> Result<Tensor> {
     };
     let (height, width) = mask.dims2()?;
     if height == 0 || width == 0 {
-        return Tensor::zeros((1, 4), DType::F32, mask.device());
+        return Tensor::zeros((1, 4), DType::F32, &original_device);
     }
-    let binary = mask.ge(0.5f32)?.to_dtype(DType::F32)?;
-    let row_any = binary.max(candle::D::Minus1)?;
-    let col_any = binary.max(candle::D::Minus2)?;
-    if row_any.max_all()?.to_scalar::<f32>()? <= 0.0 {
-        return Tensor::zeros((1, 4), DType::F32, mask.device());
+    // Keep box extraction deterministic across backends; CUDA argmax/flip based
+    // reductions produced stale-looking boxes for valid video masks.
+    let mask = if mask.device().same_device(&Device::Cpu) {
+        mask
+    } else {
+        mask.to_device(&Device::Cpu)?
+    };
+    let mask_values = mask.to_vec2::<f32>()?;
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    let mut found = false;
+    for (y, row) in mask_values.iter().enumerate() {
+        for (x, value) in row.iter().enumerate() {
+            if *value >= 0.5 {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+                found = true;
+            }
+        }
     }
-    let width_scale = width.max(1) as f64;
-    let height_scale = height.max(1) as f64;
-    let min_x = col_any
-        .argmax(0)?
-        .to_dtype(DType::F32)?
-        .reshape((1,))?
-        .affine(1.0 / width_scale, 0.0)?;
-    let min_y = row_any
-        .argmax(0)?
-        .to_dtype(DType::F32)?
-        .reshape((1,))?
-        .affine(1.0 / height_scale, 0.0)?;
-    let max_x_offset = width.saturating_sub(1) as f64 / width_scale;
-    let max_x = col_any
-        .flip(&[0])?
-        .argmax(0)?
-        .to_dtype(DType::F32)?
-        .reshape((1,))?
-        .affine(-1.0 / width_scale, max_x_offset)?;
-    let max_y_offset = height.saturating_sub(1) as f64 / height_scale;
-    let max_y = row_any
-        .flip(&[0])?
-        .argmax(0)?
-        .to_dtype(DType::F32)?
-        .reshape((1,))?
-        .affine(-1.0 / height_scale, max_y_offset)?;
-    Tensor::stack(&[&min_x, &min_y, &max_x, &max_y], 0)?.reshape((1, 4))
+    if !found {
+        return Tensor::zeros((1, 4), DType::F32, &original_device);
+    }
+    let width_scale = width.max(1) as f32;
+    let height_scale = height.max(1) as f32;
+    let boxes = Tensor::from_vec(
+        vec![
+            min_x as f32 / width_scale,
+            min_y as f32 / height_scale,
+            max_x as f32 / width_scale,
+            max_y as f32 / height_scale,
+        ],
+        (1, 4),
+        &Device::Cpu,
+    )?;
+    if original_device.same_device(&Device::Cpu) {
+        Ok(boxes)
+    } else {
+        boxes.to_device(&original_device)
+    }
 }
 
 pub(super) fn resize_mask_logits_to_video(
@@ -592,10 +607,7 @@ pub(super) fn persist_visible_frame_output(
         } else {
             output.to_storage_device(session.storage_device())?
         };
-        stored_outputs.insert(
-            output.obj_id,
-            stored_output,
-        );
+        stored_outputs.insert(output.obj_id, stored_output);
     }
     if stored_outputs.is_empty() {
         session.frame_outputs.remove(&frame_output.frame_idx);
@@ -635,7 +647,9 @@ mod tests {
             &device,
         )?;
 
-        let actual = mask_to_normalized_xyxy(&mask)?.flatten_all()?.to_vec1::<f32>()?;
+        let actual = mask_to_normalized_xyxy(&mask)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
 
         let expected = [2.0f32 / 6.0, 1.0 / 5.0, 4.0 / 6.0, 3.0 / 5.0];
         assert!(actual
@@ -658,9 +672,51 @@ mod tests {
             &device,
         )?;
 
-        let actual = mask_to_normalized_xyxy(&mask)?.flatten_all()?.to_vec1::<f32>()?;
+        let actual = mask_to_normalized_xyxy(&mask)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
 
         let expected = [2.0f32 / 4.0, 1.0 / 3.0, 2.0 / 4.0, 1.0 / 3.0];
+        assert!(actual
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| (actual - expected).abs() <= 1e-6));
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_frame_postprocess_recomputes_boxes_without_hole_filling() -> Result<()> {
+        let device = Device::Cpu;
+        let masks = Tensor::from_vec(
+            vec![
+                0.0f32, 0.0, 0.0, 0.0, 0.0, //
+                0.0, 1.0, 1.0, 1.0, 0.0, //
+                0.0, 1.0, 1.0, 1.0, 0.0, //
+                0.0, 0.0, 0.0, 0.0, 0.0, //
+            ],
+            (1, 1, 4, 5),
+            &device,
+        )?;
+        let mut output = ObjectFrameOutput {
+            obj_id: 7,
+            mask_logits: masks.clone(),
+            masks,
+            boxes_xyxy: Tensor::zeros((1, 4), DType::F32, &device)?,
+            scores: Tensor::ones((1,), DType::F32, &device)?,
+            presence_scores: None,
+            prompt_frame_idx: Some(0),
+            memory_frame_indices: Vec::new(),
+            text_prompt: Some("person".to_owned()),
+            used_explicit_geometry: false,
+            reused_previous_output: false,
+        };
+        let mut config = VideoConfig::default();
+        config.fill_hole_area = 0;
+
+        apply_prompt_frame_output_postprocess(&mut output, &config, Some(&device))?;
+
+        let actual = output.boxes_xyxy.flatten_all()?.to_vec1::<f32>()?;
+        let expected = [1.0f32 / 5.0, 1.0 / 4.0, 3.0 / 5.0, 2.0 / 4.0];
         assert!(actual
             .iter()
             .zip(expected)
@@ -692,8 +748,7 @@ mod tests {
             frame_idx: 7,
             objects: vec![make_output(1)?, make_output(2)?, make_output(3)?],
         };
-        let filtered =
-            filter_video_frame_output(&frame_output, &BTreeSet::from([1u32, 3u32]));
+        let filtered = filter_video_frame_output(&frame_output, &BTreeSet::from([1u32, 3u32]));
 
         assert_eq!(filtered.frame_idx, 7);
         assert_eq!(filtered.objects.len(), 1);

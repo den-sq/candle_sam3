@@ -1509,6 +1509,146 @@ impl Sam3VideoTrackerCore<'_> {
         Ok((visual_prompt, true))
     }
 
+    fn run_text_prompt_seed_frame(
+        &self,
+        config: &VideoConfig,
+        model: &Sam3ImageModel,
+        compute_device: &Device,
+        session: &mut Sam3VideoSession,
+        frame_idx: usize,
+        object: &TrackedObject,
+        prompt: &SessionPrompt,
+        direction: PropagationDirection,
+    ) -> Result<Vec<(u32, ObjectFrameOutput, TrackerFrameState, Option<f32>)>> {
+        let text = prompt.text.as_ref().ok_or_else(|| {
+            candle::Error::Msg("text prompt seed path requires a text prompt".to_owned())
+        })?;
+        let visual_features = session.get_visual_features(model, compute_device, frame_idx)?;
+        let tracker_visual_features = tracker_visual_output(&visual_features);
+        let text_encoding = session.cached_text_encoding(model, text, compute_device)?;
+        let encoded_prompt = combine_encoded_prompts(Some(&text_encoding), None)?.ok_or_else(|| {
+            candle::Error::Msg("text prompt seed path produced no encoded prompt".to_owned())
+        })?;
+        let grounding = ground_all_from_encoded_prompt(model, &visual_features, &encoded_prompt)?;
+        let query_count = grounding_query_count(&grounding.scores)?;
+        let mut results = Vec::new();
+
+        for query_idx in 0..query_count {
+            let detector_score = grounding_query_score(&grounding.scores, query_idx)?;
+            if detector_score <= config.score_threshold_detection {
+                continue;
+            }
+
+            let obj_id = if results.is_empty() {
+                object.obj_id
+            } else {
+                session.add_prompt(
+                    frame_idx,
+                    prompt.clone(),
+                    None,
+                    true,
+                    true,
+                    config.max_objects,
+                )?
+            };
+
+            let query_grounding =
+                grounding_query_output(&grounding, query_idx, detector_score)?;
+            let mut detector_output = grounding_to_object_output(
+                obj_id,
+                &query_grounding,
+                Some(frame_idx),
+                Vec::new(),
+                Some(text.clone()),
+                false,
+                false,
+                session.video_size(),
+            )?;
+            detector_output.presence_scores = None;
+            apply_prompt_frame_output_postprocess(
+                &mut detector_output,
+                config,
+                Some(session.storage_device()),
+            )?;
+            if let Some(debug_object) = session.tracked_objects.get(&obj_id).cloned() {
+                if let Some(recorder) = session.debug_recorder_mut() {
+                    recorder.record_detector_grounding(
+                        &debug_object,
+                        frame_idx,
+                        direction,
+                        debug_prompt_metadata(prompt, false)?,
+                        &detector_output,
+                    )?;
+                }
+            }
+
+            let mut tracker_mask_input =
+                normalize_video_mask_prompt(&query_grounding.mask_logits, compute_device)?;
+            let (_, _, height, width) = tracker_mask_input.dims4()?;
+            let tracker_input_size = self.tracker.input_mask_size();
+            if height != tracker_input_size || width != tracker_input_size {
+                tracker_mask_input = tracker_mask_input.upsample_bilinear2d(
+                    tracker_input_size,
+                    tracker_input_size,
+                    false,
+                )?;
+            }
+            let tracker_mask_input = tracker_mask_input.gt(0f64)?.to_dtype(DType::F32)?;
+            let tracker_state = self
+                .tracker
+                .track_frame_with_storage_device(
+                    &tracker_visual_features,
+                    frame_idx,
+                    session.num_frames(),
+                    None,
+                    None,
+                    None,
+                    Some(&tracker_mask_input),
+                    &BTreeMap::new(),
+                    true,
+                    false,
+                    true,
+                    false,
+                    Some(session.storage_device()),
+                    None,
+                )?
+                .state;
+            if let Some(debug_object) = session.tracked_objects.get(&obj_id).cloned() {
+                let mut tracker_seed_output = tracker_state_to_object_output(
+                    obj_id,
+                    &tracker_state,
+                    Some(detector_score),
+                    Some(frame_idx),
+                    Vec::new(),
+                    Some(text.clone()),
+                    false,
+                    false,
+                    session.video_size(),
+                )?;
+                tracker_seed_output.presence_scores = None;
+                apply_prompt_frame_output_postprocess(
+                    &mut tracker_seed_output,
+                    config,
+                    Some(session.storage_device()),
+                )?;
+                if let Some(recorder) = session.debug_recorder_mut() {
+                    recorder.record_tracker_seed(
+                        &debug_object,
+                        frame_idx,
+                        direction,
+                        debug_prompt_metadata(prompt, false)?,
+                        &tracker_seed_output,
+                        &tracker_state,
+                    )?;
+                }
+            }
+
+            results.push((obj_id, detector_output, tracker_state, Some(detector_score)));
+        }
+
+        Ok(results)
+    }
+
     fn run_visual_prompt_seed_frame(
         &self,
         config: &VideoConfig,
@@ -1962,9 +2102,9 @@ impl Sam3VideoTrackerCore<'_> {
             let Some(object_snapshot) = session.tracked_objects.get(&obj_id).cloned() else {
                 continue;
             };
-            let seed_result = if let Some(mask_prompt) = mask_prompt {
-                if has_history {
-                    Some(self.run_refined_mask_prompt_frame(
+            if let Some(mask_prompt) = mask_prompt {
+                let seed_result = if has_history {
+                    self.run_refined_mask_prompt_frame(
                         config,
                         model,
                         compute_device,
@@ -1973,9 +2113,9 @@ impl Sam3VideoTrackerCore<'_> {
                         &object_snapshot,
                         &mask_prompt,
                         direction,
-                    )?)
+                    )?
                 } else {
-                    Some(self.run_mask_prompt_seed_frame(
+                    self.run_mask_prompt_seed_frame(
                         config,
                         model,
                         compute_device,
@@ -1984,11 +2124,12 @@ impl Sam3VideoTrackerCore<'_> {
                         &object_snapshot,
                         &mask_prompt,
                         direction,
-                    )?)
-                }
+                    )?
+                };
+                pending_results.push((obj_id, seed_result.0, seed_result.1, seed_result.2));
             } else if let Some(prompt) = prompt {
                 if has_history {
-                    Some(self.run_refined_tracker_prompt_frame(
+                    let seed_result = self.run_refined_tracker_prompt_frame(
                         config,
                         model,
                         compute_device,
@@ -1997,7 +2138,19 @@ impl Sam3VideoTrackerCore<'_> {
                         &object_snapshot,
                         &prompt,
                         direction,
-                    )?)
+                    )?;
+                    pending_results.push((obj_id, seed_result.0, seed_result.1, seed_result.2));
+                } else if prompt.text.is_some() && !prompt.has_geometry() {
+                    pending_results.extend(self.run_text_prompt_seed_frame(
+                        config,
+                        model,
+                        compute_device,
+                        session,
+                        frame_idx,
+                        &object_snapshot,
+                        &prompt,
+                        direction,
+                    )?);
                 } else if prompt.text.is_some()
                     || prompt
                         .boxes
@@ -2005,7 +2158,7 @@ impl Sam3VideoTrackerCore<'_> {
                         .map(|boxes| !boxes.is_empty())
                         .unwrap_or(false)
                 {
-                    Some(self.run_visual_prompt_seed_frame(
+                    let seed_result = self.run_visual_prompt_seed_frame(
                         config,
                         model,
                         compute_device,
@@ -2014,9 +2167,10 @@ impl Sam3VideoTrackerCore<'_> {
                         &object_snapshot,
                         &prompt,
                         direction,
-                    )?)
+                    )?;
+                    pending_results.push((obj_id, seed_result.0, seed_result.1, seed_result.2));
                 } else {
-                    Some(self.run_direct_tracker_prompt_seed_frame(
+                    let seed_result = self.run_direct_tracker_prompt_seed_frame(
                         config,
                         model,
                         compute_device,
@@ -2025,7 +2179,8 @@ impl Sam3VideoTrackerCore<'_> {
                         &object_snapshot,
                         &prompt,
                         direction,
-                    )?)
+                    )?;
+                    pending_results.push((obj_id, seed_result.0, seed_result.1, seed_result.2));
                 }
             } else {
                 let own_latest_input_frame =
@@ -2046,28 +2201,19 @@ impl Sam3VideoTrackerCore<'_> {
                             frame_idx < object_snapshot.last_updated_frame
                         }
                     };
-                if is_active {
-                    if can_extend_uninteracted_multi_object {
-                        None
-                    } else {
-                        Some(self.run_propagated_frame(
-                            config,
-                            model,
-                            compute_device,
-                            session,
-                            frame_idx,
-                            &object_snapshot,
-                            direction,
-                        )?)
-                    }
-                } else {
-                    None
+                if is_active && !can_extend_uninteracted_multi_object {
+                    let seed_result = self.run_propagated_frame(
+                        config,
+                        model,
+                        compute_device,
+                        session,
+                        frame_idx,
+                        &object_snapshot,
+                        direction,
+                    )?;
+                    pending_results.push((obj_id, seed_result.0, seed_result.1, seed_result.2));
                 }
-            };
-            let Some((output, tracker_state, display_score)) = seed_result else {
-                continue;
-            };
-            pending_results.push((obj_id, output, tracker_state, display_score));
+            }
         }
 
         let frame_objects = self.postprocess_output(
@@ -2133,6 +2279,62 @@ impl Sam3VideoTrackerCore<'_> {
             objects: frame_objects,
         })
     }
+}
+
+fn grounding_query_count(scores: &Tensor) -> Result<usize> {
+    match scores.rank() {
+        3 | 2 => scores.dim(1),
+        1 => scores.dim(0),
+        rank => candle::bail!("expected text detection score tensor rank 1/2/3, got {rank}"),
+    }
+}
+
+fn grounding_query_score(scores: &Tensor, query_idx: usize) -> Result<f32> {
+    match scores.rank() {
+        3 => scores
+            .i((0, query_idx))?
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .into_iter()
+            .next()
+            .ok_or_else(|| candle::Error::Msg("empty text detection score".to_owned())),
+        2 => scores.i((0, query_idx))?.to_vec0::<f32>(),
+        1 => scores.i(query_idx)?.to_vec0::<f32>(),
+        rank => candle::bail!("expected text detection score tensor rank 1/2/3, got {rank}"),
+    }
+}
+
+fn grounding_query_mask_logits(grounding: &GroundingOutput, query_idx: usize) -> Result<Tensor> {
+    match grounding.mask_logits.rank() {
+        4 => grounding.mask_logits.i((0, query_idx)),
+        3 => grounding.mask_logits.i(query_idx),
+        rank => candle::bail!("expected text detection mask tensor rank 3/4, got {rank}"),
+    }
+}
+
+fn grounding_query_box_xyxy(grounding: &GroundingOutput, query_idx: usize) -> Result<Tensor> {
+    match grounding.boxes_xyxy.rank() {
+        3 => grounding.boxes_xyxy.i((0, query_idx))?.reshape((1, 4)),
+        2 => grounding.boxes_xyxy.i(query_idx)?.reshape((1, 4)),
+        rank => candle::bail!("expected text detection box tensor rank 2/3, got {rank}"),
+    }
+}
+
+fn grounding_query_output(
+    grounding: &GroundingOutput,
+    query_idx: usize,
+    score: f32,
+) -> Result<GroundingOutput> {
+    let mask_logits = grounding_query_mask_logits(grounding, query_idx)?;
+    let masks = candle_nn::ops::sigmoid(&mask_logits)?;
+    let scores = Tensor::from_vec(vec![score], (1,), grounding.scores.device())?;
+    Ok(GroundingOutput {
+        mask_logits,
+        masks,
+        boxes_xyxy: grounding_query_box_xyxy(grounding, query_idx)?,
+        scores,
+        presence_scores: None,
+    })
 }
 
 pub(super) fn move_visual_output(
