@@ -303,18 +303,20 @@ pub(super) fn mask_to_normalized_xyxy(mask: &Tensor) -> Result<Tensor> {
         .to_dtype(DType::F32)?
         .reshape((1,))?
         .affine(1.0 / height_scale, 0.0)?;
+    let max_x_offset = width.saturating_sub(1) as f64 / width_scale;
     let max_x = col_any
         .flip(&[0])?
         .argmax(0)?
         .to_dtype(DType::F32)?
         .reshape((1,))?
-        .affine(-1.0 / width_scale, 1.0)?;
+        .affine(-1.0 / width_scale, max_x_offset)?;
+    let max_y_offset = height.saturating_sub(1) as f64 / height_scale;
     let max_y = row_any
         .flip(&[0])?
         .argmax(0)?
         .to_dtype(DType::F32)?
         .reshape((1,))?
-        .affine(-1.0 / height_scale, 1.0)?;
+        .affine(-1.0 / height_scale, max_y_offset)?;
     Tensor::stack(&[&min_x, &min_y, &max_x, &max_y], 0)?.reshape((1, 4))
 }
 
@@ -612,4 +614,90 @@ pub(super) fn persist_visible_frame_output(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_to_normalized_xyxy_uses_last_foreground_index_for_max_corner() -> Result<()> {
+        let device = Device::Cpu;
+        let mask = Tensor::from_vec(
+            vec![
+                0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 1.0, 1.0, 0.0, //
+                0.0, 0.0, 1.0, 1.0, 1.0, 0.0, //
+                0.0, 0.0, 1.0, 1.0, 1.0, 0.0, //
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, //
+            ],
+            (5, 6),
+            &device,
+        )?;
+
+        let actual = mask_to_normalized_xyxy(&mask)?.flatten_all()?.to_vec1::<f32>()?;
+
+        let expected = [2.0f32 / 6.0, 1.0 / 5.0, 4.0 / 6.0, 3.0 / 5.0];
+        assert!(actual
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| (actual - expected).abs() <= 1e-6));
+        Ok(())
+    }
+
+    #[test]
+    fn mask_to_normalized_xyxy_keeps_single_pixel_boxes_zero_area() -> Result<()> {
+        let device = Device::Cpu;
+        let mask = Tensor::from_vec(
+            vec![
+                0.0f32, 0.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0, //
+                0.0, 0.0, 0.0, 0.0, //
+            ],
+            (3, 4),
+            &device,
+        )?;
+
+        let actual = mask_to_normalized_xyxy(&mask)?.flatten_all()?.to_vec1::<f32>()?;
+
+        let expected = [2.0f32 / 4.0, 1.0 / 3.0, 2.0 / 4.0, 1.0 / 3.0];
+        assert!(actual
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| (actual - expected).abs() <= 1e-6));
+        Ok(())
+    }
+
+    #[test]
+    fn filter_video_frame_output_excludes_hidden_object_ids() -> Result<()> {
+        let mask_logits = Tensor::zeros((1, 1, 2, 2), DType::F32, &Device::Cpu)?;
+        let masks = candle_nn::ops::sigmoid(&mask_logits)?;
+        let scores = Tensor::ones((1,), DType::F32, &Device::Cpu)?;
+        let make_output = |obj_id| -> Result<ObjectFrameOutput> {
+            Ok(ObjectFrameOutput {
+                obj_id,
+                mask_logits: mask_logits.clone(),
+                masks: masks.clone(),
+                boxes_xyxy: mask_to_normalized_xyxy(&masks)?,
+                scores: scores.clone(),
+                presence_scores: None,
+                prompt_frame_idx: Some(0),
+                memory_frame_indices: Vec::new(),
+                text_prompt: None,
+                used_explicit_geometry: false,
+                reused_previous_output: false,
+            })
+        };
+        let frame_output = VideoFrameOutput {
+            frame_idx: 7,
+            objects: vec![make_output(1)?, make_output(2)?, make_output(3)?],
+        };
+        let filtered =
+            filter_video_frame_output(&frame_output, &BTreeSet::from([1u32, 3u32]));
+
+        assert_eq!(filtered.frame_idx, 7);
+        assert_eq!(filtered.objects.len(), 1);
+        assert_eq!(filtered.objects[0].obj_id, 2);
+        Ok(())
+    }
 }
