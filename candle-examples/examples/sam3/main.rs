@@ -442,6 +442,26 @@ fn directory_has_jpeg_frames(dir_path: &Path) -> Result<bool> {
         }))
 }
 
+fn notebook_video_frame_cache_marker_matches(
+    dir_path: &Path,
+    directory_listing_url: &str,
+) -> Result<bool> {
+    let marker_path = dir_path.join(".complete");
+    let Ok(marker) = fs::read_to_string(&marker_path) else {
+        return Ok(false);
+    };
+    Ok(marker == format!("directory_listing_url={directory_listing_url}\n"))
+}
+
+fn notebook_video_frame_cache_is_current(
+    dir_path: &Path,
+    directory_listing_url: &str,
+) -> Result<bool> {
+    Ok(dir_path.is_dir()
+        && directory_has_jpeg_frames(dir_path)?
+        && notebook_video_frame_cache_marker_matches(dir_path, directory_listing_url)?)
+}
+
 pub(crate) fn ensure_notebook_video_frames(
     asset_root: &Path,
     relative_frame_dir: &str,
@@ -449,7 +469,7 @@ pub(crate) fn ensure_notebook_video_frames(
     label: &str,
 ) -> Result<PathBuf> {
     let frame_dir = asset_root.join(relative_frame_dir);
-    if frame_dir.is_dir() && directory_has_jpeg_frames(&frame_dir)? {
+    if notebook_video_frame_cache_is_current(&frame_dir, directory_listing_url)? {
         return Ok(frame_dir);
     }
 
@@ -1575,6 +1595,50 @@ mod tests {
             .map(|download| download.name)
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["0.jpeg", "2.jpg", "10.jpg"]);
+    }
+
+    fn temp_cache_dir(test_name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("sam3_notebook_cache_{test_name}_{unique}"))
+    }
+
+    #[test]
+    fn notebook_video_frame_cache_is_current_accepts_directory_listing_marker() -> Result<()> {
+        let dir = temp_cache_dir("current_marker");
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("0.jpg"), b"jpeg-placeholder")?;
+        fs::write(
+            dir.join(".complete"),
+            "directory_listing_url=https://example.com/video-frames\n",
+        )?;
+
+        let is_current =
+            notebook_video_frame_cache_is_current(&dir, "https://example.com/video-frames")?;
+
+        assert!(is_current);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn notebook_video_frame_cache_is_current_rejects_legacy_source_video_marker() -> Result<()> {
+        let dir = temp_cache_dir("legacy_marker");
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("0.jpg"), b"jpeg-placeholder")?;
+        fs::write(
+            dir.join(".complete"),
+            "source_video=output/video-predictor-example/_notebook_assets/videos/bedroom.mp4\n",
+        )?;
+
+        let is_current =
+            notebook_video_frame_cache_is_current(&dir, "https://example.com/video-frames")?;
+
+        assert!(!is_current);
+        fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]
