@@ -189,6 +189,32 @@ fn layer_norm_2d(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn cleanup_mask_logits_small_components_2d(device: &Device) -> Result<()> {
+    let logits = Tensor::from_vec(
+        vec![
+            0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 1.0, 1.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 1.0, 0.0, 1.0, //
+            0.0, 1.0, 1.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, //
+        ],
+        (1, 1, 5, 6),
+        device,
+    )?;
+    let actual = candle_nn::ops::cleanup_mask_logits_small_components_2d(&logits, 2, 0.1, -0.1)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let expected = vec![
+        0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, //
+        0.0, 1.0, 1.0, 1.0, 0.0, 0.0, //
+        0.0, 1.0, 0.1, 1.0, 0.0, -0.1, //
+        0.0, 1.0, 1.0, 1.0, 0.0, 0.0, //
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, //
+    ];
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
 #[test]
 fn softmax_numerical_stability() -> Result<()> {
     let dev = &Device::Cpu;
@@ -386,4 +412,15 @@ fn ln2d_cpu() -> Result<()> {
 #[test]
 fn ln2d_gpu() -> Result<()> {
     layer_norm_2d(&Device::new_cuda(0)?)
+}
+
+#[test]
+fn cleanup_mask_logits_small_components_2d_cpu() -> Result<()> {
+    cleanup_mask_logits_small_components_2d(&Device::Cpu)
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cleanup_mask_logits_small_components_2d_gpu() -> Result<()> {
+    cleanup_mask_logits_small_components_2d(&Device::new_cuda(0)?)
 }

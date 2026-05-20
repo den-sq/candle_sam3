@@ -1050,6 +1050,255 @@ impl candle::CustomOp3 for LayerNorm2d {
     }
 }
 
+pub const CLEANUP_MASK_LOGITS_SMALL_COMPONENTS_2D_CUDA_MAX_AREA: usize = 64;
+
+#[derive(Debug, Clone)]
+struct CleanupMaskLogitsSmallComponents2d {
+    max_area: usize,
+    hole_fill_logit: f32,
+    sprinkle_remove_logit: f32,
+}
+
+impl candle::CustomOp1 for CleanupMaskLogitsSmallComponents2d {
+    fn name(&self) -> &'static str {
+        "cleanup-mask-logits-small-components-2d"
+    }
+
+    fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
+        let src = match storage {
+            CpuStorage::F32(src) => src,
+            _ => candle::bail!("cleanup_mask_logits_small_components_2d expects f32 input"),
+        };
+        let src = match layout.contiguous_offsets() {
+            None => candle::bail!("input has to be contiguous"),
+            Some((o1, o2)) => &src[o1..o2],
+        };
+        let dims = layout.shape().dims();
+        let [batch, channels, height, width]: [usize; 4] = dims.try_into().map_err(|_| {
+            candle::Error::Msg(format!(
+                "cleanup_mask_logits_small_components_2d expected rank 4, got {dims:?}"
+            ))
+        })?;
+        let spatial = height * width;
+        let mut dst = Vec::with_capacity(layout.shape().elem_count());
+        for plane_idx in 0..batch * channels {
+            let offset = plane_idx * spatial;
+            let mut plane = src[offset..offset + spatial].to_vec();
+            fill_small_holes_flat_plane(
+                &mut plane,
+                height,
+                width,
+                self.max_area,
+                self.hole_fill_logit,
+            );
+            remove_small_sprinkles_flat_plane(
+                &mut plane,
+                height,
+                width,
+                self.max_area,
+                self.sprinkle_remove_logit,
+            );
+            dst.extend(plane);
+        }
+        Ok((
+            candle::WithDType::to_cpu_storage_owned(dst),
+            Shape::from_dims(dims),
+        ))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        storage: &candle::CudaStorage,
+        layout: &Layout,
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        use candle::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle::cuda_backend::{kernels, WrapErr};
+
+        if self.max_area > CLEANUP_MASK_LOGITS_SMALL_COMPONENTS_2D_CUDA_MAX_AREA {
+            candle::bail!(
+                "cleanup_mask_logits_small_components_2d CUDA path supports max_area <= {}, got {}",
+                CLEANUP_MASK_LOGITS_SMALL_COMPONENTS_2D_CUDA_MAX_AREA,
+                self.max_area
+            );
+        }
+        if storage.dtype() != DType::F32 {
+            candle::bail!("cleanup_mask_logits_small_components_2d expects f32 input")
+        }
+        let src = storage.as_cuda_slice::<f32>()?;
+        let src = match layout.contiguous_offsets() {
+            None => candle::bail!("input has to be contiguous"),
+            Some((o1, o2)) => src.slice(o1..o2),
+        };
+        let dims = layout.shape().dims();
+        let [batch, channels, height, width]: [usize; 4] = dims.try_into().map_err(|_| {
+            candle::Error::Msg(format!(
+                "cleanup_mask_logits_small_components_2d expected rank 4, got {dims:?}"
+            ))
+        })?;
+        let elem_count = layout.shape().elem_count();
+        if height > i32::MAX as usize || width > i32::MAX as usize {
+            candle::bail!(
+                "cleanup_mask_logits_small_components_2d CUDA path expects height/width <= i32::MAX, got {height}x{width}"
+            );
+        }
+        if height
+            .checked_mul(width)
+            .filter(|spatial| *spatial <= i32::MAX as usize)
+            .is_none()
+        {
+            candle::bail!(
+                "cleanup_mask_logits_small_components_2d CUDA path expects per-plane element count <= i32::MAX, got {height}x{width}"
+            );
+        }
+        if elem_count > u32::MAX as usize {
+            candle::bail!(
+                "cleanup_mask_logits_small_components_2d CUDA path expects total element count <= u32::MAX, got {elem_count}"
+            );
+        }
+        let plane_count = batch * channels;
+        let device = storage.device();
+        let tmp = unsafe { device.alloc::<f32>(elem_count)? };
+        let dst = unsafe { device.alloc::<f32>(elem_count)? };
+        let fg_counts = device.alloc_zeros::<u32>(plane_count)?;
+        let cfg = LaunchConfig::for_num_elems(elem_count as u32);
+
+        let fill_func =
+            device.get_or_load_func("cleanup_mask_logits_fill_holes_f32", &kernels::REDUCE)?;
+        let mut fill_builder = fill_func.builder();
+        fill_builder.arg(&src);
+        fill_builder.arg(&tmp);
+        fill_builder.arg(&fg_counts);
+        candle::builder_arg!(
+            fill_builder,
+            elem_count,
+            height as i32,
+            width as i32,
+            self.max_area as i32,
+            self.hole_fill_logit
+        );
+        unsafe { fill_builder.launch(cfg) }.w()?;
+
+        let remove_func = device
+            .get_or_load_func("cleanup_mask_logits_remove_sprinkles_f32", &kernels::REDUCE)?;
+        let mut remove_builder = remove_func.builder();
+        remove_builder.arg(&tmp);
+        remove_builder.arg(&dst);
+        remove_builder.arg(&fg_counts);
+        candle::builder_arg!(
+            remove_builder,
+            elem_count,
+            height as i32,
+            width as i32,
+            self.max_area as i32,
+            self.sprinkle_remove_logit
+        );
+        unsafe { remove_builder.launch(cfg) }.w()?;
+
+        Ok((
+            candle::CudaStorage::wrap_cuda_slice(dst, device.clone()),
+            layout.shape().clone(),
+        ))
+    }
+}
+
+fn cleanup_mask_component_size(
+    plane: &[f32],
+    height: usize,
+    width: usize,
+    start_idx: usize,
+    max_area: usize,
+    want_foreground: bool,
+) -> usize {
+    let mut queue = Vec::with_capacity(
+        max_area
+            .saturating_add(1)
+            .min(CLEANUP_MASK_LOGITS_SMALL_COMPONENTS_2D_CUDA_MAX_AREA + 1),
+    );
+    let mut head = 0usize;
+    queue.push(start_idx);
+
+    while head < queue.len() {
+        let idx = queue[head];
+        head += 1;
+        let row = idx / width;
+        let col = idx - row * width;
+        let row_start = row.saturating_sub(1);
+        let row_end = (row + 1).min(height.saturating_sub(1));
+        let col_start = col.saturating_sub(1);
+        let col_end = (col + 1).min(width.saturating_sub(1));
+
+        for next_row in row_start..=row_end {
+            for next_col in col_start..=col_end {
+                if next_row == row && next_col == col {
+                    continue;
+                }
+                let next_idx = next_row * width + next_col;
+                let selected = if want_foreground {
+                    plane[next_idx] > 0.0
+                } else {
+                    plane[next_idx] <= 0.0
+                };
+                if !selected || queue.iter().any(|seen| *seen == next_idx) {
+                    continue;
+                }
+                queue.push(next_idx);
+                if queue.len() > max_area {
+                    return queue.len();
+                }
+            }
+        }
+    }
+
+    queue.len()
+}
+
+fn fill_small_holes_flat_plane(
+    plane: &mut [f32],
+    height: usize,
+    width: usize,
+    max_area: usize,
+    fill_logit: f32,
+) {
+    let original = plane.to_vec();
+    for idx in 0..plane.len() {
+        if original[idx] > 0.0 {
+            continue;
+        }
+        let component_size =
+            cleanup_mask_component_size(&original, height, width, idx, max_area, false);
+        if component_size <= max_area {
+            plane[idx] = fill_logit;
+        }
+    }
+}
+
+fn remove_small_sprinkles_flat_plane(
+    plane: &mut [f32],
+    height: usize,
+    width: usize,
+    max_area: usize,
+    remove_logit: f32,
+) {
+    let total_fg = plane.iter().filter(|value| **value > 0.0).count();
+    let fg_area_thresh = total_fg.saturating_div(2).min(max_area);
+    if fg_area_thresh == 0 {
+        return;
+    }
+    let original = plane.to_vec();
+    for idx in 0..plane.len() {
+        if original[idx] <= 0.0 {
+            continue;
+        }
+        let component_size =
+            cleanup_mask_component_size(&original, height, width, idx, fg_area_thresh, true);
+        if component_size <= fg_area_thresh {
+            plane[idx] = remove_logit;
+        }
+    }
+}
+
 pub fn layer_norm_slow(x: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> Result<Tensor> {
     let x_dtype = x.dtype();
     let internal_dtype = match x_dtype {
@@ -1098,6 +1347,24 @@ pub fn layer_norm_2d(xs: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> Re
         )
     }
     xs.apply_op3_no_bwd(alpha, beta, &LayerNorm2d { eps })
+}
+
+pub fn cleanup_mask_logits_small_components_2d(
+    mask_logits: &Tensor,
+    max_area: usize,
+    hole_fill_logit: f32,
+    sprinkle_remove_logit: f32,
+) -> Result<Tensor> {
+    mask_logits.dims4()?;
+    if max_area == 0 {
+        return Ok(mask_logits.clone());
+    }
+    let mask_logits = mask_logits.to_dtype(DType::F32)?.contiguous()?;
+    mask_logits.apply_op1_no_bwd(&CleanupMaskLogitsSmallComponents2d {
+        max_area,
+        hole_fill_logit,
+        sprinkle_remove_logit,
+    })
 }
 
 // https://pytorch.org/docs/stable/generated/torch.nn.PixelShuffle.html

@@ -316,8 +316,16 @@ pointwise ops.
 
 #### How SAM3 Would Use It
 
-This would remove the remaining exact GPU -> CPU -> GPU cleanup roundtrip in SAM3 video
-postprocessing while preserving current semantics.
+SAM3 video now has a narrow CUDA fast path for the default small-component cleanup
+case: `candle_nn::ops::cleanup_mask_logits_small_components_2d` handles rank-4
+F32 mask logits with `max_area <= 64` by using bounded per-pixel 8-connected
+component searches directly on the GPU. That removes the default
+GPU -> CPU -> GPU cleanup roundtrip while preserving current SAM3 semantics for
+`fill_hole_area = 16`.
+
+The general primitive gap still exists. A reusable connected-components API would
+be needed for larger component thresholds, non-F32 masks, labels, component
+statistics, or other topology-aware image-processing users.
 
 ## Supporting Backend/Runtime Work
 

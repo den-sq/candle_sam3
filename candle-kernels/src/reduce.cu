@@ -226,6 +226,126 @@ __device__ void layernorm2d(const T * x, T * dst, const T * alpha, const T * bet
     }
 }
 
+constexpr int CLEANUP_MASK_MAX_AREA = 64;
+
+__device__ bool cleanup_mask_selected(const float value, const bool want_foreground) {
+    return want_foreground ? value > 0.f : value <= 0.f;
+}
+
+__device__ int cleanup_mask_bounded_component_size(
+    const float *plane,
+    const int height,
+    const int width,
+    const int start_idx,
+    const int max_area,
+    const bool want_foreground
+) {
+    int queue[CLEANUP_MASK_MAX_AREA + 1];
+    int head = 0;
+    int count = 1;
+    queue[0] = start_idx;
+
+    while (head < count) {
+        const int idx = queue[head++];
+        const int row = idx / width;
+        const int col = idx - row * width;
+        const int row_start = row > 0 ? row - 1 : row;
+        const int row_end = row + 1 < height ? row + 1 : row;
+        const int col_start = col > 0 ? col - 1 : col;
+        const int col_end = col + 1 < width ? col + 1 : col;
+
+        for (int next_row = row_start; next_row <= row_end; ++next_row) {
+            for (int next_col = col_start; next_col <= col_end; ++next_col) {
+                if (next_row == row && next_col == col) {
+                    continue;
+                }
+                const int next_idx = next_row * width + next_col;
+                if (!cleanup_mask_selected(plane[next_idx], want_foreground)) {
+                    continue;
+                }
+
+                bool already_seen = false;
+                for (int seen_idx = 0; seen_idx < count; ++seen_idx) {
+                    if (queue[seen_idx] == next_idx) {
+                        already_seen = true;
+                        break;
+                    }
+                }
+                if (already_seen) {
+                    continue;
+                }
+
+                queue[count++] = next_idx;
+                if (count > max_area) {
+                    return count;
+                }
+            }
+        }
+    }
+
+    return count;
+}
+
+extern "C" __global__ void cleanup_mask_logits_fill_holes_f32(
+    const float *src,
+    float *tmp,
+    unsigned int *fg_counts,
+    const size_t elem_count,
+    const int height,
+    const int width,
+    const int max_area,
+    const float fill_logit
+) {
+    const size_t spatial = static_cast<size_t>(height) * width;
+    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < elem_count; idx += blockDim.x * gridDim.x) {
+        const size_t plane_idx = idx / spatial;
+        const int plane_offset = static_cast<int>(idx - plane_idx * spatial);
+        const float *plane = src + plane_idx * spatial;
+        float value = src[idx];
+        if (value <= 0.f) {
+            const int component_size = cleanup_mask_bounded_component_size(
+                plane, height, width, plane_offset, max_area, false);
+            if (component_size <= max_area) {
+                value = fill_logit;
+            }
+        }
+        tmp[idx] = value;
+        if (value > 0.f) {
+            atomicAdd(fg_counts + plane_idx, 1u);
+        }
+    }
+}
+
+extern "C" __global__ void cleanup_mask_logits_remove_sprinkles_f32(
+    const float *tmp,
+    float *dst,
+    const unsigned int *fg_counts,
+    const size_t elem_count,
+    const int height,
+    const int width,
+    const int max_area,
+    const float remove_logit
+) {
+    const size_t spatial = static_cast<size_t>(height) * width;
+    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < elem_count; idx += blockDim.x * gridDim.x) {
+        const size_t plane_idx = idx / spatial;
+        const int plane_offset = static_cast<int>(idx - plane_idx * spatial);
+        const float *plane = tmp + plane_idx * spatial;
+        float value = tmp[idx];
+        if (value > 0.f) {
+            const int fg_area_thresh = min(static_cast<int>(fg_counts[plane_idx] / 2u), max_area);
+            if (fg_area_thresh > 0) {
+                const int component_size = cleanup_mask_bounded_component_size(
+                    plane, height, width, plane_offset, fg_area_thresh, true);
+                if (component_size <= fg_area_thresh) {
+                    value = remove_logit;
+                }
+            }
+        }
+        dst[idx] = value;
+    }
+}
+
 // RmsNorm implementation adapted from ggml, accumulation is made using f32.
 // https://github.com/ggerganov/llama.cpp/blob/d59bd97065cd7ded6c4ecab54b1d5e0b1b11e318/ggml-cuda.cu#L523
 template <typename T>

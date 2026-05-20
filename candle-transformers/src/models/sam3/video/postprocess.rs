@@ -388,6 +388,16 @@ pub(super) fn postprocess_low_res_mask_logits_for_video(
     if matches!(mask_logits.device(), Device::Cpu) {
         return postprocess_low_res_mask_logits_on_cpu(mask_logits, max_area);
     }
+    if matches!(mask_logits.device(), Device::Cuda(_))
+        && max_area <= candle_nn::ops::CLEANUP_MASK_LOGITS_SMALL_COMPONENTS_2D_CUDA_MAX_AREA
+    {
+        return candle_nn::ops::cleanup_mask_logits_small_components_2d(
+            mask_logits,
+            max_area,
+            VIDEO_PROPAGATION_HOLE_FILL_LOGIT,
+            VIDEO_PROPAGATION_SPRINKLE_REMOVE_LOGIT,
+        );
+    }
     let device = mask_logits.device().clone();
     let mask_logits = mask_logits.to_device(&Device::Cpu)?;
     postprocess_low_res_mask_logits_on_cpu(&mask_logits, max_area)?.to_device(&device)

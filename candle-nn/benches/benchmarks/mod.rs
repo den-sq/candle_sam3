@@ -1,3 +1,4 @@
+pub(crate) mod cleanup;
 pub(crate) mod conv;
 pub(crate) mod norm;
 pub(crate) mod softmax;
