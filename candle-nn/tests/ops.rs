@@ -147,6 +147,48 @@ fn layer_norml(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn layer_norm_2d_slow(xs: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f64) -> Result<Tensor> {
+    let channels = alpha.dims1()?;
+    let mean = xs.mean_keepdim(1)?;
+    let xs_centered = xs.broadcast_sub(&mean)?;
+    let var = xs_centered.sqr()?.mean_keepdim(1)?;
+    let xs_normed = xs_centered.broadcast_div(&(var + eps)?.sqrt()?)?;
+    xs_normed
+        .broadcast_mul(&alpha.reshape((1, channels, 1, 1))?)?
+        .broadcast_add(&beta.reshape((1, channels, 1, 1))?)
+}
+
+fn layer_norm_2d(device: &Device) -> Result<()> {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+
+    let (b_size, channels, height, width) = (3, 8, 5, 7);
+    let el_count = b_size * channels * height * width;
+    let mut rng = StdRng::seed_from_u64(314159265);
+    let src = (0..el_count)
+        .map(|_| rng.random::<f32>() * 2. - 1.)
+        .collect::<Vec<_>>();
+    let alpha = (0..channels)
+        .map(|idx| 0.5 + idx as f32 * 0.1)
+        .collect::<Vec<_>>();
+    let beta = (0..channels)
+        .map(|idx| -0.2 + idx as f32 * 0.05)
+        .collect::<Vec<_>>();
+    let tensor = Tensor::from_vec(src, (b_size, channels, height, width), device)?;
+    let alpha = Tensor::new(alpha, device)?;
+    let beta = Tensor::new(beta, device)?;
+
+    let actual = candle_nn::ops::layer_norm_2d(&tensor, &alpha, &beta, 1e-5)?;
+    let expected = layer_norm_2d_slow(&tensor, &alpha, &beta, 1e-5)?;
+    let diff = (actual - expected)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .reshape(())?
+        .to_vec0::<f32>()?;
+    assert!(diff < 1e-5, "layer_norm_2d max abs diff {diff}");
+    Ok(())
+}
+
 #[test]
 fn softmax_numerical_stability() -> Result<()> {
     let dev = &Device::Cpu;
@@ -334,3 +376,14 @@ test_device!(rms_norml, rms_norml_cpu, rms_norml_gpu, rms_norml_metal);
 test_device!(layer_norm, ln_cpu, ln_gpu, ln_metal);
 test_device!(layer_norml, lnl_cpu, lnl_gpu, lnl_metal);
 test_device!(sigmoid, sigmoid_cpu, sigmoid_gpu, sigmoid_metal);
+
+#[test]
+fn ln2d_cpu() -> Result<()> {
+    layer_norm_2d(&Device::Cpu)
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn ln2d_gpu() -> Result<()> {
+    layer_norm_2d(&Device::new_cuda(0)?)
+}

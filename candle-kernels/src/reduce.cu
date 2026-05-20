@@ -183,6 +183,49 @@ __device__ void layernorm(const T * x, T * dst, const T * alpha, const T * beta,
     }
 }
 
+// Channels-first 2D LayerNorm over the C dimension for contiguous NCHW tensors.
+template <typename T>
+__device__ void layernorm2d(const T * x, T * dst, const T * alpha, const T * beta, const int ncols, const int spatial, const int block_size, const float eps) {
+    const int row = blockIdx.x*blockDim.y + threadIdx.y;
+    const int tid = threadIdx.x;
+    const int batch = row / spatial;
+    const int pixel = row - batch * spatial;
+    const int base = batch * ncols * spatial + pixel;
+
+    float2 mean_var = make_float2(0.f, 0.f);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = static_cast<float>(x[base + col * spatial]);
+        mean_var.x += xi;
+        mean_var.y += xi * xi;
+    }
+
+    mean_var = warp_reduce_sum(mean_var);
+    if (block_size > WARP_SIZE) {
+        __shared__ float2 s_sum[32];
+        int warp_id = threadIdx.x / WARP_SIZE;
+        int lane_id = threadIdx.x % WARP_SIZE;
+        if (lane_id == 0) {
+            s_sum[warp_id] = mean_var;
+        }
+        __syncthreads();
+        mean_var = s_sum[lane_id];
+        mean_var = warp_reduce_sum(mean_var);
+    }
+
+    const float mean = mean_var.x / ncols;
+    const float var = mean_var.y / ncols - mean * mean;
+    const float inv_std = rsqrtf(var + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const float a = static_cast<float>(alpha[col]);
+        const float b = static_cast<float>(beta[col]);
+        const int offset = base + col * spatial;
+        const float lhs = (static_cast<float>(x[offset]) - mean) * inv_std;
+        dst[offset] = static_cast<T>(lhs * a + b);
+    }
+}
+
 // RmsNorm implementation adapted from ggml, accumulation is made using f32.
 // https://github.com/ggerganov/llama.cpp/blob/d59bd97065cd7ded6c4ecab54b1d5e0b1b11e318/ggml-cuda.cu#L523
 template <typename T>
@@ -612,6 +655,14 @@ fast_argmax(const size_t src_numel, const size_t el_to_sum_per_block,
     layernorm<TYPENAME>(src, dst, alpha, beta, n_cols, block_size, eps);       \
   }                                                                            \
 
+#define LAYERNORM2D_OP(TYPENAME, FN_NAME)                                      \
+  extern "C" __global__ void FN_NAME(                                          \
+      const TYPENAME *src, TYPENAME *dst, const TYPENAME *alpha,               \
+      const TYPENAME *beta, const int n_cols, const int spatial,               \
+      const int block_size, const float eps) {                                 \
+    layernorm2d<TYPENAME>(src, dst, alpha, beta, n_cols, spatial, block_size, eps); \
+  }                                                                            \
+
 #define ROPE_OP(TYPENAME, FN_NAME, FN_NAME_I, FN_NAME_THD) \
   extern "C" __global__ void FN_NAME_I( \
       const TYPENAME *src, \
@@ -651,6 +702,7 @@ fast_argmax(const size_t src_numel, const size_t el_to_sum_per_block,
 SOFTMAX_OP(__nv_bfloat16, float, softmax_bf16)
 RMSNORM_OP(__nv_bfloat16, rmsnorm_bf16)
 LAYERNORM_OP(__nv_bfloat16, layernorm_bf16)
+LAYERNORM2D_OP(__nv_bfloat16, layernorm2d_bf16)
 ROPE_OP(__nv_bfloat16, rope_bf16, rope_i_bf16, rope_thd_bf16)
 SUM_OP(__nv_bfloat16, sum_bf16)
 FAST_OP(__nv_bfloat16, fast_min_bf16, fast_max_bf16, fast_argmin_bf16, fast_argmax_bf16, fast_sum_bf16)
@@ -668,6 +720,7 @@ FAST_OP(__nv_bfloat16, fast_min_bf16, fast_max_bf16, fast_argmin_bf16, fast_argm
 SOFTMAX_OP(__half, float, softmax_f16)
 RMSNORM_OP(__half, rmsnorm_f16)
 LAYERNORM_OP(__half, layernorm_f16)
+LAYERNORM2D_OP(__half, layernorm2d_f16)
 ROPE_OP(__half, rope_f16, rope_i_f16, rope_thd_f16)
 SUM_OP(__half, sum_f16)
 FAST_OP(__half, fast_min_f16, fast_max_f16, fast_argmin_f16, fast_argmax_f16, fast_sum_f16)
@@ -682,6 +735,8 @@ RMSNORM_OP(float, rmsnorm_f32)
 RMSNORM_OP(double, rmsnorm_f64)
 LAYERNORM_OP(float, layernorm_f32)
 LAYERNORM_OP(double, layernorm_f64)
+LAYERNORM2D_OP(float, layernorm2d_f32)
+LAYERNORM2D_OP(double, layernorm2d_f64)
 ROPE_OP(float, rope_f32, rope_i_f32, rope_thd_f32)
 ROPE_OP(double, rope_f64, rope_i_f64, rope_thd_f64)
 

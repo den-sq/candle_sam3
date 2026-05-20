@@ -4,10 +4,49 @@ use std::sync::Mutex;
 use super::*;
 
 #[derive(Debug)]
+struct TrackerMaskmemLayerNorm2d {
+    weight: Tensor,
+    bias: Tensor,
+    weight_4d: Tensor,
+    bias_4d: Tensor,
+    eps: f64,
+}
+
+impl TrackerMaskmemLayerNorm2d {
+    fn new(num_channels: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+        let weight = vb.get(num_channels, "weight")?;
+        let bias = vb.get(num_channels, "bias")?;
+        let weight_4d = weight.reshape((1, num_channels, 1, 1))?;
+        let bias_4d = bias.reshape((1, num_channels, 1, 1))?;
+        Ok(Self {
+            weight,
+            bias,
+            weight_4d,
+            bias_4d,
+            eps,
+        })
+    }
+
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        if xs.is_contiguous() && xs.device().is_cuda() {
+            return candle_nn::ops::layer_norm_2d(xs, &self.weight, &self.bias, self.eps as f32);
+        }
+
+        let mean = xs.mean_keepdim(1)?;
+        let centered = xs.broadcast_sub(&mean)?;
+        let var = centered.sqr()?.mean_keepdim(1)?;
+        let normed = centered.broadcast_div(&(var + self.eps)?.sqrt()?)?;
+        normed
+            .broadcast_mul(&self.weight_4d)?
+            .broadcast_add(&self.bias_4d)
+    }
+}
+
+#[derive(Debug)]
 pub(super) struct TrackerSimpleMaskDownSampler {
     interpol_size: [usize; 2],
     convs: Vec<Conv2d>,
-    norms: Vec<LayerNorm2d>,
+    norms: Vec<TrackerMaskmemLayerNorm2d>,
     out_proj: Conv2d,
 }
 
@@ -50,7 +89,7 @@ impl TrackerSimpleMaskDownSampler {
                 },
                 encoder_vb.pp(layer_idx * 3),
             )?);
-            norms.push(LayerNorm2d::new(
+            norms.push(TrackerMaskmemLayerNorm2d::new(
                 mask_out_chans,
                 1e-6,
                 encoder_vb.pp(layer_idx * 3 + 1),
@@ -111,7 +150,10 @@ impl TrackerCxBlock {
             vb.pp("dwconv"),
         )?;
         let gamma = if config.layer_scale_init_value > 0.0 {
-            Some(vb.get((config.dim,), "gamma")?.reshape((1, 1, 1, config.dim))?)
+            Some(
+                vb.get((config.dim,), "gamma")?
+                    .reshape((1, 1, 1, config.dim))?,
+            )
         } else {
             None
         };
@@ -135,7 +177,7 @@ impl TrackerCxBlock {
         if let Some(gamma) = self.gamma.as_ref() {
             xs = xs.broadcast_mul(gamma)?;
         }
-        xs = xs.permute((0, 3, 1, 2))?.contiguous()?;
+        xs = xs.permute((0, 3, 1, 2))?;
         residual.broadcast_add(&xs)
     }
 }

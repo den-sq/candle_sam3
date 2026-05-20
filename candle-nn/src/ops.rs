@@ -866,6 +866,190 @@ impl candle::CustomOp3 for LayerNorm {
     }
 }
 
+#[derive(Debug, Clone)]
+struct LayerNorm2d {
+    eps: f32,
+}
+
+impl candle::CustomOp3 for LayerNorm2d {
+    fn name(&self) -> &'static str {
+        "layer-norm-2d"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+        s3: &CpuStorage,
+        l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        use candle::backend::BackendStorage;
+
+        fn inner<
+            T: candle::WithDType
+                + num_traits::Float
+                + num_traits::AsPrimitive<f32>
+                + num_traits::FromPrimitive,
+        >(
+            src: &[T],
+            layout: &Layout,
+            alpha: &[T],
+            alpha_layout: &Layout,
+            beta: &[T],
+            beta_layout: &Layout,
+            eps: f32,
+        ) -> Result<(CpuStorage, Shape)> {
+            let src = match layout.contiguous_offsets() {
+                None => candle::bail!("input has to be contiguous"),
+                Some((o1, o2)) => &src[o1..o2],
+            };
+            let alpha = match alpha_layout.contiguous_offsets() {
+                None => candle::bail!("alpha has to be contiguous"),
+                Some((o1, o2)) => &alpha[o1..o2],
+            };
+            let beta = match beta_layout.contiguous_offsets() {
+                None => candle::bail!("beta has to be contiguous"),
+                Some((o1, o2)) => &beta[o1..o2],
+            };
+            let dims = layout.shape().dims();
+            let [b_size, channels, height, width]: [usize; 4] = dims.try_into().map_err(|_| {
+                candle::Error::Msg(format!("layer_norm_2d expected rank 4, got {dims:?}"))
+            })?;
+            let spatial = height * width;
+            let mut dst = vec![T::zero(); layout.shape().elem_count()];
+
+            for batch in 0..b_size {
+                for pixel in 0..spatial {
+                    let base = batch * channels * spatial + pixel;
+                    let mut sum = 0f32;
+                    let mut sum2 = 0f32;
+                    for channel in 0..channels {
+                        let v = src[base + channel * spatial].as_();
+                        sum += v;
+                        sum2 += v * v;
+                    }
+                    let mean = sum / channels as f32;
+                    let var = sum2 / channels as f32 - mean * mean;
+                    let inv_std = (var + eps).sqrt().recip();
+                    for channel in 0..channels {
+                        let offset = base + channel * spatial;
+                        let a = alpha[channel].as_();
+                        let b = beta[channel].as_();
+                        let value = (src[offset].as_() - mean) * inv_std * a + b;
+                        dst[offset] = T::from_f32(value).unwrap_or_else(T::nan);
+                    }
+                }
+            }
+
+            let storage = candle::WithDType::to_cpu_storage_owned(dst);
+            Ok((storage, Shape::from_dims(dims)))
+        }
+
+        use CpuStorage as C;
+        match (s1, s2, s3) {
+            (C::BF16(s1), C::BF16(s2), C::BF16(s3)) => {
+                inner::<half::bf16>(s1, l1, s2, l2, s3, l3, self.eps)
+            }
+            (C::F16(s1), C::F16(s2), C::F16(s3)) => {
+                inner::<half::f16>(s1, l1, s2, l2, s3, l3, self.eps)
+            }
+            (C::F32(s1), C::F32(s2), C::F32(s3)) => inner::<f32>(s1, l1, s2, l2, s3, l3, self.eps),
+            (C::F64(s1), C::F64(s2), C::F64(s3)) => inner::<f64>(s1, l1, s2, l2, s3, l3, self.eps),
+            _ => candle::bail!("unsupported dtype for layer_norm_2d {:?}", s1.dtype()),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &candle::CudaStorage,
+        l1: &Layout,
+        s2: &candle::CudaStorage,
+        l2: &Layout,
+        s3: &candle::CudaStorage,
+        l3: &Layout,
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        use candle::cuda_backend::cudarc::driver::{
+            CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
+        };
+        use candle::cuda_backend::{kernel_name, kernels, Map3, WrapErr};
+        use candle::{CudaDevice, WithDType};
+
+        struct S {
+            eps: f32,
+        }
+        impl Map3 for S {
+            fn f<T: DeviceRepr + WithDType>(
+                &self,
+                src: &CudaSlice<T>,
+                layout: &Layout,
+                alpha: &CudaSlice<T>,
+                alpha_layout: &Layout,
+                beta: &CudaSlice<T>,
+                beta_layout: &Layout,
+                dev: &CudaDevice,
+            ) -> Result<CudaSlice<T>> {
+                let src = match layout.contiguous_offsets() {
+                    None => candle::bail!("input has to be contiguous"),
+                    Some((o1, o2)) => src.slice(o1..o2),
+                };
+                let alpha = match alpha_layout.contiguous_offsets() {
+                    None => candle::bail!("alpha has to be contiguous"),
+                    Some((o1, o2)) => alpha.slice(o1..o2),
+                };
+                let beta = match beta_layout.contiguous_offsets() {
+                    None => candle::bail!("beta has to be contiguous"),
+                    Some((o1, o2)) => beta.slice(o1..o2),
+                };
+                let dims = layout.shape().dims();
+                let [b_size, channels, height, width]: [usize; 4] =
+                    dims.try_into().map_err(|_| {
+                        candle::Error::Msg(format!("layer_norm_2d expected rank 4, got {dims:?}"))
+                    })?;
+                let spatial = height * width;
+                let n_rows = b_size * spatial;
+
+                let block_size = if channels < 1024 { 32 } else { 1024 };
+                let cfg = LaunchConfig {
+                    grid_dim: (n_rows as u32, 1, 1),
+                    block_dim: (block_size, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let func =
+                    dev.get_or_load_func(&kernel_name::<T>("layernorm2d"), &kernels::REDUCE)?;
+                // SAFETY: Set later by running the kernel.
+                let dst = unsafe { dev.alloc::<T>(layout.shape().elem_count())? };
+                let mut builder = func.builder();
+                builder.arg(&src);
+                builder.arg(&dst);
+                builder.arg(&alpha);
+                builder.arg(&beta);
+                candle::builder_arg!(
+                    builder,
+                    channels as i32,
+                    spatial as i32,
+                    block_size as i32,
+                    self.eps
+                );
+                // SAFETY: ffi.
+                unsafe { builder.launch(cfg) }.w()?;
+                Ok(dst)
+            }
+        }
+
+        use candle::backend::BackendStorage;
+        let dev = s1.device();
+        let slice = S { eps: self.eps }.map(&s1.slice, l1, &s2.slice, l2, &s3.slice, l3, dev)?;
+        let dst = candle::cuda_backend::CudaStorage {
+            slice,
+            device: dev.clone(),
+        };
+        Ok((dst, l1.shape().clone()))
+    }
+}
+
 pub fn layer_norm_slow(x: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> Result<Tensor> {
     let x_dtype = x.dtype();
     let internal_dtype = match x_dtype {
@@ -899,6 +1083,21 @@ pub fn layer_norm(xs: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> Resul
         )
     }
     xs.apply_op3_no_bwd(alpha, beta, &LayerNorm { eps })
+}
+
+pub fn layer_norm_2d(xs: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> Result<Tensor> {
+    let (_, channels, _, _) = xs.dims4()?;
+    let channels_alpha = alpha.dims1()?;
+    let channels_beta = beta.dims1()?;
+    if channels != channels_alpha || channels != channels_beta {
+        candle::bail!(
+            "shape mismatch in layer-norm-2d src: {:?} alpha: {:?} beta: {:?}",
+            xs.shape(),
+            alpha.shape(),
+            beta.shape()
+        )
+    }
+    xs.apply_op3_no_bwd(alpha, beta, &LayerNorm2d { eps })
 }
 
 // https://pytorch.org/docs/stable/generated/torch.nn.PixelShuffle.html
