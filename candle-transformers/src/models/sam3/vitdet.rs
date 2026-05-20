@@ -391,9 +391,13 @@ fn tile_position_embeddings(
     let pos_embed = pos_embed
         .reshape((1, pretrain_size, pretrain_size, hidden_size))?
         .permute((0, 3, 1, 2))?;
-    let repeat_h = target_height / pretrain_size + 1;
-    let repeat_w = target_width / pretrain_size + 1;
-    let pos_embed = pos_embed.repeat((1, 1, repeat_h, repeat_w))?;
+    let repeat_h = target_height.div_ceil(pretrain_size);
+    let repeat_w = target_width.div_ceil(pretrain_size);
+    let pos_embed = if repeat_h == 1 && repeat_w == 1 {
+        pos_embed
+    } else {
+        pos_embed.repeat((1, 1, repeat_h, repeat_w))?
+    };
     pos_embed
         .narrow(2, 0, target_height)?
         .narrow(3, 0, target_width)?
@@ -401,10 +405,36 @@ fn tile_position_embeddings(
 }
 
 #[derive(Debug)]
+struct Sam3TiledPositionEmbeddings {
+    source: Tensor,
+    cached: Tensor,
+    cached_hw: (usize, usize),
+}
+
+impl Sam3TiledPositionEmbeddings {
+    fn new(source: Tensor, cached_hw: (usize, usize)) -> Result<Self> {
+        let cached = tile_position_embeddings(&source, cached_hw.0, cached_hw.1)?;
+        Ok(Self {
+            source,
+            cached,
+            cached_hw,
+        })
+    }
+
+    fn get(&self, target_height: usize, target_width: usize) -> Result<Tensor> {
+        if (target_height, target_width) == self.cached_hw {
+            Ok(self.cached.clone())
+        } else {
+            tile_position_embeddings(&self.source, target_height, target_width)
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct Sam3ViTDetTrunk {
     config: VisionConfig,
     patch_embed: PatchEmbed,
-    pos_embed: Option<Tensor>,
+    pos_embed: Option<Sam3TiledPositionEmbeddings>,
     blocks: Vec<Sam3VisionBlock>,
     pre_layer_norm: Option<LayerNorm>,
 }
@@ -412,15 +442,18 @@ pub struct Sam3ViTDetTrunk {
 impl Sam3ViTDetTrunk {
     pub fn new(config: &VisionConfig, vb: VarBuilder) -> Result<Self> {
         let patch_embed = PatchEmbed::new(config, vb.pp("patch_embed"))?;
-        let pos_embed = if config.use_abs_pos {
-            Some(load_pos_embed(config, vb.clone())?)
-        } else {
-            None
-        };
         let input_size = (
             config.image_size / config.patch_size,
             config.image_size / config.patch_size,
         );
+        let pos_embed = if config.use_abs_pos {
+            Some(Sam3TiledPositionEmbeddings::new(
+                load_pos_embed(config, vb.clone())?,
+                input_size,
+            )?)
+        } else {
+            None
+        };
         let pre_layer_norm = if config.ln_pre && vb.contains_tensor("ln_pre.weight") {
             Some(candle_nn::layer_norm(
                 config.embed_dim,
@@ -486,10 +519,9 @@ impl Sam3ViTDetTrunk {
         hidden_states: &Tensor,
         block_index: usize,
     ) -> Result<(Tensor, BTreeMap<String, Tensor>)> {
-        let block = self
-            .blocks
-            .get(block_index)
-            .ok_or_else(|| candle::Error::Msg(format!("sam3 vision block {block_index} is out of range")))?;
+        let block = self.blocks.get(block_index).ok_or_else(|| {
+            candle::Error::Msg(format!("sam3 vision block {block_index} is out of range"))
+        })?;
         block.forward_with_debug(hidden_states, block_index)
     }
 
@@ -507,7 +539,8 @@ impl Sam3ViTDetTrunk {
             let original_hw = (hidden_states.dim(1)?, hidden_states.dim(2)?);
             // Keep tensors partitioned across consecutive windowed blocks so we only
             // pay the NHWC<->window layout materialization once per run.
-            let (mut windowed_states, padded_hw) = window_partition_nhwc(&hidden_states, window_size)?;
+            let (mut windowed_states, padded_hw) =
+                window_partition_nhwc(&hidden_states, window_size)?;
             while block_index < self.blocks.len() {
                 let block = &self.blocks[block_index];
                 if block.window_size != window_size {
@@ -550,7 +583,7 @@ impl Sam3ViTDetTrunk {
             );
         }
         if let Some(pos_embed) = &self.pos_embed {
-            let pos_embed = tile_position_embeddings(pos_embed, patch_height, patch_width)?;
+            let pos_embed = pos_embed.get(patch_height, patch_width)?;
             hidden_states = hidden_states.broadcast_add(&pos_embed)?;
         }
         if !debug_blocks.is_empty() {
@@ -565,7 +598,8 @@ impl Sam3ViTDetTrunk {
         if !debug_blocks.is_empty() {
             debug_tensors.insert("vision.pre_block.ln_pre".to_owned(), hidden_states.clone());
         }
-        let mut block_outputs = collect_block_outputs.then(|| Vec::with_capacity(self.blocks.len()));
+        let mut block_outputs =
+            collect_block_outputs.then(|| Vec::with_capacity(self.blocks.len()));
         if collect_block_outputs || !debug_blocks.is_empty() {
             for (block_index, block) in self.blocks.iter().enumerate() {
                 if debug_blocks.contains(&block_index) {
