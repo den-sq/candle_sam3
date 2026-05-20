@@ -399,24 +399,17 @@ impl Sam3TrackerMaskDecoder {
         ))?;
         let tokens = Tensor::cat(&[&output_tokens, sparse_prompt_embeddings], 1)?;
 
-        let src = if repeat_image {
-            repeat_interleave(image_embeddings, batch_size, 0)?
-        } else if image_embeddings.dim(0)? == batch_size {
-            image_embeddings.clone()
-        } else {
-            candle::bail!(
-                "tracker mask decoder expected image embeddings batch {} to match prompt batch {batch_size}",
-                image_embeddings.dim(0)?
-            );
-        };
+        let src = decoder_image_batch(
+            image_embeddings,
+            batch_size,
+            repeat_image,
+            "image embeddings",
+        )?;
         let src = src.broadcast_add(dense_prompt_embeddings)?;
-        let pos_src = if repeat_image {
-            repeat_interleave(image_pe, batch_size, 0)?
-        } else {
-            image_pe.broadcast_as(src.shape())?
-        };
+        let pos_src = decoder_position_batch(image_pe, &src, batch_size, repeat_image)?;
 
-        let (transformer_hs, transformer_src) = self.transformer.forward(&src, &pos_src, &tokens)?;
+        let (transformer_hs, transformer_src) =
+            self.transformer.forward(&src, &pos_src, &tokens)?;
         let token_offset = if self.pred_obj_score_head.is_some() {
             1
         } else {
@@ -428,8 +421,11 @@ impl Sam3TrackerMaskDecoder {
         } else {
             None
         };
-        let mask_tokens_out = transformer_hs
-            .i((.., token_offset + 1..token_offset + 1 + self.num_mask_tokens, ..))?;
+        let mask_tokens_out = transformer_hs.i((
+            ..,
+            token_offset + 1..token_offset + 1 + self.num_mask_tokens,
+            ..,
+        ))?;
         let (_, channels, height, width) = image_embeddings.dims4()?;
         let src_4d = transformer_src
             .transpose(1, 2)?
@@ -558,9 +554,7 @@ impl Sam3TrackerMaskDecoder {
             .unsqueeze(3)?
             .broadcast_as((batch_size, 1, height, width))?
             .contiguous()?;
-        let best_multimask_logits = multimask_logits
-            .contiguous()?
-            .gather(&best_mask_index, 1)?;
+        let best_multimask_logits = multimask_logits.contiguous()?.gather(&best_mask_index, 1)?;
         let best_iou_index = best_scores_inds.unsqueeze(1)?.contiguous()?;
         let best_multimask_iou_scores = multimask_iou_scores
             .contiguous()?
@@ -598,22 +592,14 @@ impl Sam3TrackerMaskDecoder {
         ))?;
         let tokens = Tensor::cat(&[&output_tokens, sparse_prompt_embeddings], 1)?;
 
-        let src = if repeat_image {
-            repeat_interleave(image_embeddings, batch_size, 0)?
-        } else if image_embeddings.dim(0)? == batch_size {
-            image_embeddings.clone()
-        } else {
-            candle::bail!(
-                "tracker mask decoder expected image embeddings batch {} to match prompt batch {batch_size}",
-                image_embeddings.dim(0)?
-            );
-        };
+        let src = decoder_image_batch(
+            image_embeddings,
+            batch_size,
+            repeat_image,
+            "image embeddings",
+        )?;
         let src = src.broadcast_add(dense_prompt_embeddings)?;
-        let pos_src = if repeat_image {
-            repeat_interleave(image_pe, batch_size, 0)?
-        } else {
-            image_pe.broadcast_as(src.shape())?
-        };
+        let pos_src = decoder_position_batch(image_pe, &src, batch_size, repeat_image)?;
 
         let (hs, src) = self.transformer.forward(&src, &pos_src, &tokens)?;
         let token_offset = if self.pred_obj_score_head.is_some() {
@@ -627,8 +613,11 @@ impl Sam3TrackerMaskDecoder {
         } else {
             None
         };
-        let mask_tokens_out =
-            hs.i((.., token_offset + 1..token_offset + 1 + self.num_mask_tokens, ..))?;
+        let mask_tokens_out = hs.i((
+            ..,
+            token_offset + 1..token_offset + 1 + self.num_mask_tokens,
+            ..,
+        ))?;
         let (_, channels, height, width) = image_embeddings.dims4()?;
         let src = src
             .transpose(1, 2)?
@@ -678,8 +667,50 @@ impl Sam3TrackerMaskDecoder {
     }
 }
 
+fn decoder_image_batch(
+    tensor: &Tensor,
+    batch_size: usize,
+    repeat_image: bool,
+    label: &str,
+) -> Result<Tensor> {
+    let image_batch = tensor.dim(0)?;
+    if image_batch == batch_size {
+        return Ok(tensor.clone());
+    }
+    if repeat_image {
+        if image_batch != 1 {
+            candle::bail!(
+                "tracker mask decoder can only repeat single-image {label}, got batch {image_batch} for prompt batch {batch_size}"
+            );
+        }
+        repeat_interleave(tensor, batch_size, 0)
+    } else {
+        candle::bail!(
+            "tracker mask decoder expected {label} batch {image_batch} to match prompt batch {batch_size}"
+        )
+    }
+}
+
+fn decoder_position_batch(
+    image_pe: &Tensor,
+    src: &Tensor,
+    batch_size: usize,
+    repeat_image: bool,
+) -> Result<Tensor> {
+    let pe_batch = image_pe.dim(0)?;
+    let src_batch = src.dim(0)?;
+    if pe_batch == src_batch {
+        return Ok(image_pe.clone());
+    }
+    if repeat_image && pe_batch == 1 {
+        repeat_interleave(image_pe, batch_size, 0)
+    } else {
+        image_pe.broadcast_as(src.shape())
+    }
+}
+
 impl Sam3TrackerModel {
-    pub(super) fn forward_sam_heads_internal(
+    fn forward_sam_heads_impl(
         &self,
         backbone_features: &Tensor,
         point_prompt: Option<&(Tensor, Tensor)>,
@@ -687,7 +718,8 @@ impl Sam3TrackerModel {
         high_res_features: Option<&[Tensor]>,
         multimask_output: bool,
         is_cond_frame: bool,
-    ) -> Result<(Tensor, Tensor, TrackerFrameState)> {
+        return_multimasks: bool,
+    ) -> Result<(Option<Tensor>, Option<Tensor>, TrackerFrameState)> {
         let batch_size = backbone_features.dim(0)?;
         let device = backbone_features.device();
         let (sam_point_coords, sam_point_labels) = match point_prompt {
@@ -739,11 +771,15 @@ impl Sam3TrackerModel {
                 false,
                 high_res_features,
             )?;
-        let high_res_multimasks = low_res_multimasks.upsample_bilinear2d(
-            self.config.image_size,
-            self.config.image_size,
-            false,
-        )?;
+        let high_res_multimasks = if return_multimasks {
+            Some(low_res_multimasks.upsample_bilinear2d(
+                self.config.image_size,
+                self.config.image_size,
+                false,
+            )?)
+        } else {
+            None
+        };
         let object_present = object_score_logits.gt(0f64)?;
         let (low_res_masks, high_res_masks, sam_output_token) = if multimask_output {
             let best_iou_indices = ious.argmax(1)?.contiguous()?;
@@ -783,10 +819,19 @@ impl Sam3TrackerModel {
                 self.config.image_size,
                 false,
             )?;
-            (low_res_masks, high_res_masks, sam_output_tokens.i((.., 0, ..))?)
+            (
+                low_res_masks,
+                high_res_masks,
+                sam_output_tokens.i((.., 0, ..))?,
+            )
         };
         let obj_ptr = self.obj_ptr_proj.forward(&sam_output_token)?;
         let object_present_for_ptr = gate_object_ptr(&obj_ptr, &object_present, &self.no_obj_ptr)?;
+        let low_res_multimasks = if return_multimasks {
+            Some(low_res_multimasks)
+        } else {
+            None
+        };
         Ok((
             low_res_multimasks,
             high_res_multimasks,
@@ -806,6 +851,31 @@ impl Sam3TrackerModel {
         ))
     }
 
+    pub(super) fn forward_sam_heads_internal(
+        &self,
+        backbone_features: &Tensor,
+        point_prompt: Option<&(Tensor, Tensor)>,
+        mask_inputs: Option<&Tensor>,
+        high_res_features: Option<&[Tensor]>,
+        multimask_output: bool,
+        is_cond_frame: bool,
+    ) -> Result<(Tensor, Tensor, TrackerFrameState)> {
+        let (low_res_multimasks, high_res_multimasks, state) = self.forward_sam_heads_impl(
+            backbone_features,
+            point_prompt,
+            mask_inputs,
+            high_res_features,
+            multimask_output,
+            is_cond_frame,
+            true,
+        )?;
+        let low_res_multimasks =
+            low_res_multimasks.expect("return_multimasks requested low-res multimasks");
+        let high_res_multimasks =
+            high_res_multimasks.expect("return_multimasks requested high-res multimasks");
+        Ok((low_res_multimasks, high_res_multimasks, state))
+    }
+
     pub(super) fn forward_sam_heads(
         &self,
         backbone_features: &Tensor,
@@ -815,13 +885,14 @@ impl Sam3TrackerModel {
         multimask_output: bool,
         is_cond_frame: bool,
     ) -> Result<TrackerFrameState> {
-        let (_, _, state) = self.forward_sam_heads_internal(
+        let (_, _, state) = self.forward_sam_heads_impl(
             backbone_features,
             point_prompt,
             mask_inputs,
             high_res_features,
             multimask_output,
             is_cond_frame,
+            false,
         )?;
         Ok(state)
     }
@@ -905,17 +976,28 @@ impl Sam3TrackerModel {
     }
 }
 
-fn gate_selected_masks(low_res_masks: &Tensor, object_present: &Tensor, _device: &Device) -> Result<Tensor> {
-    let present = object_present
-        .to_dtype(low_res_masks.dtype())?
-        .reshape((object_present.dim(0)?, 1, 1, 1))?;
+fn gate_selected_masks(
+    low_res_masks: &Tensor,
+    object_present: &Tensor,
+    _device: &Device,
+) -> Result<Tensor> {
+    let present = object_present.to_dtype(low_res_masks.dtype())?.reshape((
+        object_present.dim(0)?,
+        1,
+        1,
+        1,
+    ))?;
     let absent = present.affine(-1.0, 1.0)?;
     low_res_masks
         .broadcast_mul(&present)?
         .broadcast_add(&absent.affine(NO_OBJ_SCORE, 0.0)?)
 }
 
-fn gate_object_ptr(obj_ptr: &Tensor, object_present: &Tensor, no_obj_ptr: &Tensor) -> Result<Tensor> {
+fn gate_object_ptr(
+    obj_ptr: &Tensor,
+    object_present: &Tensor,
+    no_obj_ptr: &Tensor,
+) -> Result<Tensor> {
     let present = object_present.to_dtype(obj_ptr.dtype())?;
     let absent = present.affine(-1.0, 1.0)?;
     let no_obj_ptr = maybe_to_device_dtype(no_obj_ptr, obj_ptr.device(), obj_ptr.dtype())?;
