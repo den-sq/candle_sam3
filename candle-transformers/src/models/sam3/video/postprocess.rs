@@ -278,61 +278,57 @@ fn apply_object_wise_non_overlapping_constraints(
 }
 
 pub(super) fn mask_to_normalized_xyxy(mask: &Tensor) -> Result<Tensor> {
-    let original_device = mask.device().clone();
     let mask = match mask.rank() {
         4 => mask.i((0, 0))?,
         3 => mask.i(0)?,
         2 => mask.clone(),
         rank => candle::bail!("expected mask rank 2, 3, or 4, got {}", rank),
     };
+    let device = mask.device();
     let (height, width) = mask.dims2()?;
     if height == 0 || width == 0 {
-        return Tensor::zeros((1, 4), DType::F32, &original_device);
+        return Tensor::zeros((1, 4), DType::F32, device);
     }
-    // Keep box extraction deterministic across backends; CUDA argmax/flip based
-    // reductions produced stale-looking boxes for valid video masks.
-    let mask = if mask.device().same_device(&Device::Cpu) {
-        mask
-    } else {
-        mask.to_device(&Device::Cpu)?
-    };
-    let mask_values = mask.to_vec2::<f32>()?;
-    let mut min_x = width;
-    let mut min_y = height;
-    let mut max_x = 0usize;
-    let mut max_y = 0usize;
-    let mut found = false;
-    for (y, row) in mask_values.iter().enumerate() {
-        for (x, value) in row.iter().enumerate() {
-            if *value >= 0.5 {
-                min_x = min_x.min(x);
-                min_y = min_y.min(y);
-                max_x = max_x.max(x);
-                max_y = max_y.max(y);
-                found = true;
-            }
-        }
-    }
-    if !found {
-        return Tensor::zeros((1, 4), DType::F32, &original_device);
-    }
-    let width_scale = width.max(1) as f32;
-    let height_scale = height.max(1) as f32;
-    let boxes = Tensor::from_vec(
-        vec![
-            min_x as f32 / width_scale,
-            min_y as f32 / height_scale,
-            max_x as f32 / width_scale,
-            max_y as f32 / height_scale,
+
+    let mask_present = mask.ge(0.5f64)?;
+    let shape = (height, width);
+    let x_coords = Tensor::arange(0u32, width as u32, device)?
+        .to_dtype(DType::F32)?
+        .reshape((1, width))?
+        .broadcast_as(shape)?;
+    let y_coords = Tensor::arange(0u32, height as u32, device)?
+        .to_dtype(DType::F32)?
+        .reshape((height, 1))?
+        .broadcast_as(shape)?;
+    let hidden_x = Tensor::full(width as f32, shape, device)?;
+    let hidden_y = Tensor::full(height as f32, shape, device)?;
+    let empty_coord = Tensor::full(-1f32, shape, device)?;
+
+    let min_x = mask_present.where_cond(&x_coords, &hidden_x)?.min_all()?;
+    let min_y = mask_present.where_cond(&y_coords, &hidden_y)?.min_all()?;
+    let max_x = mask_present
+        .where_cond(&x_coords, &empty_coord)?
+        .max_all()?;
+    let max_y = mask_present
+        .where_cond(&y_coords, &empty_coord)?
+        .max_all()?;
+    let width_scale = width.max(1) as f64;
+    let height_scale = height.max(1) as f64;
+    let boxes = Tensor::stack(
+        &[
+            min_x.affine(1.0 / width_scale, 0.0)?,
+            min_y.affine(1.0 / height_scale, 0.0)?,
+            max_x.affine(1.0 / width_scale, 0.0)?,
+            max_y.affine(1.0 / height_scale, 0.0)?,
         ],
-        (1, 4),
-        &Device::Cpu,
-    )?;
-    if original_device.same_device(&Device::Cpu) {
-        Ok(boxes)
-    } else {
-        boxes.to_device(&original_device)
-    }
+        0,
+    )?
+    .reshape((1, 4))?;
+
+    let has_foreground = mask_present.to_dtype(DType::F32)?.max_all()?.gt(0f64)?;
+    has_foreground
+        .broadcast_as((1, 4))?
+        .where_cond(&boxes, &Tensor::zeros((1, 4), DType::F32, device)?)
 }
 
 pub(super) fn resize_mask_logits_to_video(
@@ -681,6 +677,19 @@ mod tests {
             .iter()
             .zip(expected)
             .all(|(actual, expected)| (actual - expected).abs() <= 1e-6));
+        Ok(())
+    }
+
+    #[test]
+    fn mask_to_normalized_xyxy_returns_zero_box_for_empty_masks() -> Result<()> {
+        let device = Device::Cpu;
+        let mask = Tensor::zeros((3, 4), DType::F32, &device)?;
+
+        let actual = mask_to_normalized_xyxy(&mask)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+
+        assert_eq!(actual, vec![0.0f32; 4]);
         Ok(())
     }
 
