@@ -352,7 +352,10 @@ fn compute_tracker_axial_freqs(
         .broadcast_as((end_y, end_x, rotary_dim))?
         .flatten(0, 1)?;
 
-    Ok((Tensor::cat(&[&x_real, &y_real], 1)?, Tensor::cat(&[&x_imag, &y_imag], 1)?))
+    Ok((
+        Tensor::cat(&[&x_real, &y_real], 1)?,
+        Tensor::cat(&[&x_imag, &y_imag], 1)?,
+    ))
 }
 
 fn apply_tracker_rotary_single(
@@ -376,6 +379,39 @@ fn apply_tracker_rotary_single(
         .to_dtype(xs_dtype)
 }
 
+fn apply_tracker_rotary_repeated(
+    xs: &Tensor,
+    freqs_real: &Tensor,
+    freqs_imag: &Tensor,
+    repeat_factor: usize,
+) -> Result<Tensor> {
+    let (batch_size, num_heads, seq_len, head_dim) = xs.dims4()?;
+    if repeat_factor == 0 || seq_len % repeat_factor != 0 {
+        candle::bail!(
+            "tracker rotary repeated frequency factor {repeat_factor} does not divide sequence length {seq_len}"
+        );
+    }
+    let block_len = seq_len / repeat_factor;
+    let xs_dtype = xs.dtype();
+    let xs = xs.to_dtype(DType::F32)?.reshape((
+        batch_size,
+        num_heads,
+        repeat_factor,
+        block_len,
+        head_dim / 2,
+        2,
+    ))?;
+    let xs_real = xs.i((.., .., .., .., .., 0))?;
+    let xs_imag = xs.i((.., .., .., .., .., 1))?;
+    let freqs_real = freqs_real.reshape((1, 1, 1, block_len, head_dim / 2))?;
+    let freqs_imag = freqs_imag.reshape((1, 1, 1, block_len, head_dim / 2))?;
+    let real = (xs_real.broadcast_mul(&freqs_real)? - xs_imag.broadcast_mul(&freqs_imag)?)?;
+    let imag = (xs_real.broadcast_mul(&freqs_imag)? + xs_imag.broadcast_mul(&freqs_real)?)?;
+    Tensor::stack(&[&real, &imag], 5)?
+        .reshape((batch_size, num_heads, seq_len, head_dim))?
+        .to_dtype(xs_dtype)
+}
+
 fn apply_tracker_axial_rotary(
     q: &Tensor,
     k: &Tensor,
@@ -394,20 +430,18 @@ fn apply_tracker_axial_rotary(
     if num_k_rope == 0 {
         return Ok((q, k.clone()));
     }
-    let mut k_freqs_real = q_freqs_real.clone();
-    let mut k_freqs_imag = q_freqs_imag.clone();
-    if num_k_rope != q_seq_len {
+    let k_rope = k.narrow(2, 0, num_k_rope)?;
+    let k_rope = if num_k_rope != q_seq_len {
         if !repeat_freqs_k || num_k_rope % q_seq_len != 0 {
             candle::bail!(
                 "tracker rotary expected key rope length {num_k_rope} to equal query length {q_seq_len} or be a whole-number repeat"
             );
         }
         let repeat_factor = num_k_rope / q_seq_len;
-        k_freqs_real = k_freqs_real.repeat((repeat_factor, 1))?;
-        k_freqs_imag = k_freqs_imag.repeat((repeat_factor, 1))?;
-    }
-    let k_rope = k.narrow(2, 0, num_k_rope)?;
-    let k_rope = apply_tracker_rotary_single(&k_rope, &k_freqs_real, &k_freqs_imag)?;
+        apply_tracker_rotary_repeated(&k_rope, &q_freqs_real, &q_freqs_imag, repeat_factor)?
+    } else {
+        apply_tracker_rotary_single(&k_rope, &q_freqs_real, &q_freqs_imag)?
+    };
     let k = if num_k_rope < k_seq_len {
         let k_tail = k.narrow(2, num_k_rope, k_seq_len - num_k_rope)?;
         Tensor::cat(&[&k_rope, &k_tail], 2)?

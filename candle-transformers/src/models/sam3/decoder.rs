@@ -285,7 +285,7 @@ impl DecoderLayer {
         memory_text: &Tensor,
         text_attention_mask: &Tensor,
         memory: &Tensor,
-        memory_key_padding_mask: &Tensor,
+        memory_key_padding_mask: Option<&Tensor>,
         memory_pos: &Tensor,
         cross_attn_mask: Option<&Tensor>,
         presence_token: Option<&Tensor>,
@@ -359,7 +359,7 @@ impl DecoderLayer {
         let image_attn_out = self.cross_attn_image.forward(
             &tgt,
             memory,
-            Some(memory_key_padding_mask),
+            memory_key_padding_mask,
             Some(&tgt_query_pos),
             Some(memory_pos),
             cross_attn_mask.as_ref(),
@@ -597,7 +597,9 @@ impl Sam3TransformerDecoder {
                 prompt_features,
                 prompt_mask,
                 &encoder_out.memory,
-                &encoder_out.padding_mask,
+                // Fusion image memory is dense/all-valid, so avoid building a zero additive
+                // attention mask for every decoder image-cross layer.
+                None,
                 &encoder_out.pos_embed,
                 cross_attn_mask.as_ref(),
                 presence_state.as_ref(),
@@ -893,4 +895,3 @@ fn box_cxcywh_to_xyxy(boxes: &Tensor) -> Result<Tensor> {
     }
     Tensor::from_vec(xyxy, (batch_size, num_queries, 4), device)
 }
-

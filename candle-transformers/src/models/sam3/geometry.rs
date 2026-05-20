@@ -171,17 +171,14 @@ impl GeometryEncoderLayer {
         prompt_feats: &Tensor,
         vision_feats: &Tensor,
         vision_pos_encoding: &Tensor,
-        prompt_padding_mask: &Tensor,
+        prompt_padding_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let residual = prompt_feats;
         let hidden_states = self.norm1.forward(prompt_feats)?;
 
-        let hidden_states = self.self_attn.forward(
-            &hidden_states,
-            &hidden_states,
-            Some(prompt_padding_mask),
-            None,
-        )?;
+        let hidden_states =
+            self.self_attn
+                .forward(&hidden_states, &hidden_states, prompt_padding_mask, None)?;
 
         let hidden_states = (hidden_states + residual)?;
 
@@ -415,8 +412,7 @@ impl SequenceGeometryEncoder {
         debug::capture_tensor("geometry/features_initial_norm", &features)?;
 
         for (layer_idx, layer) in self.encode.iter().enumerate() {
-            features =
-                layer.forward(&features, &vision_feats, &vision_pos_embeds, &padding_mask)?;
+            features = layer.forward(&features, &vision_feats, &vision_pos_embeds, None)?;
             debug::capture_tensor(
                 &format!("geometry/features_after_layer_{}", layer_idx),
                 &features,
@@ -1278,4 +1274,3 @@ fn cxcywh_to_xyxy(cx: f32, cy: f32, w: f32, h: f32) -> (f32, f32, f32, f32) {
     let half_h = h * 0.5;
     (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
 }
-

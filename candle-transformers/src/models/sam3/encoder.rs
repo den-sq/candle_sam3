@@ -1,4 +1,4 @@
-use candle::{DType, Device, Result, Tensor};
+use candle::{DType, Result, Tensor};
 use candle_nn::{LayerNorm, Linear, Module, VarBuilder};
 
 use super::config::EncoderConfig;
@@ -219,10 +219,8 @@ impl Sam3FusionEncoder {
         };
         let (memory_parts, pos_parts, spatial_shapes, level_start_index, valid_ratios, batch_size) =
             prepare_multilevel_features(&selected_features, &selected_pos, pooled_prompt.as_ref())?;
-        let memory_refs: Vec<&Tensor> = memory_parts.iter().collect();
-        let pos_refs: Vec<&Tensor> = pos_parts.iter().collect();
-        let mut memory = Tensor::cat(&memory_refs, 0)?;
-        let pos_embed = Tensor::cat(&pos_refs, 0)?;
+        let mut memory = cat_parts_or_clone(&memory_parts, 0)?;
+        let pos_embed = cat_parts_or_clone(&pos_parts, 0)?;
         for layer in self.layers.iter() {
             memory = layer.forward(
                 &memory,
@@ -252,6 +250,17 @@ fn normalize_padding_mask(mask: &Tensor, batch_size: usize, seq_len: usize) -> R
             "sam3 fusion encoder expected padding mask shape ({batch_size}, {seq_len}) or ({seq_len}, {batch_size}), got {shape:?}"
         ),
     }
+}
+
+fn cat_parts_or_clone(tensors: &[Tensor], dim: usize) -> Result<Tensor> {
+    if tensors.is_empty() {
+        candle::bail!("sam3 fusion encoder expected at least one tensor to concatenate")
+    }
+    if tensors.len() == 1 {
+        return Ok(tensors[0].clone());
+    }
+    let refs = tensors.iter().collect::<Vec<_>>();
+    Tensor::cat(refs.as_slice(), dim)
 }
 
 fn select_feature_levels<'a>(
@@ -287,8 +296,8 @@ fn prepare_multilevel_features(
 ) -> Result<(Vec<Tensor>, Vec<Tensor>, Tensor, Tensor, Tensor, usize)> {
     let mut memory_parts = Vec::with_capacity(visual_features.len());
     let mut pos_parts = Vec::with_capacity(visual_pos_embeds.len());
-    let mut spatial_shape_parts = Vec::with_capacity(visual_features.len());
-    let mut level_start_index_parts = Vec::with_capacity(visual_features.len());
+    let mut spatial_shape_values = Vec::with_capacity(visual_features.len() * 2);
+    let mut level_start_index_values = Vec::with_capacity(visual_features.len());
     let mut current_offset = 0u32;
     let mut batch_size = None;
     let device = visual_features[0].device();
@@ -328,16 +337,16 @@ fn prepare_multilevel_features(
             batch,
             channels,
         ))?);
-        level_start_index_parts.push(singleton_u32(device, current_offset)?);
+        level_start_index_values.push(current_offset);
         current_offset += (height * width) as u32;
-        spatial_shape_parts.push(pair_u32(device, height as u32, width as u32)?);
+        spatial_shape_values.push(height as u32);
+        spatial_shape_values.push(width as u32);
     }
 
     let batch_size = batch_size.unwrap_or(0);
-    let spatial_shape_refs = spatial_shape_parts.iter().collect::<Vec<_>>();
-    let spatial_shapes = Tensor::stack(spatial_shape_refs.as_slice(), 0)?;
-    let level_start_index_refs = level_start_index_parts.iter().collect::<Vec<_>>();
-    let level_start_index = Tensor::cat(level_start_index_refs.as_slice(), 0)?;
+    let level_count = visual_features.len();
+    let spatial_shapes = Tensor::from_vec(spatial_shape_values, (level_count, 2), device)?;
+    let level_start_index = Tensor::from_vec(level_start_index_values, level_count, device)?;
     let valid_ratios = Tensor::ones((batch_size, visual_features.len(), 2), DType::F32, device)?;
     Ok((
         memory_parts,
@@ -347,16 +356,6 @@ fn prepare_multilevel_features(
         valid_ratios,
         batch_size,
     ))
-}
-
-fn singleton_u32(device: &Device, value: u32) -> Result<Tensor> {
-    Tensor::arange(value, value + 1, device)
-}
-
-fn pair_u32(device: &Device, first: u32, second: u32) -> Result<Tensor> {
-    let first = singleton_u32(device, first)?;
-    let second = singleton_u32(device, second)?;
-    Tensor::cat(&[&first, &second], 0)
 }
 
 fn pool_prompt_feat(prompt: &Tensor, prompt_mask: &Tensor, pool_with_mask: bool) -> Result<Tensor> {
