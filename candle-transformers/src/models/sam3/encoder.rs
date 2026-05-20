@@ -133,7 +133,7 @@ impl FusionEncoderLayer {
         &self,
         tgt: &Tensor,
         prompt: &Tensor,
-        tgt_padding_mask: &Tensor,
+        tgt_padding_mask: Option<&Tensor>,
         prompt_padding_mask: &Tensor,
         query_pos: &Tensor,
     ) -> Result<Tensor> {
@@ -142,7 +142,7 @@ impl FusionEncoderLayer {
         let hidden_states = self.self_attn.forward(
             &hidden_states,
             &hidden_states,
-            Some(tgt_padding_mask),
+            tgt_padding_mask,
             Some(query_pos),
             Some(query_pos),
         )?;
@@ -223,16 +223,16 @@ impl Sam3FusionEncoder {
         let pos_refs: Vec<&Tensor> = pos_parts.iter().collect();
         let mut memory = Tensor::cat(&memory_refs, 0)?;
         let pos_embed = Tensor::cat(&pos_refs, 0)?;
-        let padding_mask = Tensor::zeros((memory.dim(0)?, batch_size), DType::U8, memory.device())?;
         for layer in self.layers.iter() {
             memory = layer.forward(
                 &memory,
                 &prompt.features,
-                &padding_mask,
+                None,
                 &prompt.padding_mask,
                 &pos_embed,
             )?;
         }
+        let padding_mask = Tensor::zeros((memory.dim(0)?, batch_size), DType::U8, memory.device())?;
         Ok(FusionEncoderOutput {
             memory,
             pos_embed,
@@ -377,4 +377,3 @@ fn pool_prompt_feat(prompt: &Tensor, prompt_mask: &Tensor, pool_with_mask: bool)
         .broadcast_div(&is_valid.sum(0)?.clamp(1e-6, f64::MAX)?)?;
     pooled_prompt.reshape((batch_size, hidden_size))
 }
-
