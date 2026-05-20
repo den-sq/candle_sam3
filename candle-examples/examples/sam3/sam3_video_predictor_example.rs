@@ -92,7 +92,7 @@ pub(crate) fn run(
         }))?,
     )?;
 
-    let source = sam3::VideoSource::from_path(
+    let source: sam3::VideoSource = sam3::VideoSource::from_path(
         video_path
             .to_str()
             .context("video notebook path is not valid UTF-8")?,
