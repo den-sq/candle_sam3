@@ -52,6 +52,26 @@ fn softmax(device: &Device) -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn softmax_last_dim_cpu_accumulates_f32_denominator_wide() -> Result<()> {
+    let small_logit = -18.420681f32; // ln(1e-8), rounded to f32.
+    let mut logits = vec![small_logit; 5001];
+    logits[0] = 0.0;
+    let tensor = Tensor::from_vec(logits, (1, 5001), &Device::Cpu)?;
+    let probs = candle_nn::ops::softmax_last_dim(&tensor)?.to_vec2::<f32>()?;
+
+    let small_exp = small_logit.exp() as f64;
+    let expected_first = (1.0 / (1.0 + 5000.0 * small_exp)) as f32;
+    let diff = (probs[0][0] - expected_first).abs();
+    assert!(
+        diff < 1e-7,
+        "first probability {actual:.9} differed from wide-denominator expected {expected:.9}",
+        actual = probs[0][0],
+        expected = expected_first,
+    );
+    Ok(())
+}
+
 fn rms_norm(device: &Device) -> Result<()> {
     let data = &[[[3f32, 1., 4.], [1., 5., 9.]], [[2., 1., 7.], [8., 2., 8.]]];
     let tensor = Tensor::new(data, device)?;

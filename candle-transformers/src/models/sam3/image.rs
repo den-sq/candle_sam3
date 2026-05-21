@@ -629,6 +629,65 @@ mod tests {
 
     #[test]
     #[ignore = "manual vision trunk parity investigation"]
+    fn image_trunk_debug_blocks_7_and_8_from_reference_input_prints_stage_diffs() -> Result<()> {
+        let dev = Device::Cpu;
+        let checkpoint_dir = sam3_test_checkpoint_dir();
+        let model = Sam3ImageModel::from_upstream_pth(
+            &Config::default(),
+            checkpoint_dir.join("sam3.pt"),
+            candle::DType::F32,
+            &dev,
+        )?;
+        let reference = candle::safetensors::load(
+            vision_trunk_debug_propagated_bundle_dir().join("reference.safetensors"),
+            &dev,
+        )?;
+        let image = reference
+            .get("inputs.image")
+            .ok_or_else(|| {
+                candle::Error::Msg(
+                    "propagated vision trunk bundle is missing inputs.image".to_owned(),
+                )
+            })?
+            .clone();
+        let (_trunk, _block_outputs, debug_tensors) =
+            model.encode_image_trunk_with_debug_blocks(&image, &[7, 8])?;
+
+        for block_index in [7usize, 8] {
+            for stage_suffix in [
+                "input",
+                "norm1",
+                "attn_output",
+                "post_attn",
+                "norm2",
+                "mlp_fc1",
+                "mlp_gelu",
+                "mlp_output",
+                "output",
+            ] {
+                let stage_name = format!("vision.block_debug.{block_index}.{stage_suffix}");
+                let actual = debug_tensors
+                    .get(&stage_name)
+                    .ok_or_else(|| {
+                        candle::Error::Msg(format!(
+                            "runtime trunk debug output is missing required tensor {stage_name}"
+                        ))
+                    })?
+                    .permute((0, 3, 1, 2))?;
+                let expected = reference.get(&stage_name).ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "propagated vision trunk bundle is missing required tensor {stage_name}"
+                    ))
+                })?;
+                let max_abs_diff = tensor_max_abs_diff(&actual, expected)?;
+                println!("{stage_name}: max_abs_diff={max_abs_diff:.9}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "manual vision trunk parity investigation"]
     fn image_trunk_blocks_7_and_8_debug_bundle_match_reference() -> Result<()> {
         let dev = Device::Cpu;
         let checkpoint_dir = sam3_test_checkpoint_dir();
@@ -875,6 +934,12 @@ mod tests {
         std::env::var("SAM3_TEST_CHECKPOINT_DIR")
             .map(PathBuf::from)
             .expect("SAM3_TEST_CHECKPOINT_DIR must point at a directory containing sam3.pt")
+    }
+
+    fn vision_trunk_debug_propagated_bundle_dir() -> PathBuf {
+        std::env::var("SAM3_VITDET_DEBUG_PROPAGATED_BUNDLE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp/reference_box_positive_debug_b7_b8_current"))
     }
 
     fn vision_trunk_debug_bundle_dir(block_index: usize) -> PathBuf {
