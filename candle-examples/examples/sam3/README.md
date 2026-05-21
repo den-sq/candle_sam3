@@ -7,6 +7,9 @@ fixture-generation tooling.
 For parity/export workflows, use the sibling repo at
 `/home/dnorthover/ChengCode/sam_parity`.
 
+For the issue-10 CPU encoder-drift tradeoff notes, see
+[`ISSUE10_ENCODER_DRIFT_NOTES.md`](ISSUE10_ENCODER_DRIFT_NOTES.md).
+
 ## Supported Runtime Flows
 
 - text-guided image prediction
