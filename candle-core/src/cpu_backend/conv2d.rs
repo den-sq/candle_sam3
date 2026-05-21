@@ -40,6 +40,9 @@ impl Map2 for Conv2D<'_> {
             // although with large enough input size, tiled will start beating it.
             return conv2d_im2col_gemm(p, inp, inp_l, k, k_l);
         }
+        if p.padding == 0 && p.dilation == 1 && p.stride == p.k_h && p.k_h == p.k_w && p.c_in == 3 {
+            return conv2d_patchify_direct(p, inp, inp_l, k, k_l);
+        }
         // TODO other cases
 
         // No fast path, fallback to default general impl.
@@ -265,6 +268,54 @@ fn conv2d_tiled<T: WithDType + num_traits::Num + Copy + 'static>(
             Ok::<(), crate::Error>(())
         })
     })?;
+
+    Ok(dst)
+}
+
+/// Specialization for ViT-style non-overlapping patch embeddings.
+///
+/// PyTorch's CPU convolution for this SAM3 patchify layer uses a different
+/// reduction order than Candle's tiled-im2col GEMM path. Keeping the scalar
+/// patch order here reduces the seed drift before the ViT trunk amplifies it.
+fn conv2d_patchify_direct<T: WithDType + num_traits::Num + Copy + 'static>(
+    p: &ParamsConv2D,
+    inp: &[T],
+    inp_l: &Layout,
+    k: &[T],
+    k_l: &Layout,
+) -> Result<Vec<T>> {
+    let inp = &inp[inp_l.start_offset()..];
+    let (inp_s0, inp_s1, inp_s2, inp_s3) = crate::shape::dims4(inp_l.stride())?;
+    let k = &k[k_l.start_offset()..];
+    let (k_s0, k_s1, k_s2, k_s3) = crate::shape::dims4(k_l.stride())?;
+    let (out_h, out_w) = (p.out_h(), p.out_w());
+    let output_len = p.b_size * p.c_out * out_h * out_w;
+
+    let dst = (0..output_len)
+        .into_par_iter()
+        .map(|dst_idx| {
+            let out_x = dst_idx % out_w;
+            let out_y = (dst_idx / out_w) % out_h;
+            let dst_c_idx = (dst_idx / (out_h * out_w)) % p.c_out;
+            let b_idx = dst_idx / (p.c_out * out_h * out_w);
+            let in_y_base = out_y * p.stride;
+            let in_x_base = out_x * p.stride;
+            let mut acc = T::zero();
+            for kh in 0..p.k_h {
+                for kw in 0..p.k_w {
+                    for c_in_idx in 0..p.c_in {
+                        let inp_idx = b_idx * inp_s0
+                            + c_in_idx * inp_s1
+                            + (in_y_base + kh) * inp_s2
+                            + (in_x_base + kw) * inp_s3;
+                        let k_idx = dst_c_idx * k_s0 + c_in_idx * k_s1 + kh * k_s2 + kw * k_s3;
+                        acc = acc + inp[inp_idx] * k[k_idx];
+                    }
+                }
+            }
+            acc
+        })
+        .collect();
 
     Ok(dst)
 }

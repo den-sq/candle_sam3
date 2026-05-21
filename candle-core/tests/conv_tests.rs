@@ -932,6 +932,34 @@ fn conv2d_c_eq_h_eq_w(dev: &Device) -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn conv2d_patchify_stride_matches_scalar_order_cpu() -> Result<()> {
+    let dev = &Device::Cpu;
+    let input_values = [
+        1e20f32, 3., 5., 7., 1., 1e20, 1e20, 11., -1e20, -1e20, -1e20, 13.,
+    ];
+    let t = Tensor::new(&input_values, dev)?.reshape((1, 3, 2, 2))?;
+    let w = Tensor::ones((1, 3, 2, 2), candle_core::DType::F32, dev)?;
+    let res = t.conv2d(&w, 0, 2, 1, 1)?;
+    assert_eq!(res.dims(), [1, 1, 1, 1]);
+
+    let mut expected = 0f32;
+    for kh in 0..2 {
+        for kw in 0..2 {
+            for c in 0..3 {
+                expected += input_values[c * 4 + kh * 2 + kw];
+            }
+        }
+    }
+
+    let actual = res.i((0, 0, 0, 0))?.to_scalar::<f32>()?;
+    assert_eq!(
+        actual, expected,
+        "patchify conv should preserve kh/kw/channel scalar accumulation order"
+    );
+    Ok(())
+}
+
 test_device!(conv1d, conv1d_cpu, conv1d_gpu, conv1d_metal);
 test_device!(
     conv1d_small,

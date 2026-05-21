@@ -488,16 +488,17 @@ fn encoded_prompt_from_text(text: &TextEncoding) -> EncodedPrompt {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::path::PathBuf;
 
     use super::{GroundingOutput, ImageSize, Sam3ImageState};
     use candle::{Device, Result, Tensor};
-    use candle_nn::VarBuilder;
+    use candle_nn::{Module, VarBuilder};
 
     use crate::models::sam3::Sam3ImageModel;
     use crate::models::sam3::{
         Config, DecoderConfig, EncoderConfig, GeometryConfig, GeometryPrompt, ImageConfig,
-        NeckConfig, SegmentationConfig, TextConfig, VisionConfig,
+        NeckConfig, Sam3CheckpointSource, SegmentationConfig, TextConfig, VisionConfig,
     };
 
     #[test]
@@ -629,7 +630,7 @@ mod tests {
 
     #[test]
     #[ignore = "manual vision trunk parity investigation"]
-    fn image_trunk_debug_blocks_7_and_8_from_reference_input_prints_stage_diffs() -> Result<()> {
+    fn image_trunk_issue10_debug_from_reference_input_prints_stage_diffs() -> Result<()> {
         let dev = Device::Cpu;
         let checkpoint_dir = sam3_test_checkpoint_dir();
         let model = Sam3ImageModel::from_upstream_pth(
@@ -650,10 +651,16 @@ mod tests {
                 )
             })?
             .clone();
-        let (_trunk, _block_outputs, debug_tensors) =
-            model.encode_image_trunk_with_debug_blocks(&image, &[7, 8])?;
+        let debug_blocks = discover_debug_blocks(&reference);
+        if debug_blocks.is_empty() {
+            candle::bail!("propagated vision trunk bundle contains no block debug tensors");
+        }
+        let (_trunk, block_outputs, debug_tensors) =
+            model.encode_image_trunk_with_debug_blocks(&image, &debug_blocks)?;
 
-        for block_index in [7usize, 8] {
+        print_pre_block_diffs(&debug_tensors, &reference)?;
+        print_same_input_ln_pre_diff(&reference, &checkpoint_dir, &dev)?;
+        for &block_index in &debug_blocks {
             for stage_suffix in [
                 "input",
                 "norm1",
@@ -682,6 +689,29 @@ mod tests {
                 let max_abs_diff = tensor_max_abs_diff(&actual, expected)?;
                 println!("{stage_name}: max_abs_diff={max_abs_diff:.9}");
             }
+        }
+        let last_block_index = last_block_index_to_print(&reference, 8)?;
+        print_block_output_diffs(&block_outputs, &reference, last_block_index)?;
+        for &block_index in &debug_blocks {
+            print_block_residual_components(&debug_tensors, &reference, block_index)?;
+        }
+        let focus_label = format!("block{last_block_index}_output_argmax");
+        let focus_argmax = print_block_output_argmax(&block_outputs, &reference, last_block_index)?;
+        print_block_outputs_at_index(
+            &block_outputs,
+            &reference,
+            last_block_index,
+            focus_argmax,
+            &focus_label,
+        )?;
+        for &block_index in &debug_blocks {
+            print_block_residual_components_at_index(
+                &debug_tensors,
+                &reference,
+                block_index,
+                focus_argmax,
+                &focus_label,
+            )?;
         }
         Ok(())
     }
@@ -907,6 +937,15 @@ mod tests {
     }
 
     fn tensor_max_abs_diff(actual: &Tensor, expected: &Tensor) -> Result<f32> {
+        let (max_abs_diff, _flat_index, _actual, _expected) =
+            tensor_max_abs_diff_details(actual, expected)?;
+        Ok(max_abs_diff)
+    }
+
+    fn tensor_max_abs_diff_details(
+        actual: &Tensor,
+        expected: &Tensor,
+    ) -> Result<(f32, usize, f32, f32)> {
         if actual.dims() != expected.dims() {
             candle::bail!(
                 "shape mismatch actual={:?} expected={:?}",
@@ -922,12 +961,256 @@ mod tests {
             .to_dtype(candle::DType::F32)?
             .flatten_all()?
             .to_vec1::<f32>()?;
-        let max_abs_diff = actual
-            .iter()
-            .zip(expected.iter())
-            .map(|(lhs, rhs)| (lhs - rhs).abs())
-            .fold(0f32, f32::max);
-        Ok(max_abs_diff)
+        let (mut max_abs_diff, mut max_index) = (0f32, 0usize);
+        for (index, (lhs, rhs)) in actual.iter().zip(expected.iter()).enumerate() {
+            let diff = (lhs - rhs).abs();
+            if diff > max_abs_diff {
+                max_abs_diff = diff;
+                max_index = index;
+            }
+        }
+        Ok((
+            max_abs_diff,
+            max_index,
+            actual[max_index],
+            expected[max_index],
+        ))
+    }
+
+    fn discover_debug_blocks(reference: &HashMap<String, Tensor>) -> Vec<usize> {
+        let mut blocks = BTreeSet::new();
+        for key in reference.keys() {
+            let Some(rest) = key.strip_prefix("vision.block_debug.") else {
+                continue;
+            };
+            let Some((block_index, _stage)) = rest.split_once('.') else {
+                continue;
+            };
+            if let Ok(block_index) = block_index.parse::<usize>() {
+                blocks.insert(block_index);
+            }
+        }
+        blocks.into_iter().collect()
+    }
+
+    fn last_block_index_to_print(
+        reference: &HashMap<String, Tensor>,
+        preferred: usize,
+    ) -> Result<usize> {
+        if reference.contains_key(&format!("vision.block.{preferred}")) {
+            return Ok(preferred);
+        }
+        reference
+            .keys()
+            .filter_map(|key| key.strip_prefix("vision.block."))
+            .filter_map(|block_index| block_index.parse::<usize>().ok())
+            .max()
+            .ok_or_else(|| candle::Error::Msg("reference bundle contains no block outputs".into()))
+    }
+
+    fn print_pre_block_diffs(
+        debug_tensors: &BTreeMap<String, Tensor>,
+        reference: &HashMap<String, Tensor>,
+    ) -> Result<()> {
+        for stage_name in [
+            "vision.pre_block.patch_embed",
+            "vision.pre_block.pos_embed_added",
+            "vision.pre_block.ln_pre",
+        ] {
+            let Some(expected) = reference.get(stage_name) else {
+                continue;
+            };
+            let actual = debug_tensors
+                .get(stage_name)
+                .ok_or_else(|| candle::Error::Msg(format!("missing runtime {stage_name}")))?
+                .permute((0, 3, 1, 2))?;
+            let actual_dims = actual.dims().to_vec();
+            let (max_abs_diff, flat_index, actual_value, expected_value) =
+                tensor_max_abs_diff_details(&actual, expected)?;
+            let coord = unravel_index(flat_index, &actual_dims);
+            println!(
+                "{stage_name}: max_abs_diff={max_abs_diff:.9} coord={coord:?} actual={actual_value:.9} expected={expected_value:.9}"
+            );
+        }
+        Ok(())
+    }
+
+    fn print_same_input_ln_pre_diff(
+        reference: &HashMap<String, Tensor>,
+        checkpoint_dir: &std::path::Path,
+        dev: &Device,
+    ) -> Result<()> {
+        let Some(input) = reference.get("vision.pre_block.pos_embed_added") else {
+            return Ok(());
+        };
+        let Some(expected) = reference.get("vision.pre_block.ln_pre") else {
+            return Ok(());
+        };
+        let config = Config::default();
+        let checkpoint = Sam3CheckpointSource::upstream_pth(checkpoint_dir.join("sam3.pt"));
+        let vb = checkpoint.load_var_builder(candle::DType::F32, dev)?;
+        let ln_pre = candle_nn::layer_norm(
+            config.vision.embed_dim,
+            1e-5,
+            vb.pp("backbone")
+                .pp("vision_backbone")
+                .pp("trunk")
+                .pp("ln_pre"),
+        )?;
+        let actual = ln_pre
+            .forward(&input.permute((0, 2, 3, 1))?)?
+            .permute((0, 3, 1, 2))?;
+        let max_abs_diff = tensor_max_abs_diff(&actual, expected)?;
+        println!("vision.pre_block.ln_pre.same_input: max_abs_diff={max_abs_diff:.9}");
+        Ok(())
+    }
+
+    fn print_block_output_diffs(
+        block_outputs: &[Tensor],
+        reference: &HashMap<String, Tensor>,
+        last_block_index: usize,
+    ) -> Result<()> {
+        for block_index in 0..=last_block_index {
+            let stage_name = format!("vision.block.{block_index}");
+            let actual = block_outputs
+                .get(block_index)
+                .ok_or_else(|| candle::Error::Msg(format!("missing runtime {stage_name}")))?
+                .permute((0, 3, 1, 2))?;
+            let expected = reference
+                .get(&stage_name)
+                .ok_or_else(|| candle::Error::Msg(format!("missing reference {stage_name}")))?;
+            let max_abs_diff = tensor_max_abs_diff(&actual, expected)?;
+            println!("{stage_name}: max_abs_diff={max_abs_diff:.9}");
+        }
+        Ok(())
+    }
+
+    fn print_block_output_argmax(
+        block_outputs: &[Tensor],
+        reference: &HashMap<String, Tensor>,
+        block_index: usize,
+    ) -> Result<usize> {
+        let stage_name = format!("vision.block.{block_index}");
+        let actual = block_outputs
+            .get(block_index)
+            .ok_or_else(|| candle::Error::Msg(format!("missing runtime {stage_name}")))?
+            .permute((0, 3, 1, 2))?;
+        let expected = reference
+            .get(&stage_name)
+            .ok_or_else(|| candle::Error::Msg(format!("missing reference {stage_name}")))?;
+        let actual_dims = actual.dims().to_vec();
+        let (max_abs_diff, flat_index, actual, expected) =
+            tensor_max_abs_diff_details(&actual, expected)?;
+        let coord = unravel_index(flat_index, &actual_dims);
+        println!(
+            "{stage_name}.argmax: coord={coord:?} max_abs_diff={max_abs_diff:.9} actual={actual:.9} expected={expected:.9}"
+        );
+        Ok(flat_index)
+    }
+
+    fn print_block_outputs_at_index(
+        block_outputs: &[Tensor],
+        reference: &HashMap<String, Tensor>,
+        last_block_index: usize,
+        flat_index: usize,
+        label: &str,
+    ) -> Result<()> {
+        for block_index in 0..=last_block_index {
+            let stage_name = format!("vision.block.{block_index}");
+            let actual_values = block_outputs
+                .get(block_index)
+                .ok_or_else(|| candle::Error::Msg(format!("missing runtime {stage_name}")))?
+                .permute((0, 3, 1, 2))?
+                .to_dtype(candle::DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let expected_values = reference
+                .get(&stage_name)
+                .ok_or_else(|| candle::Error::Msg(format!("missing reference {stage_name}")))?
+                .to_dtype(candle::DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let actual = actual_values[flat_index];
+            let expected = expected_values[flat_index];
+            println!(
+                "{stage_name}.at_{label}: actual={actual:.9} expected={expected:.9} diff={diff:.9}",
+                diff = actual - expected,
+            );
+        }
+        Ok(())
+    }
+
+    fn print_block_residual_components(
+        debug_tensors: &BTreeMap<String, Tensor>,
+        reference: &HashMap<String, Tensor>,
+        block_index: usize,
+    ) -> Result<usize> {
+        let output_name = format!("vision.block_debug.{block_index}.output");
+        let output_actual = debug_tensors
+            .get(&output_name)
+            .ok_or_else(|| candle::Error::Msg(format!("missing runtime tensor {output_name}")))?
+            .permute((0, 3, 1, 2))?;
+        let output_expected = reference
+            .get(&output_name)
+            .ok_or_else(|| candle::Error::Msg(format!("missing reference tensor {output_name}")))?;
+        let (max_abs_diff, flat_index, actual, expected) =
+            tensor_max_abs_diff_details(&output_actual, output_expected)?;
+        let coord = unravel_index(flat_index, output_actual.dims());
+        println!(
+            "{output_name}.argmax: coord={coord:?} max_abs_diff={max_abs_diff:.9} actual={actual:.9} expected={expected:.9}"
+        );
+
+        print_block_residual_components_at_index(
+            debug_tensors,
+            reference,
+            block_index,
+            flat_index,
+            "output_argmax",
+        )?;
+        Ok(flat_index)
+    }
+
+    fn print_block_residual_components_at_index(
+        debug_tensors: &BTreeMap<String, Tensor>,
+        reference: &HashMap<String, Tensor>,
+        block_index: usize,
+        flat_index: usize,
+        label: &str,
+    ) -> Result<()> {
+        for stage_suffix in ["input", "attn_output", "post_attn", "mlp_output"] {
+            let stage_name = format!("vision.block_debug.{block_index}.{stage_suffix}");
+            let actual_values = debug_tensors
+                .get(&stage_name)
+                .ok_or_else(|| candle::Error::Msg(format!("missing runtime tensor {stage_name}")))?
+                .permute((0, 3, 1, 2))?
+                .to_dtype(candle::DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let expected_values = reference
+                .get(&stage_name)
+                .ok_or_else(|| {
+                    candle::Error::Msg(format!("missing reference tensor {stage_name}"))
+                })?
+                .to_dtype(candle::DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let actual = actual_values[flat_index];
+            let expected = expected_values[flat_index];
+            println!(
+                "{stage_name}.at_{label}: actual={actual:.9} expected={expected:.9} diff={diff:.9}",
+                diff = actual - expected,
+            );
+        }
+        Ok(())
+    }
+
+    fn unravel_index(mut flat_index: usize, dims: &[usize]) -> Vec<usize> {
+        let mut coord = vec![0usize; dims.len()];
+        for (axis, dim) in dims.iter().enumerate().rev() {
+            coord[axis] = flat_index % dim;
+            flat_index /= dim;
+        }
+        coord
     }
 
     fn sam3_test_checkpoint_dir() -> PathBuf {

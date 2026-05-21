@@ -751,13 +751,63 @@ impl candle::CustomOp3 for LayerNorm {
             Ok((storage, Shape::from_dims(dims)))
         }
 
+        fn inner_f32(
+            src: &[f32],
+            layout: &Layout,
+            alpha: &[f32],
+            alpha_layout: &Layout,
+            beta: &[f32],
+            beta_layout: &Layout,
+            eps: f32,
+        ) -> Result<(CpuStorage, Shape)> {
+            let src = match layout.contiguous_offsets() {
+                None => candle::bail!("input has to be contiguous"),
+                Some((o1, o2)) => &src[o1..o2],
+            };
+            let alpha = match alpha_layout.contiguous_offsets() {
+                None => candle::bail!("alpha has to be contiguous"),
+                Some((o1, o2)) => &alpha[o1..o2],
+            };
+            let beta = match beta_layout.contiguous_offsets() {
+                None => candle::bail!("beta has to be contiguous"),
+                Some((o1, o2)) => &beta[o1..o2],
+            };
+            let el_count = layout.shape().elem_count();
+            let dims = layout.shape().dims();
+            let dim_m1 = dims[dims.len() - 1];
+            let mut dst = vec![0f32; el_count];
+            src.par_chunks(dim_m1)
+                .zip(dst.par_chunks_mut(dim_m1))
+                .for_each(|(src, dst)| {
+                    let mut sum = 0f64;
+                    for v in src {
+                        sum += *v as f64;
+                    }
+                    let mean = sum / dim_m1 as f64;
+                    let mut sum2 = 0f64;
+                    for v in src {
+                        let centered = *v as f64 - mean;
+                        sum2 += centered * centered;
+                    }
+                    let var = sum2 / dim_m1 as f64;
+                    let inv_std = (var + eps as f64).sqrt().recip();
+                    for ((d, s), (alpha, beta)) in
+                        dst.iter_mut().zip(src.iter()).zip(alpha.iter().zip(beta))
+                    {
+                        *d = ((*s as f64 - mean) * inv_std * *alpha as f64 + *beta as f64) as f32;
+                    }
+                });
+            let storage = candle::WithDType::to_cpu_storage_owned(dst);
+            Ok((storage, Shape::from_dims(dims)))
+        }
+
         use CpuStorage as C;
         match (s1, s2, s3) {
             (C::BF16(s1), C::BF16(s2), C::BF16(s3)) => {
                 inner::<half::bf16>(s1, l1, s2, l2, s3, l3, eps)
             }
             (C::F16(s1), C::F16(s2), C::F16(s3)) => inner::<half::f16>(s1, l1, s2, l2, s3, l3, eps),
-            (C::F32(s1), C::F32(s2), C::F32(s3)) => inner::<f32>(s1, l1, s2, l2, s3, l3, eps),
+            (C::F32(s1), C::F32(s2), C::F32(s3)) => inner_f32(s1, l1, s2, l2, s3, l3, eps),
             _ => candle::bail!("unsupported dtype for rmsnorm {:?}", s1.dtype()),
         }
     }
