@@ -1,7 +1,7 @@
 use super::*;
 use crate::models::sam3::neck::TrackerVisualSequences;
-use crate::models::sam3::tracker::add_tensor_memory;
 use crate::models::sam3::torch_ops::tensor::first_scalar_f32;
+use crate::models::sam3::tracker::add_tensor_memory;
 use crate::models::sam3::tracker::PackedPromptHistory;
 
 #[derive(Debug, Clone)]
@@ -516,11 +516,13 @@ impl<'a> Sam3VideoPredictor<'a> {
             let empty_mask_obj_ids = output
                 .objects
                 .iter()
-                .filter_map(|object| match mask_has_foreground(&object.mask_logits, 0.0) {
-                    Ok(true) => None,
-                    Ok(false) => Some(Ok(object.obj_id)),
-                    Err(err) => Some(Err(err)),
-                })
+                .filter_map(
+                    |object| match mask_has_foreground(&object.mask_logits, 0.0) {
+                        Ok(true) => None,
+                        Ok(false) => Some(Ok(object.obj_id)),
+                        Err(err) => Some(Err(err)),
+                    },
+                )
                 .collect::<Result<BTreeSet<_>>>()?;
             let previous_removed_obj_ids = temporal_disambiguation_state.hidden_obj_ids().clone();
             let is_last_frame = order_idx + 1 == processing_order.len();
@@ -544,17 +546,12 @@ impl<'a> Sam3VideoPredictor<'a> {
                 BTreeSet::new()
             };
             if hotstart_delay > 0 {
-                let frame_has_prompt_input = session.prompt_frames().contains(&frame_idx);
-                if frame_has_prompt_input {
-                    yield_list.push(output);
-                } else {
-                    hotstart_buffer.push_back(output);
-                    if is_last_frame {
-                        yield_list.extend(hotstart_buffer.drain(..));
-                    } else if hotstart_buffer.len() >= hotstart_delay {
-                        if let Some(oldest) = hotstart_buffer.pop_front() {
-                            yield_list.push(oldest);
-                        }
+                hotstart_buffer.push_back(output);
+                if is_last_frame {
+                    yield_list.extend(hotstart_buffer.drain(..));
+                } else if hotstart_buffer.len() >= hotstart_delay {
+                    if let Some(oldest) = hotstart_buffer.pop_front() {
+                        yield_list.push(oldest);
                     }
                 }
             } else {
@@ -598,14 +595,6 @@ impl<'a> Sam3VideoPredictor<'a> {
                 },
             );
             for yielded in yield_list {
-                let is_prompt_frame = session.prompt_frames().contains(&yielded.frame_idx);
-                if hotstart_delay > 0 && is_prompt_frame {
-                    on_frame(&yielded)?;
-                    if session.low_memory_mode() {
-                        session.evict_cached_output_frame(yielded.frame_idx);
-                    }
-                    continue;
-                }
                 let mut hidden_obj_ids = temporal_disambiguation_state.hidden_obj_ids().clone();
                 hidden_obj_ids.extend(
                     temporal_disambiguation_state.unconfirmed_obj_ids_for_yield_frame(
@@ -1369,7 +1358,8 @@ impl Sam3VideoTrackerCore<'_> {
                 packed_history.as_ref(),
             )?
             .state;
-        tracker_state = self.attach_state_memory(&tracker_visual_features, &tracker_state, false)?;
+        tracker_state =
+            self.attach_state_memory(&tracker_visual_features, &tracker_state, false)?;
         let detector_score = detector_output.score_value()?;
         let mut output = tracker_state_to_object_output(
             object.obj_id,
@@ -1526,9 +1516,10 @@ impl Sam3VideoTrackerCore<'_> {
         let visual_features = session.get_visual_features(model, compute_device, frame_idx)?;
         let tracker_visual_features = tracker_visual_output(&visual_features);
         let text_encoding = session.cached_text_encoding(model, text, compute_device)?;
-        let encoded_prompt = combine_encoded_prompts(Some(&text_encoding), None)?.ok_or_else(|| {
-            candle::Error::Msg("text prompt seed path produced no encoded prompt".to_owned())
-        })?;
+        let encoded_prompt =
+            combine_encoded_prompts(Some(&text_encoding), None)?.ok_or_else(|| {
+                candle::Error::Msg("text prompt seed path produced no encoded prompt".to_owned())
+            })?;
         let grounding = ground_all_from_encoded_prompt(model, &visual_features, &encoded_prompt)?;
         let query_count = grounding_query_count(&grounding.scores)?;
         let mut results = Vec::new();
@@ -1552,8 +1543,7 @@ impl Sam3VideoTrackerCore<'_> {
                 )?
             };
 
-            let query_grounding =
-                grounding_query_output(&grounding, query_idx, detector_score)?;
+            let query_grounding = grounding_query_output(&grounding, query_idx, detector_score)?;
             let mut detector_output = grounding_to_object_output(
                 obj_id,
                 &query_grounding,
@@ -1970,8 +1960,8 @@ impl Sam3VideoTrackerCore<'_> {
             } else {
                 let text_encoding =
                     session.cached_text_encoding(model, &text_prompt, compute_device)?;
-                let encoded_prompt =
-                    combine_encoded_prompts(Some(&text_encoding), None)?.ok_or_else(|| {
+                let encoded_prompt = combine_encoded_prompts(Some(&text_encoding), None)?
+                    .ok_or_else(|| {
                         candle::Error::Msg(
                             "text detector path produced no encoded prompt".to_owned(),
                         )
@@ -2000,10 +1990,7 @@ impl Sam3VideoTrackerCore<'_> {
                             .into_iter()
                             .next()
                             .unwrap_or(0.0),
-                        2 => grounding
-                            .scores
-                            .i((0, query_idx))?
-                            .to_vec0::<f32>()?,
+                        2 => grounding.scores.i((0, query_idx))?.to_vec0::<f32>()?,
                         1 => grounding.scores.i(query_idx)?.to_vec0::<f32>()?,
                         _ => 0.0,
                     };
@@ -2232,10 +2219,7 @@ impl Sam3VideoTrackerCore<'_> {
             } else {
                 output.to_storage_device(session.storage_device())?
             };
-            stored_outputs.insert(
-                output.obj_id,
-                stored_output,
-            );
+            stored_outputs.insert(output.obj_id, stored_output);
         }
         if stored_outputs.is_empty() {
             session.frame_outputs.remove(&frame_idx);
@@ -2558,11 +2542,8 @@ mod tests {
 
     #[test]
     fn compact_cached_output_materializes_masks_and_boxes() -> Result<()> {
-        let mask_logits = Tensor::from_vec(
-            vec![0.0f32, 1.0, -1.0, 0.5],
-            (1, 1, 2, 2),
-            &Device::Cpu,
-        )?;
+        let mask_logits =
+            Tensor::from_vec(vec![0.0f32, 1.0, -1.0, 0.5], (1, 1, 2, 2), &Device::Cpu)?;
         let masks = candle_nn::ops::sigmoid(&mask_logits)?;
         let output = ObjectFrameOutput {
             obj_id: 1,
