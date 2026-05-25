@@ -31,10 +31,11 @@ impl<'a> Sam3VideoTrackerCore<'a> {
             hidden_obj_ids.extend(obj_ids.iter().copied());
         }
         let mut visible_outputs = Vec::new();
+        let mut visible_scores = Vec::new();
         let use_local_confirmation_gate =
             predictor_config.masklet_confirmation_enable && config.hotstart_delay == 0;
 
-        for (obj_id, raw_output, _, _) in results.iter() {
+        for (obj_id, raw_output, state, _) in results.iter() {
             let output = if postprocess_on_cpu
                 && !raw_output.masks.device().same_device(&postprocess_device)
             {
@@ -65,10 +66,19 @@ impl<'a> Sam3VideoTrackerCore<'a> {
                 continue;
             }
             visible_outputs.push(output.clone());
+            visible_scores.push(if postprocess_on_cpu {
+                tracker_state_object_score_logit_on_device(state, &postprocess_device)?
+            } else {
+                tracker_state_object_score_logit(state)?
+            });
         }
 
         let visible_outputs = if config.non_overlap_masks_for_output {
-            apply_object_wise_non_overlapping_constraints(&visible_outputs)?
+            apply_object_wise_non_overlapping_constraints(
+                &visible_outputs,
+                &visible_scores,
+                output_threshold,
+            )?
         } else {
             visible_outputs
                 .into_iter()
@@ -158,6 +168,22 @@ pub(super) fn object_presence_score(output: &ObjectFrameOutput) -> Result<f32> {
     }
 }
 
+fn tracker_state_object_score_logit(state: &TrackerFrameState) -> Result<f32> {
+    first_scalar_f32(&state.object_score_logits)
+}
+
+fn tracker_state_object_score_logit_on_device(
+    state: &TrackerFrameState,
+    device: &Device,
+) -> Result<f32> {
+    let logits = if state.object_score_logits.device().same_device(device) {
+        state.object_score_logits.clone()
+    } else {
+        state.object_score_logits.to_device(device)?
+    };
+    first_scalar_f32(&logits)
+}
+
 pub(super) fn mask_has_foreground(mask: &Tensor, threshold: f32) -> Result<bool> {
     Ok(mask
         .ge(threshold as f64)?
@@ -209,39 +235,50 @@ fn rebuild_object_output_from_binary_mask(
 
 fn apply_object_wise_non_overlapping_constraints(
     outputs: &[ObjectFrameOutput],
+    scores: &[f32],
+    threshold: f32,
 ) -> Result<Vec<ObjectFrameOutput>> {
     if outputs.len() <= 1 {
         return Ok(outputs.to_vec());
     }
-    let device = outputs[0].mask_logits.device();
-    let mut mask_logit_tensors = Vec::with_capacity(outputs.len());
-    for output in outputs {
-        let mask_logits = match output.mask_logits.rank() {
-            4 => output.mask_logits.clone(),
-            3 => output.mask_logits.unsqueeze(0)?,
-            2 => output.mask_logits.unsqueeze(0)?.unsqueeze(0)?,
-            rank => candle::bail!("expected mask logits rank 2, 3, or 4, got {}", rank),
-        }
-        .to_dtype(DType::F32)?;
-        mask_logit_tensors.push(mask_logits);
+    if scores.len() != outputs.len() {
+        candle::bail!(
+            "expected one non-overlap score per output, got {} scores for {} outputs",
+            scores.len(),
+            outputs.len()
+        );
     }
-    let mask_logit_refs = mask_logit_tensors.iter().collect::<Vec<_>>();
-    let mask_logits = Tensor::cat(&mask_logit_refs, 0)?.contiguous()?;
-    let (batch_size, channels, height, width) = mask_logits.dims4()?;
-    let winner_idx = mask_logits.argmax_keepdim(0)?;
+    let device = outputs[0].masks.device();
+    let mut mask_tensors = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        let mask = match output.masks.rank() {
+            4 => output.masks.clone(),
+            3 => output.masks.unsqueeze(1)?,
+            2 => output.masks.unsqueeze(0)?.unsqueeze(0)?,
+            rank => candle::bail!("expected mask rank 2, 3, or 4, got {}", rank),
+        };
+        mask_tensors.push(mask);
+    }
+    let mask_refs = mask_tensors.iter().collect::<Vec<_>>();
+    let mask_stack = Tensor::cat(&mask_refs, 0)?.contiguous()?;
+    let mask_present = mask_stack.ge(threshold as f64)?;
+    let score_tensor = Tensor::from_vec(scores.to_vec(), (outputs.len(), 1, 1, 1), device)?;
+    let scored_masks = mask_present.where_cond(
+        &score_tensor.broadcast_as(mask_stack.shape())?,
+        &Tensor::full(f32::NEG_INFINITY, mask_stack.shape(), device)?,
+    )?;
+    let winner_idx = scored_masks.argmax_keepdim(0)?;
     let object_idx =
-        Tensor::arange(0u32, batch_size as u32, device)?.reshape((batch_size, 1, 1, 1))?;
-    let keep = object_idx
-        .broadcast_eq(&winner_idx.broadcast_as((batch_size, channels, height, width))?)?;
-    let neg_ten = Tensor::full(-10f32, mask_logits.shape(), device)?;
-    let suppressed_logits = mask_logits.le(-10f64)?.where_cond(&mask_logits, &neg_ten)?;
-    let non_overlapping_logits = keep.where_cond(&mask_logits, &suppressed_logits)?;
+        Tensor::arange(0u32, outputs.len() as u32, device)?.reshape((outputs.len(), 1, 1, 1))?;
+    let keep = object_idx.broadcast_eq(&winner_idx.broadcast_as(mask_stack.shape())?)?;
+    let binary_masks = keep.where_cond(
+        &mask_present.to_dtype(DType::F32)?,
+        &Tensor::zeros(mask_stack.shape(), DType::F32, device)?,
+    )?;
     outputs
         .iter()
         .enumerate()
-        .map(|(idx, output)| {
-            rebuild_object_output_from_mask_logits(output, &non_overlapping_logits.i(idx)?)
-        })
+        .map(|(idx, output)| rebuild_object_output_from_binary_mask(output, &binary_masks.i(idx)?))
         .collect()
 }
 
@@ -739,11 +776,11 @@ mod tests {
     }
 
     #[test]
-    fn output_non_overlap_uses_per_pixel_mask_logits() -> Result<()> {
+    fn output_non_overlap_uses_raw_tracker_logits_before_sigmoid_saturation() -> Result<()> {
         let device = Device::Cpu;
-        let make_output = |obj_id, logit| -> Result<ObjectFrameOutput> {
-            let mask_logits = Tensor::from_vec(vec![logit; 6], (1, 1, 2, 3), &device)?;
-            let masks = candle_nn::ops::sigmoid(&mask_logits)?;
+        let make_output = |obj_id, logits, mask| -> Result<ObjectFrameOutput> {
+            let mask_logits = Tensor::from_vec(logits, (1, 1, 2, 3), &device)?;
+            let masks = Tensor::from_vec(mask, (1, 1, 2, 3), &device)?;
             Ok(ObjectFrameOutput {
                 obj_id,
                 mask_logits,
@@ -758,16 +795,27 @@ mod tests {
                 reused_previous_output: false,
             })
         };
-        let outputs = vec![make_output(1, 2.0)?, make_output(2, 3.0)?];
+        let outputs = vec![
+            make_output(1, vec![2.0; 6], vec![1.0; 6])?,
+            make_output(2, vec![1.0; 6], vec![1.0; 6])?,
+        ];
 
-        let actual = apply_object_wise_non_overlapping_constraints(&outputs)?;
+        let actual =
+            apply_object_wise_non_overlapping_constraints(&outputs, &[20.875, 21.875], 0.5)?;
 
         assert_eq!(actual.len(), 2);
         assert_eq!(actual[0].obj_id, 1);
         assert_eq!(actual[1].obj_id, 2);
         assert!(!mask_has_foreground(&actual[0].masks, 0.5)?);
         assert!(mask_has_foreground(&actual[1].masks, 0.5)?);
-        assert!(actual[0].mask_logits.max_all()?.to_scalar::<f32>()? <= -10.0);
+        assert_eq!(actual[0].mask_logits.max_all()?.to_scalar::<f32>()?, 0.0);
+        let winning_foreground = actual[1]
+            .masks
+            .ge(0.5f64)?
+            .to_dtype(DType::F32)?
+            .sum_all()?
+            .to_scalar::<f32>()?;
+        assert_eq!(winning_foreground, 6.0);
         let winning_box = actual[1].boxes_xyxy.flatten_all()?.to_vec1::<f32>()?;
         let expected_box = [0.0f32, 0.0, 2.0 / 3.0, 1.0 / 2.0];
         assert!(winning_box
