@@ -1,4 +1,5 @@
 //! Tensor Layouts including contiguous or sparse strides
+
 use crate::{Error, Result, Shape};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -115,6 +116,20 @@ impl Layout {
     /// Returns true if the data is stored in a Fortran contiguous (aka column major) way.
     pub fn is_fortran_contiguous(&self) -> bool {
         self.shape.is_fortran_contiguous(&self.stride)
+    }
+
+    pub fn is_scalar(&self) -> bool {
+        let dims = self.dims();
+        dims.is_empty() || dims.iter().all(|d| *d == 1)
+    }
+
+    /// Returns true if the data is actually a scalar during broadcast
+    pub fn is_scalar_broadcast(&self) -> bool {
+        self.stride().iter().all(|s| *s == 0)
+    }
+
+    pub fn is_scalar_like(&self) -> bool {
+        self.is_scalar() || self.is_scalar_broadcast()
     }
 
     pub fn narrow(&self, dim: usize, start: usize, len: usize) -> Result<Self> {
@@ -271,60 +286,4 @@ impl Layout {
             }
         }
     }
-
-    // Returns the contiguous offsets with broadcast if applicable.
-    pub(crate) fn offsets_b(&self) -> Option<ContiguousOffsetsWithBroadcast> {
-        let mut left_broadcast = 1;
-        let mut right_broadcast = 1;
-        let strides = self.stride();
-        let dims = self.dims();
-        let mut start_cont = 0;
-        let mut end_cont = dims.len();
-        for (&s, &d) in strides.iter().zip(dims.iter()) {
-            if s != 0 {
-                break;
-            }
-            start_cont += 1;
-            left_broadcast *= d;
-        }
-        if start_cont == dims.len() {
-            return Some(ContiguousOffsetsWithBroadcast {
-                start: self.start_offset,
-                len: 1,
-                left_broadcast,
-                right_broadcast: 1,
-            });
-        }
-        for (&s, &d) in strides.iter().zip(dims.iter()).rev() {
-            if s != 0 {
-                break;
-            }
-            end_cont -= 1;
-            right_broadcast *= d;
-        }
-        // Check that the inner dims are contiguous
-        let strides = &strides[start_cont..end_cont];
-        let dims = &dims[start_cont..end_cont];
-        let mut len = 1;
-        for (&stride, &dim) in strides.iter().zip(dims.iter()).rev() {
-            if stride != len {
-                return None;
-            }
-            len *= dim;
-        }
-        Some(ContiguousOffsetsWithBroadcast {
-            start: self.start_offset,
-            len,
-            left_broadcast,
-            right_broadcast,
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContiguousOffsetsWithBroadcast {
-    pub start: usize,
-    pub len: usize,
-    pub left_broadcast: usize,
-    pub right_broadcast: usize,
 }
