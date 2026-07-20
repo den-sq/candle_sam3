@@ -2557,7 +2557,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compact_cached_output_materializes_masks_and_boxes() -> Result<()> {
+    fn compact_cached_output_round_trips_thresholded_masks_logits_and_boxes() -> Result<()> {
         let mask_logits = Tensor::from_vec(
             vec![0.0f32, 1.0, -1.0, 0.5],
             (1, 1, 2, 2),
@@ -2584,10 +2584,39 @@ mod tests {
 
         let materialized = compact.materialize_cached()?;
         assert_eq!(materialized.masks.dims4()?, (1, 1, 2, 2));
-        assert!(materialized.boxes_xyxy.elem_count() > 0);
+        assert_eq!(
+            materialized.mask_logits.flatten_all()?.to_vec1::<f32>()?,
+            output.mask_logits.flatten_all()?.to_vec1::<f32>()?
+        );
         assert_eq!(
             materialized.masks.sum_all()?.to_scalar::<f32>()?,
             output.masks.sum_all()?.to_scalar::<f32>()?
+        );
+        assert_eq!(
+            materialized
+                .masks
+                .gt(0.5f64)?
+                .flatten_all()?
+                .to_vec1::<u8>()?,
+            output
+                .masks
+                .gt(0.5f64)?
+                .flatten_all()?
+                .to_vec1::<u8>()?
+        );
+        assert_eq!(
+            materialized.boxes_xyxy.flatten_all()?.to_vec1::<f32>()?,
+            output.boxes_xyxy.flatten_all()?.to_vec1::<f32>()?
+        );
+        assert_eq!(
+            materialized
+                .masks
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .first()
+                .copied(),
+            Some(0.5),
+            "zero logits rematerialize to 0.5 but remain background under strict thresholding"
         );
         Ok(())
     }

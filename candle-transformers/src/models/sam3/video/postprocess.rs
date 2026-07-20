@@ -188,7 +188,7 @@ fn tracker_state_presence_score_on_device(
 
 pub(super) fn mask_has_foreground(mask: &Tensor, threshold: f32) -> Result<bool> {
     Ok(mask
-        .ge(threshold as f64)?
+        .gt(threshold as f64)?
         .to_dtype(DType::F32)?
         .max_all()?
         .to_scalar::<f32>()?
@@ -290,7 +290,7 @@ pub(super) fn mask_to_normalized_xyxy(mask: &Tensor) -> Result<Tensor> {
         return Tensor::zeros((1, 4), DType::F32, device);
     }
 
-    let mask_present = mask.ge(0.5f64)?;
+    let mask_present = mask.gt(0.5f64)?;
     let shape = (height, width);
     let x_coords = Tensor::arange(0u32, width as u32, device)?
         .to_dtype(DType::F32)?
