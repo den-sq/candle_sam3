@@ -88,6 +88,12 @@ pub struct VideoSessionOptions {
     pub prefetch_ahead: usize,
     pub prefetch_behind: usize,
     pub max_feature_cache_entries: usize,
+    /// Maximum retained non-conditioning tracker states per object.
+    ///
+    /// `None` preserves the unbounded compatibility behavior. When set, the
+    /// predictor rejects values smaller than the tracker memory/refinement
+    /// windows and evicts older non-conditioning states after callbacks.
+    pub max_non_cond_tracker_states: Option<usize>,
 }
 
 impl Default for VideoSessionOptions {
@@ -100,6 +106,7 @@ impl Default for VideoSessionOptions {
             prefetch_ahead: 2,
             prefetch_behind: 1,
             max_feature_cache_entries: 2,
+            max_non_cond_tracker_states: None,
         }
     }
 }

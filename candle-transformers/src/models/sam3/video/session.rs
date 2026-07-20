@@ -28,6 +28,17 @@ pub struct SessionCacheStats {
     pub cached_feature_entries: usize,
     pub cached_output_frames: usize,
     pub tracked_objects: usize,
+    pub retained_tracker_states: usize,
+    pub retained_non_cond_tracker_states: usize,
+    pub retained_output_frame_indices: usize,
+    pub cpu_low_res_mask_bytes: usize,
+    pub device_low_res_mask_bytes: usize,
+    pub hotstart_buffered_frames: usize,
+    pub hotstart_buffered_cpu_bytes: usize,
+    pub hotstart_buffered_device_bytes: usize,
+    pub peak_hotstart_buffered_frames: usize,
+    pub peak_hotstart_buffered_cpu_bytes: usize,
+    pub peak_hotstart_buffered_device_bytes: usize,
     pub cpu_bytes: SessionCacheByteBreakdown,
     pub device_bytes: SessionCacheByteBreakdown,
 }
@@ -305,6 +316,12 @@ pub struct Sam3VideoSession {
     feature_cache: HashMap<usize, VisualBackboneOutput>,
     feature_cache_order: VecDeque<usize>,
     text_cache: HashMap<String, CachedTextPrompt>,
+    hotstart_buffered_frames: usize,
+    hotstart_buffered_cpu_bytes: usize,
+    hotstart_buffered_device_bytes: usize,
+    peak_hotstart_buffered_frames: usize,
+    peak_hotstart_buffered_cpu_bytes: usize,
+    peak_hotstart_buffered_device_bytes: usize,
 }
 
 impl Sam3VideoSession {
@@ -341,6 +358,12 @@ impl Sam3VideoSession {
             feature_cache: HashMap::new(),
             feature_cache_order: VecDeque::new(),
             text_cache: HashMap::new(),
+            hotstart_buffered_frames: 0,
+            hotstart_buffered_cpu_bytes: 0,
+            hotstart_buffered_device_bytes: 0,
+            peak_hotstart_buffered_frames: 0,
+            peak_hotstart_buffered_cpu_bytes: 0,
+            peak_hotstart_buffered_device_bytes: 0,
         })
     }
 
@@ -366,6 +389,8 @@ impl Sam3VideoSession {
             frames: frame_device_bytes,
             ..Default::default()
         };
+        let mut cpu_low_res_mask_bytes = 0usize;
+        let mut device_low_res_mask_bytes = 0usize;
 
         for visual in self.feature_cache.values() {
             let (cpu, device) = visual.memory_bytes();
@@ -391,6 +416,11 @@ impl Sam3VideoSession {
                 let (cpu, device) = state.memory_bytes();
                 cpu_bytes.tracker_states = cpu_bytes.tracker_states.saturating_add(cpu);
                 device_bytes.tracker_states = device_bytes.tracker_states.saturating_add(device);
+                add_tensor_memory(
+                    &state.low_res_masks,
+                    &mut cpu_low_res_mask_bytes,
+                    &mut device_low_res_mask_bytes,
+                );
             }
             let (cpu, device) = object.prompt_history_cache.memory_bytes();
             cpu_bytes.packed_prompt_history =
@@ -404,11 +434,44 @@ impl Sam3VideoSession {
             device_bytes.text_cache = device_bytes.text_cache.saturating_add(device);
         }
 
+        let retained_tracker_states = self
+            .tracked_objects
+            .values()
+            .map(|object| object.tracker_states.len())
+            .sum();
+        let retained_non_cond_tracker_states = self
+            .tracked_objects
+            .values()
+            .map(|object| {
+                object
+                    .tracker_states
+                    .values()
+                    .filter(|state| !state.is_cond_frame)
+                    .count()
+            })
+            .sum();
+        let retained_output_frame_indices = self
+            .tracked_objects
+            .values()
+            .map(|object| object.frame_outputs.len())
+            .sum();
+
         SessionCacheStats {
             loaded_frame_count: self.frame_source.loaded_frame_count(),
             cached_feature_entries: self.feature_cache.len(),
             cached_output_frames: self.frame_outputs.len(),
             tracked_objects: self.tracked_objects.len(),
+            retained_tracker_states,
+            retained_non_cond_tracker_states,
+            retained_output_frame_indices,
+            cpu_low_res_mask_bytes,
+            device_low_res_mask_bytes,
+            hotstart_buffered_frames: self.hotstart_buffered_frames,
+            hotstart_buffered_cpu_bytes: self.hotstart_buffered_cpu_bytes,
+            hotstart_buffered_device_bytes: self.hotstart_buffered_device_bytes,
+            peak_hotstart_buffered_frames: self.peak_hotstart_buffered_frames,
+            peak_hotstart_buffered_cpu_bytes: self.peak_hotstart_buffered_cpu_bytes,
+            peak_hotstart_buffered_device_bytes: self.peak_hotstart_buffered_device_bytes,
             cpu_bytes,
             device_bytes,
         }
@@ -585,6 +648,7 @@ impl Sam3VideoSession {
         self.feature_cache.clear();
         self.feature_cache_order.clear();
         self.text_cache.clear();
+        self.clear_hotstart_stats();
         self.frame_source.close();
     }
 
@@ -599,6 +663,7 @@ impl Sam3VideoSession {
         self.temporal_disambiguation_metadata.clear();
         self.tracked_objects.clear();
         self.text_cache.clear();
+        self.clear_hotstart_stats();
         self.debug_recorder = None;
     }
 
@@ -629,6 +694,91 @@ impl Sam3VideoSession {
 
     pub(crate) fn evict_cached_output_frame(&mut self, frame_idx: usize) {
         self.frame_outputs.remove(&frame_idx);
+    }
+
+    pub(crate) fn record_hotstart_buffer(&mut self, buffer: &VecDeque<VideoFrameOutput>) {
+        let mut cpu_bytes = 0usize;
+        let mut device_bytes = 0usize;
+        for frame in buffer {
+            for output in &frame.objects {
+                let (cpu, device) = output.memory_bytes();
+                cpu_bytes = cpu_bytes.saturating_add(cpu);
+                device_bytes = device_bytes.saturating_add(device);
+            }
+        }
+        self.hotstart_buffered_frames = buffer.len();
+        self.hotstart_buffered_cpu_bytes = cpu_bytes;
+        self.hotstart_buffered_device_bytes = device_bytes;
+        self.peak_hotstart_buffered_frames = self.peak_hotstart_buffered_frames.max(buffer.len());
+        self.peak_hotstart_buffered_cpu_bytes =
+            self.peak_hotstart_buffered_cpu_bytes.max(cpu_bytes);
+        self.peak_hotstart_buffered_device_bytes =
+            self.peak_hotstart_buffered_device_bytes.max(device_bytes);
+    }
+
+    pub(crate) fn evict_bounded_tracker_history(&mut self, direction: PropagationDirection) {
+        let Some(limit) = self.session_options.max_non_cond_tracker_states else {
+            return;
+        };
+        let mut evicted = Vec::new();
+        for (obj_id, object) in self.tracked_objects.iter_mut() {
+            let protected_prompt_frames = object
+                .prompt_frames
+                .keys()
+                .chain(object.mask_prompt_frames.keys())
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let mut candidates = object
+                .tracker_states
+                .iter()
+                .filter_map(|(idx, state)| {
+                    (!state.is_cond_frame && !protected_prompt_frames.contains(idx)).then_some(*idx)
+                })
+                .collect::<Vec<_>>();
+            if candidates.len() <= limit {
+                continue;
+            }
+            candidates.sort_unstable();
+            let remove_count = candidates.len() - limit;
+            let remove = match direction {
+                PropagationDirection::Forward | PropagationDirection::Both => candidates
+                    .into_iter()
+                    .take(remove_count)
+                    .collect::<Vec<_>>(),
+                PropagationDirection::Backward => candidates
+                    .into_iter()
+                    .rev()
+                    .take(remove_count)
+                    .collect::<Vec<_>>(),
+            };
+            for evicted_frame_idx in remove {
+                object.tracker_states.remove(&evicted_frame_idx);
+                object.remove_output_frame(evicted_frame_idx);
+                evicted.push((*obj_id, evicted_frame_idx));
+            }
+            object.clear_prompt_history_cache();
+        }
+        for (obj_id, evicted_frame_idx) in evicted {
+            let remove_frame = if let Some(outputs) = self.frame_outputs.get_mut(&evicted_frame_idx)
+            {
+                outputs.remove(&obj_id);
+                outputs.is_empty()
+            } else {
+                false
+            };
+            if remove_frame {
+                self.frame_outputs.remove(&evicted_frame_idx);
+            }
+        }
+    }
+
+    fn clear_hotstart_stats(&mut self) {
+        self.hotstart_buffered_frames = 0;
+        self.hotstart_buffered_cpu_bytes = 0;
+        self.hotstart_buffered_device_bytes = 0;
+        self.peak_hotstart_buffered_frames = 0;
+        self.peak_hotstart_buffered_cpu_bytes = 0;
+        self.peak_hotstart_buffered_device_bytes = 0;
     }
 
     fn prefetch_window(
@@ -841,7 +991,7 @@ mod tests {
 
     impl FrameSource for DummyFrameSource {
         fn frame_count(&self) -> usize {
-            1
+            8
         }
 
         fn video_size(&self) -> ImageSize {
@@ -849,7 +999,7 @@ mod tests {
         }
 
         fn get_frame(&mut self, frame_idx: usize, target_device: &Device) -> Result<Tensor> {
-            if frame_idx > 0 {
+            if frame_idx >= self.frame_count() {
                 candle::bail!("frame_idx {} out of bounds", frame_idx);
             }
             self.frame.to_device(target_device)
@@ -890,6 +1040,12 @@ mod tests {
             feature_cache: HashMap::new(),
             feature_cache_order: VecDeque::new(),
             text_cache: HashMap::new(),
+            hotstart_buffered_frames: 0,
+            hotstart_buffered_cpu_bytes: 0,
+            hotstart_buffered_device_bytes: 0,
+            peak_hotstart_buffered_frames: 0,
+            peak_hotstart_buffered_cpu_bytes: 0,
+            peak_hotstart_buffered_device_bytes: 0,
         })
     }
 
@@ -975,6 +1131,139 @@ mod tests {
             .expect("tracked object should exist")
             .frame_outputs
             .contains(&0));
+        Ok(())
+    }
+
+    fn bounded_history_session() -> Result<Sam3VideoSession> {
+        let mut session = test_session(VideoMemoryProfile::LowMemory)?;
+        session.session_options.max_non_cond_tracker_states = Some(2);
+        let mut object = TrackedObject::new(7, 0);
+        for frame_idx in 0..6 {
+            let mut state = test_tracker_state()?;
+            state.is_cond_frame = frame_idx == 0;
+            object.tracker_states.insert(frame_idx, state);
+            object.record_output_frame(frame_idx);
+            session
+                .frame_outputs
+                .entry(frame_idx)
+                .or_default()
+                .insert(7, test_output(7)?);
+        }
+        session.tracked_objects.insert(7, object);
+        Ok(session)
+    }
+
+    #[test]
+    fn bounded_history_retains_conditioning_and_directional_windows() -> Result<()> {
+        let mut forward = bounded_history_session()?;
+        forward.evict_bounded_tracker_history(PropagationDirection::Forward);
+        let object = forward.tracked_objects.get(&7).expect("object");
+        assert_eq!(
+            object.tracker_states.keys().copied().collect::<Vec<_>>(),
+            vec![0, 4, 5]
+        );
+        assert_eq!(
+            object.frame_outputs.iter().copied().collect::<Vec<_>>(),
+            vec![0, 4, 5]
+        );
+        assert_eq!(
+            forward.frame_outputs.keys().copied().collect::<Vec<_>>(),
+            vec![0, 4, 5]
+        );
+        let stats = forward.cache_stats();
+        assert_eq!(stats.retained_tracker_states, 3);
+        assert_eq!(stats.retained_non_cond_tracker_states, 2);
+        assert_eq!(stats.retained_output_frame_indices, 3);
+        assert_eq!(stats.cpu_low_res_mask_bytes, 3 * std::mem::size_of::<f32>());
+        assert_eq!(stats.device_low_res_mask_bytes, 0);
+
+        let mut backward = bounded_history_session()?;
+        backward.evict_bounded_tracker_history(PropagationDirection::Backward);
+        let object = backward.tracked_objects.get(&7).expect("object");
+        assert_eq!(
+            object.tracker_states.keys().copied().collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn later_prompt_correction_survives_old_state_eviction() -> Result<()> {
+        let mut session = bounded_history_session()?;
+        session.evict_bounded_tracker_history(PropagationDirection::Forward);
+        assert!(!session
+            .tracked_objects
+            .get(&7)
+            .expect("object")
+            .tracker_states
+            .contains_key(&1));
+
+        let returned = session.add_prompt(
+            1,
+            SessionPrompt {
+                text: None,
+                points: Some(vec![(0.5, 0.5)]),
+                point_labels: Some(vec![1]),
+                boxes: None,
+                box_labels: None,
+            },
+            Some(7),
+            true,
+            false,
+            8,
+        )?;
+        assert_eq!(returned, 7);
+        let object = session.tracked_objects.get(&7).expect("object");
+        assert!(object.prompt_frames.contains_key(&1));
+        assert!(object.tracker_states.keys().all(|idx| *idx <= 1));
+        Ok(())
+    }
+
+    #[test]
+    fn hotstart_buffer_stats_are_separate_bounded_and_resettable() -> Result<()> {
+        let mut session = test_session(VideoMemoryProfile::LowMemory)?;
+        let mut buffer = VecDeque::new();
+        buffer.push_back(VideoFrameOutput {
+            frame_idx: 0,
+            objects: vec![test_output(7)?],
+        });
+        buffer.push_back(VideoFrameOutput {
+            frame_idx: 1,
+            objects: vec![test_output(7)?],
+        });
+        session.record_hotstart_buffer(&buffer);
+        let buffered = session.cache_stats();
+        assert_eq!(buffered.hotstart_buffered_frames, 2);
+        assert_eq!(buffered.peak_hotstart_buffered_frames, 2);
+        assert!(buffered.hotstart_buffered_cpu_bytes > 0);
+
+        buffer.clear();
+        session.record_hotstart_buffer(&buffer);
+        let drained = session.cache_stats();
+        assert_eq!(drained.hotstart_buffered_frames, 0);
+        assert_eq!(drained.peak_hotstart_buffered_frames, 2);
+        session.reset();
+        assert_eq!(session.cache_stats().peak_hotstart_buffered_frames, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn reset_and_close_release_bounded_history_and_output_state() -> Result<()> {
+        let mut reset = bounded_history_session()?;
+        reset.reset();
+        let reset_stats = reset.cache_stats();
+        assert_eq!(reset_stats.retained_tracker_states, 0);
+        assert_eq!(reset_stats.retained_output_frame_indices, 0);
+        assert_eq!(reset_stats.cached_output_frames, 0);
+        assert_eq!(reset_stats.cpu_low_res_mask_bytes, 0);
+
+        let mut close = bounded_history_session()?;
+        close.close();
+        let close_stats = close.cache_stats();
+        assert_eq!(close_stats.retained_tracker_states, 0);
+        assert_eq!(close_stats.retained_output_frame_indices, 0);
+        assert_eq!(close_stats.cached_output_frames, 0);
+        assert_eq!(close_stats.cpu_low_res_mask_bytes, 0);
         Ok(())
     }
 }
