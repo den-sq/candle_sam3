@@ -12,6 +12,9 @@ use super::super::Sam3TrackerConfig;
 pub struct VideoConfig {
     pub score_threshold: f32,
     pub score_threshold_detection: f32,
+    /// Number of outputs retained before streaming begins. Values above zero
+    /// delay prompt and non-prompt callbacks through the same bounded queue;
+    /// the final partial queue is emitted as an ordered callback burst.
     pub hotstart_delay: usize,
     pub hotstart_unmatch_thresh: usize,
     pub suppress_unmatched_only_within_hotstart: bool,

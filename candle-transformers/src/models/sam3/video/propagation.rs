@@ -441,6 +441,30 @@ impl<'a> Sam3VideoPredictor<'a> {
         Ok(())
     }
 
+    /// Match the reference predictor's hotstart generator contract: when enabled,
+    /// every output (including prompt frames) enters the same bounded queue. The
+    /// oldest output is released once the configured delay is reached, and the
+    /// final partial queue is drained in directional order.
+    fn schedule_hotstart_output<T>(
+        hotstart_buffer: &mut VecDeque<T>,
+        output: T,
+        hotstart_delay: usize,
+        is_last_frame: bool,
+    ) -> Vec<T> {
+        if hotstart_delay == 0 {
+            return vec![output];
+        }
+
+        hotstart_buffer.push_back(output);
+        if is_last_frame {
+            hotstart_buffer.drain(..).collect()
+        } else if hotstart_buffer.len() >= hotstart_delay {
+            hotstart_buffer.pop_front().into_iter().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
     fn propagate_one_direction<F>(
         &mut self,
         session_id: &str,
@@ -565,23 +589,12 @@ impl<'a> Sam3VideoPredictor<'a> {
             } else {
                 BTreeSet::new()
             };
-            if hotstart_delay > 0 {
-                let frame_has_prompt_input = session.prompt_frames().contains(&frame_idx);
-                if frame_has_prompt_input {
-                    yield_list.push(output);
-                } else {
-                    hotstart_buffer.push_back(output);
-                    if is_last_frame {
-                        yield_list.extend(hotstart_buffer.drain(..));
-                    } else if hotstart_buffer.len() >= hotstart_delay {
-                        if let Some(oldest) = hotstart_buffer.pop_front() {
-                            yield_list.push(oldest);
-                        }
-                    }
-                }
-            } else {
-                yield_list.push(output);
-            }
+            yield_list.extend(Self::schedule_hotstart_output(
+                &mut hotstart_buffer,
+                output,
+                hotstart_delay,
+                is_last_frame,
+            ));
             session.record_hotstart_buffer(&hotstart_buffer);
             let current_removed_obj_ids = temporal_disambiguation_state.hidden_obj_ids().clone();
             let newly_removed_obj_ids = current_removed_obj_ids
@@ -621,14 +634,6 @@ impl<'a> Sam3VideoPredictor<'a> {
                 },
             );
             for yielded in yield_list {
-                let is_prompt_frame = session.prompt_frames().contains(&yielded.frame_idx);
-                if hotstart_delay > 0 && is_prompt_frame {
-                    on_frame(&yielded)?;
-                    if session.low_memory_mode() {
-                        session.evict_cached_output_frame(yielded.frame_idx);
-                    }
-                    continue;
-                }
                 let mut hidden_obj_ids = temporal_disambiguation_state.hidden_obj_ids().clone();
                 hidden_obj_ids.extend(
                     temporal_disambiguation_state.unconfirmed_obj_ids_for_yield_frame(
@@ -2593,6 +2598,123 @@ pub(super) fn build_processing_order(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct HotstartFixtureOutput {
+        frame_idx: usize,
+        is_prompt_frame: bool,
+    }
+
+    fn reference_hotstart_schedule(
+        processing_order: &[HotstartFixtureOutput],
+        hotstart_delay: usize,
+    ) -> Vec<Vec<HotstartFixtureOutput>> {
+        // Literal scheduling contract from Meta SAM3's
+        // sam3/model/sam3_video_inference.py::propagate_in_video.
+        let mut buffer = Vec::new();
+        processing_order
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(order_idx, output)| {
+                if hotstart_delay == 0 {
+                    return vec![output];
+                }
+                buffer.push(output);
+                if order_idx + 1 == processing_order.len() {
+                    std::mem::take(&mut buffer)
+                } else if buffer.len() >= hotstart_delay {
+                    vec![buffer.remove(0)]
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect()
+    }
+
+    fn candle_hotstart_schedule(
+        processing_order: &[HotstartFixtureOutput],
+        hotstart_delay: usize,
+    ) -> (Vec<Vec<HotstartFixtureOutput>>, usize) {
+        let mut buffer = VecDeque::new();
+        let mut peak_buffered = 0;
+        let batches = processing_order
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(order_idx, output)| {
+                let batch = Sam3VideoPredictor::schedule_hotstart_output(
+                    &mut buffer,
+                    output,
+                    hotstart_delay,
+                    order_idx + 1 == processing_order.len(),
+                );
+                peak_buffered = peak_buffered.max(buffer.len());
+                batch
+            })
+            .collect();
+        (batches, peak_buffered)
+    }
+
+    #[test]
+    fn hotstart_schedule_matches_reference_for_mixed_prompt_frames_and_directions() {
+        for hotstart_delay in [0, 1, 15] {
+            for reverse in [false, true] {
+                let mut processing_order = (0..20)
+                    .map(|frame_idx| HotstartFixtureOutput {
+                        frame_idx,
+                        is_prompt_frame: matches!(frame_idx, 2 | 7 | 18),
+                    })
+                    .collect::<Vec<_>>();
+                if reverse {
+                    processing_order.reverse();
+                }
+
+                let expected = reference_hotstart_schedule(&processing_order, hotstart_delay);
+                let (actual, peak_buffered) =
+                    candle_hotstart_schedule(&processing_order, hotstart_delay);
+                assert_eq!(
+                    actual, expected,
+                    "delay={hotstart_delay}, reverse={reverse}"
+                );
+                assert!(peak_buffered <= hotstart_delay);
+
+                let flattened = actual.iter().flatten().copied().collect::<Vec<_>>();
+                assert_eq!(flattened, processing_order);
+                assert_eq!(
+                    flattened
+                        .iter()
+                        .map(|output| output.frame_idx)
+                        .collect::<BTreeSet<_>>()
+                        .len(),
+                    processing_order.len(),
+                    "each frame must be emitted exactly once"
+                );
+
+                if hotstart_delay == 15 {
+                    for (input_step, prompt) in processing_order
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, output)| output.is_prompt_frame)
+                    {
+                        let output_step = actual
+                            .iter()
+                            .position(|batch| batch.contains(prompt))
+                            .expect("prompt frame must be emitted");
+                        assert!(
+                            output_step > input_step,
+                            "prompt frame {} must use the same delayed queue",
+                            prompt.frame_idx
+                        );
+                    }
+                    assert!(
+                        actual.last().is_some_and(|batch| batch.len() > 1),
+                        "the final partial queue must be burst-drained"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn bounded_history_minimum_covers_tracker_selection_windows() {
