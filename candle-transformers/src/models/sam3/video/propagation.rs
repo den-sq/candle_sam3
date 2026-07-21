@@ -314,6 +314,16 @@ impl<'a> Sam3VideoPredictor<'a> {
         source: VideoSource,
         options: VideoSessionOptions,
     ) -> Result<String> {
+        if let Some(limit) = options.max_non_cond_tracker_states {
+            let minimum = minimum_non_cond_tracker_state_bound(self.tracker_core.tracker.config());
+            if limit < minimum {
+                candle::bail!(
+                    "max_non_cond_tracker_states {} is smaller than the tracker-required bound {}",
+                    limit,
+                    minimum
+                );
+            }
+        }
         let session_id = format!("session_{}", self.next_session_id);
         self.next_session_id += 1;
         let frame_source = source.into_frame_source(self.model.config(), &options)?;
@@ -560,6 +570,7 @@ impl<'a> Sam3VideoPredictor<'a> {
             } else {
                 yield_list.push(output);
             }
+            session.record_hotstart_buffer(&hotstart_buffer);
             let current_removed_obj_ids = temporal_disambiguation_state.hidden_obj_ids().clone();
             let newly_removed_obj_ids = current_removed_obj_ids
                 .difference(&previous_removed_obj_ids)
@@ -628,6 +639,7 @@ impl<'a> Sam3VideoPredictor<'a> {
                     session.evict_cached_output_frame(filtered.frame_idx);
                 }
             }
+            session.evict_bounded_tracker_history(options.direction);
             session.evict_for_frame(frame_idx, options.direction);
         }
         Ok(())
@@ -672,6 +684,20 @@ impl<'a> Sam3VideoPredictor<'a> {
             .ok_or_else(|| candle::Error::Msg(format!("unknown session {}", session_id)))?;
         Ok(session.cache_stats())
     }
+}
+
+fn minimum_non_cond_tracker_state_bound(config: &Sam3TrackerConfig) -> usize {
+    let mask_memory_window = config
+        .num_maskmem
+        .saturating_mul(config.memory_temporal_stride_for_eval.max(1));
+    let object_pointer_window = config.max_obj_ptrs_in_encoder.saturating_sub(1);
+    let refinement_window = config
+        .predictor
+        .refinement_detector_cond_frame_removal_window;
+    mask_memory_window
+        .max(object_pointer_window)
+        .max(refinement_window)
+        .max(1)
 }
 
 #[cfg(feature = "sam3-parity-support")]
@@ -2555,6 +2581,21 @@ pub(super) fn build_processing_order(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_history_minimum_covers_tracker_selection_windows() {
+        let config = Sam3TrackerConfig::from_sam3_config(&crate::models::sam3::Config::default());
+        let minimum = minimum_non_cond_tracker_state_bound(&config);
+        assert!(minimum >= config.num_maskmem * config.memory_temporal_stride_for_eval.max(1));
+        assert!(minimum >= config.max_obj_ptrs_in_encoder.saturating_sub(1));
+        assert!(
+            minimum
+                >= config
+                    .predictor
+                    .refinement_detector_cond_frame_removal_window
+        );
+        assert_eq!(minimum, 16);
+    }
 
     #[test]
     fn compact_cached_output_round_trips_thresholded_masks_logits_and_boxes() -> Result<()> {

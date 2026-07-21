@@ -15,11 +15,8 @@ use super::{
         interpolate::resize_bilinear2d_antialias,
         masks::{binary_planes_iou, mask_to_bool_plane},
     },
-    Sam3ImageModel, Sam3TrackerModel, TrackerFrameState,
+    Sam3ImageModel, Sam3TrackerConfig, Sam3TrackerModel, TrackerFrameState,
 };
-#[cfg(test)]
-#[allow(unused_imports)]
-use super::{Config, Sam3TrackerConfig};
 
 const CLIP_EOT_TOKEN: &str = "<|endoftext|>";
 
