@@ -469,4 +469,3 @@ fn normalize_padding_mask(mask: &Tensor, batch_size: usize, seq_len: usize) -> R
         ),
     }
 }
-

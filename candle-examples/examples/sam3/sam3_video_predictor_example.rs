@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use candle::{Device, IndexOp};
+use candle_examples::sam3_video::MediaFrameSource;
 use candle_transformers::models::sam3;
 use image::{ImageReader, Rgba, RgbaImage};
 use imageproc::drawing::draw_hollow_rect_mut;
@@ -92,10 +93,12 @@ pub(crate) fn run(
         }))?,
     )?;
 
-    let source: sam3::VideoSource = sam3::VideoSource::from_path(
-        video_path
-            .to_str()
-            .context("video notebook path is not valid UTF-8")?,
+    let config = model.config();
+    let source = MediaFrameSource::from_path(
+        &video_path,
+        config.image.image_size,
+        config.image.image_mean,
+        config.image.image_std,
     )?;
     let session_options = sam3::VideoSessionOptions {
         tokenizer_path: Some(PathBuf::from(&tokenizer_path)),
@@ -105,9 +108,12 @@ pub(crate) fn run(
         prefetch_ahead,
         prefetch_behind,
         max_feature_cache_entries,
+        max_non_cond_tracker_states: None,
     };
-    let mut predictor: sam3::Sam3VideoPredictor<'_> = sam3::Sam3VideoPredictor::new(model, tracker, device);
-    let session_id: String = predictor.start_session(source, session_options)?;
+    let mut predictor: sam3::Sam3VideoPredictor<'_> =
+        sam3::Sam3VideoPredictor::new(model, tracker, device);
+    let session_id: String =
+        predictor.start_session_with_frame_source(Box::new(source), session_options)?;
     predictor.reset_session(&session_id)?;
 
     let seed_obj_id = predictor.add_prompt(

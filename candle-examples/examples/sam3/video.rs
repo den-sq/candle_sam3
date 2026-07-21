@@ -4,10 +4,12 @@ use std::fs;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use candle::Device;
 use candle::{IndexOp, Tensor};
+use candle_examples::sam3_video::{MediaFrameSource, PngVideoDebugArtifactSink};
 use candle_transformers::models::sam3;
 use image::{ImageReader, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
@@ -154,7 +156,13 @@ pub fn run_video_prediction(
     println!("Starting video prediction for: {}", video_mode.video_path);
 
     let source_path = PathBuf::from(&video_mode.video_path);
-    let source = sam3::VideoSource::from_path(&video_mode.video_path)?;
+    let config = model.config();
+    let source = MediaFrameSource::from_path(
+        &video_mode.video_path,
+        config.image.image_size,
+        config.image.image_mean,
+        config.image.image_std,
+    )?;
     let memory_profile = if video_mode.use_low_memory_profile {
         sam3::VideoMemoryProfile::LowMemory
     } else {
@@ -168,6 +176,7 @@ pub fn run_video_prediction(
         prefetch_ahead: video_mode.prefetch_ahead,
         prefetch_behind: video_mode.prefetch_behind,
         max_feature_cache_entries: video_mode.max_feature_cache_entries,
+        max_non_cond_tracker_states: None,
     };
     let debug_root = output_dir.join(VIDEO_DEBUG_DIR);
     if video_mode.debug_bundle {
@@ -181,9 +190,14 @@ pub fn run_video_prediction(
             capture_frame_indices: video_mode.debug_frame_indices.clone(),
             capture_first_propagated_only: true,
             output_root: video_mode.debug_bundle.then_some(debug_root.clone()),
+            artifact_sink: video_mode.debug_bundle.then(|| {
+                Arc::new(PngVideoDebugArtifactSink::new(debug_root.clone()))
+                    as Arc<dyn sam3::VideoDebugArtifactSink>
+            }),
         },
     );
-    let session_id = predictor.start_session(source, session_options)?;
+    let session_id =
+        predictor.start_session_with_frame_source(Box::new(source), session_options)?;
     let num_frames = predictor.session_frame_count(&session_id)?;
     println!("Created video session {session_id} with {num_frames} frames");
 

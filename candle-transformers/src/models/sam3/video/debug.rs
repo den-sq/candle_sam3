@@ -3,7 +3,6 @@ use std::fs;
 use std::path::PathBuf;
 
 use candle::{DType, IndexOp, Result, Tensor};
-use image::{GrayImage, Luma};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -112,6 +111,9 @@ impl VideoDebugRecorder {
     pub(super) fn new(session_id: &str, config: VideoDebugConfig) -> Result<Option<Self>> {
         if !config.enabled {
             return Ok(None);
+        }
+        if config.artifact_sink.is_none() {
+            candle::bail!("video debug capture requires a caller-provided artifact sink")
         }
         let output_root = config
             .output_root
@@ -374,31 +376,27 @@ impl VideoDebugRecorder {
     }
 
     fn write_binary_mask(&self, file_name: &str, mask_probs: &[Vec<f32>]) -> Result<PathBuf> {
-        let height = mask_probs.len() as u32;
-        let width = mask_probs.first().map(Vec::len).unwrap_or(0) as u32;
-        let mut image = GrayImage::new(width, height);
-        for (y, row) in mask_probs.iter().enumerate() {
-            for (x, value) in row.iter().enumerate() {
-                let pixel = if *value >= VIDEO_DEBUG_MASK_THRESHOLD {
-                    255u8
-                } else {
-                    0u8
-                };
-                image.put_pixel(x as u32, y as u32, Luma([pixel]));
-            }
-        }
-        let path = self.output_root.join(file_name);
-        image.save(&path).map_err(|err| {
-            candle::Error::Msg(format!(
-                "failed to save debug mask {}: {}",
-                path.display(),
-                err
-            ))
-        })?;
-        Ok(path
-            .strip_prefix(&self.output_root)
-            .unwrap_or(&path)
-            .to_path_buf())
+        let height = mask_probs.len();
+        let width = mask_probs.first().map(Vec::len).unwrap_or(0);
+        let pixels = mask_probs
+            .iter()
+            .flat_map(|row| {
+                row.iter().map(|value| {
+                    if *value >= VIDEO_DEBUG_MASK_THRESHOLD {
+                        255u8
+                    } else {
+                        0u8
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let relative_path = PathBuf::from(file_name);
+        self.config
+            .artifact_sink
+            .as_ref()
+            .expect("validated artifact sink")
+            .write_binary_mask(&relative_path, width, height, &pixels)?;
+        Ok(relative_path)
     }
 
     pub(super) fn flush_manifest(&self) -> Result<()> {
@@ -528,4 +526,93 @@ fn summarize_tracker_state(state: &TrackerFrameState) -> Result<VideoDebugTracke
             .map(|tensor| summarize_tensor(tensor, None))
             .transpose()?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::models::sam3::VideoDebugArtifactSink;
+
+    #[derive(Debug, Default)]
+    struct RecordingSink {
+        writes: Mutex<Vec<(PathBuf, usize, usize, Vec<u8>)>>,
+    }
+
+    impl VideoDebugArtifactSink for RecordingSink {
+        fn write_binary_mask(
+            &self,
+            relative_path: &Path,
+            width: usize,
+            height: usize,
+            pixels: &[u8],
+        ) -> Result<()> {
+            self.writes.lock().unwrap().push((
+                relative_path.to_path_buf(),
+                width,
+                height,
+                pixels.to_vec(),
+            ));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn debug_manifest_and_mask_contract_remain_codec_independent() -> Result<()> {
+        let output_root = std::env::temp_dir().join(format!(
+            "sam3-debug-sink-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&output_root);
+        let sink = Arc::new(RecordingSink::default());
+        let recorder = VideoDebugRecorder::new(
+            "session_test",
+            VideoDebugConfig {
+                enabled: true,
+                output_root: Some(output_root.clone()),
+                artifact_sink: Some(sink.clone()),
+                ..VideoDebugConfig::default()
+            },
+        )?
+        .expect("debug recorder");
+
+        let path = recorder.write_binary_mask(
+            "frame_000001_obj_000001_mask.png",
+            &[vec![0.49, 0.5], vec![0.75, 0.0]],
+        )?;
+        assert_eq!(path, PathBuf::from("frame_000001_obj_000001_mask.png"));
+        assert_eq!(
+            *sink.writes.lock().unwrap(),
+            vec![(path, 2, 2, vec![0, 255, 255, 0])]
+        );
+
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(output_root.join(VIDEO_DEBUG_MANIFEST_FILE)).map_err(candle::Error::wrap)?,
+        )
+        .map_err(|error| candle::Error::Msg(error.to_string()))?;
+        assert_eq!(manifest["bundle_version"], 1);
+        assert_eq!(manifest["mode"], "video_debug_bundle");
+        assert_eq!(manifest["source"], "candle");
+        assert_eq!(manifest["session_id"], "session_test");
+        fs::remove_dir_all(output_root).map_err(candle::Error::wrap)?;
+        Ok(())
+    }
+
+    #[test]
+    fn enabled_debug_capture_requires_an_artifact_sink() {
+        let error = VideoDebugRecorder::new(
+            "session_test",
+            VideoDebugConfig {
+                enabled: true,
+                ..VideoDebugConfig::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires a caller-provided artifact sink"));
+    }
 }

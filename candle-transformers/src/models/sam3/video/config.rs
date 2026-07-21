@@ -1,4 +1,10 @@
-use std::path::PathBuf;
+use std::{
+    fmt::Debug,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use candle::Result;
 
 use super::super::Sam3TrackerConfig;
 
@@ -118,6 +124,22 @@ pub struct VideoDebugConfig {
     pub capture_frame_indices: Vec<usize>,
     pub capture_first_propagated_only: bool,
     pub output_root: Option<PathBuf>,
+    /// Caller-owned encoder for binary mask artifacts.
+    ///
+    /// The sink receives a path relative to `output_root`, row-major binary
+    /// pixels, and their dimensions. Core SAM3 code never depends on an image
+    /// codec implementation.
+    pub artifact_sink: Option<Arc<dyn VideoDebugArtifactSink>>,
+}
+
+pub trait VideoDebugArtifactSink: Debug + Send + Sync {
+    fn write_binary_mask(
+        &self,
+        relative_path: &Path,
+        width: usize,
+        height: usize,
+        pixels: &[u8],
+    ) -> Result<()>;
 }
 
 impl Default for VideoDebugConfig {
@@ -128,6 +150,7 @@ impl Default for VideoDebugConfig {
             capture_frame_indices: Vec::new(),
             capture_first_propagated_only: true,
             output_root: None,
+            artifact_sink: None,
         }
     }
 }
