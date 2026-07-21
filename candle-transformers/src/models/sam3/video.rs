@@ -23,10 +23,7 @@ const CLIP_EOT_TOKEN: &str = "<|endoftext|>";
 mod config;
 pub use config::*;
 mod sources;
-#[cfg(test)]
-#[allow(unused_imports)]
-pub(crate) use sources::{frame_blob_from_rgb_image_with_filter, FrameBlob};
-pub use sources::{FrameSource, VideoSource};
+pub use sources::{normalize_rgb_frame_for_sam3, FrameSource, VideoSource};
 mod propagation;
 use propagation::*;
 pub use propagation::{

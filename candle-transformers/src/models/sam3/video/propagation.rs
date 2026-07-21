@@ -314,6 +314,19 @@ impl<'a> Sam3VideoPredictor<'a> {
         source: VideoSource,
         options: VideoSessionOptions,
     ) -> Result<String> {
+        let frame_source = source.into_frame_source(&options)?;
+        self.start_session_with_frame_source(frame_source, options)
+    }
+
+    /// Start a session from a caller-owned lazy tensor source.
+    ///
+    /// Decode, resize, prefetch, cache, and source lifetime remain in the
+    /// adapter while the predictor retains tensor-only model contracts.
+    pub fn start_session_with_frame_source(
+        &mut self,
+        frame_source: Box<dyn FrameSource>,
+        options: VideoSessionOptions,
+    ) -> Result<String> {
         if let Some(limit) = options.max_non_cond_tracker_states {
             let minimum = minimum_non_cond_tracker_state_bound(self.tracker_core.tracker.config());
             if limit < minimum {
@@ -326,7 +339,6 @@ impl<'a> Sam3VideoPredictor<'a> {
         }
         let session_id = format!("session_{}", self.next_session_id);
         self.next_session_id += 1;
-        let frame_source = source.into_frame_source(self.model.config(), &options)?;
         let mut session = Sam3VideoSession::new(
             session_id.clone(),
             frame_source,
