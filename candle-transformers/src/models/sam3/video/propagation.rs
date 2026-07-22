@@ -1,8 +1,7 @@
 use super::*;
 use crate::models::sam3::neck::TrackerVisualSequences;
-use crate::models::sam3::tracker::add_tensor_memory;
+use crate::models::sam3::tracker::{add_tensor_memory, maybe_to_dtype, PackedPromptHistory};
 use crate::models::sam3::torch_ops::tensor::first_scalar_f32;
-use crate::models::sam3::tracker::PackedPromptHistory;
 
 #[derive(Debug, Clone)]
 pub struct SessionPrompt {
@@ -789,8 +788,22 @@ impl Sam3VideoTrackerCore<'_> {
         state: &TrackerFrameState,
         storage_device: &Device,
         low_memory_mode: bool,
+        retained_state_dtype: RetainedStateDType,
     ) -> Result<TrackerFrameState> {
         let mut state = move_tracker_state(state, storage_device)?;
+        if matches!(storage_device, Device::Cpu) {
+            let dtype = retained_state_dtype.candle_dtype();
+            state.maskmem_features = state
+                .maskmem_features
+                .as_ref()
+                .map(|tensor| maybe_to_dtype(tensor, dtype))
+                .transpose()?;
+            state.maskmem_prompt_features = state
+                .maskmem_prompt_features
+                .as_ref()
+                .map(|tensor| maybe_to_dtype(tensor, dtype))
+                .transpose()?;
+        }
         state.memory_selection_score = self.tracker_state_memory_selection_score(&state)?;
         let can_drop_render_tensors = !state.is_cond_frame
             || (state.maskmem_features.is_some() && state.maskmem_pos_enc.is_some());
@@ -879,6 +892,7 @@ impl Sam3VideoTrackerCore<'_> {
                 &updated_state,
                 session.storage_device(),
                 session.low_memory_mode(),
+                session.retained_state_dtype(),
             )?;
             if let Some(tracked) = session.tracked_objects.get_mut(&object.obj_id) {
                 tracked.clear_prompt_history_cache();
@@ -2294,6 +2308,7 @@ impl Sam3VideoTrackerCore<'_> {
                 &tracker_state,
                 session.storage_device(),
                 low_memory_mode,
+                session.retained_state_dtype(),
             )?;
             if let Some(object) = session.tracked_objects.get_mut(&obj_id) {
                 let replaced = object

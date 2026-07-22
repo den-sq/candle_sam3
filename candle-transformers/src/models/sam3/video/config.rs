@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use candle::Result;
+use candle::{DType, Result};
 
 use super::super::Sam3TrackerConfig;
 
@@ -88,12 +88,33 @@ pub enum VideoMemoryProfile {
     LowMemory,
 }
 
+/// Storage precision for retained mask-memory feature tensors.
+///
+/// Tensors are cast back to the model compute dtype when read. This setting is
+/// independent from model compute precision and only affects retained state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RetainedStateDType {
+    F32,
+    #[default]
+    BF16,
+}
+
+impl RetainedStateDType {
+    pub(crate) fn candle_dtype(self) -> DType {
+        match self {
+            Self::F32 => DType::F32,
+            Self::BF16 => DType::BF16,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VideoSessionOptions {
     pub tokenizer_path: Option<PathBuf>,
     pub memory_profile: VideoMemoryProfile,
     pub offload_frames_to_cpu: bool,
     pub offload_state_to_cpu: bool,
+    pub retained_state_dtype: RetainedStateDType,
     pub prefetch_ahead: usize,
     pub prefetch_behind: usize,
     pub max_feature_cache_entries: usize,
@@ -112,6 +133,7 @@ impl Default for VideoSessionOptions {
             memory_profile: VideoMemoryProfile::Balanced,
             offload_frames_to_cpu: false,
             offload_state_to_cpu: false,
+            retained_state_dtype: RetainedStateDType::BF16,
             prefetch_ahead: 2,
             prefetch_behind: 1,
             max_feature_cache_entries: 2,

@@ -31,6 +31,9 @@ pub struct SessionCacheStats {
     pub retained_tracker_states: usize,
     pub retained_non_cond_tracker_states: usize,
     pub retained_output_frame_indices: usize,
+    pub retained_state_dtype: RetainedStateDType,
+    pub postprocess_foreground_scalar_reads: usize,
+    pub postprocess_score_scalar_reads: usize,
     pub cpu_low_res_mask_bytes: usize,
     pub device_low_res_mask_bytes: usize,
     pub hotstart_buffered_frames: usize,
@@ -322,6 +325,8 @@ pub struct Sam3VideoSession {
     peak_hotstart_buffered_frames: usize,
     peak_hotstart_buffered_cpu_bytes: usize,
     peak_hotstart_buffered_device_bytes: usize,
+    postprocess_foreground_scalar_reads: usize,
+    postprocess_score_scalar_reads: usize,
 }
 
 impl Sam3VideoSession {
@@ -364,6 +369,8 @@ impl Sam3VideoSession {
             peak_hotstart_buffered_frames: 0,
             peak_hotstart_buffered_cpu_bytes: 0,
             peak_hotstart_buffered_device_bytes: 0,
+            postprocess_foreground_scalar_reads: 0,
+            postprocess_score_scalar_reads: 0,
         })
     }
 
@@ -464,6 +471,9 @@ impl Sam3VideoSession {
             retained_tracker_states,
             retained_non_cond_tracker_states,
             retained_output_frame_indices,
+            retained_state_dtype: self.session_options.retained_state_dtype,
+            postprocess_foreground_scalar_reads: self.postprocess_foreground_scalar_reads,
+            postprocess_score_scalar_reads: self.postprocess_score_scalar_reads,
             cpu_low_res_mask_bytes,
             device_low_res_mask_bytes,
             hotstart_buffered_frames: self.hotstart_buffered_frames,
@@ -493,6 +503,19 @@ impl Sam3VideoSession {
 
     pub(crate) fn storage_device(&self) -> &Device {
         &self.storage_device
+    }
+
+    pub(crate) fn retained_state_dtype(&self) -> RetainedStateDType {
+        self.session_options.retained_state_dtype
+    }
+
+    pub(crate) fn record_postprocess_foreground_scalar_read(&mut self) {
+        self.postprocess_foreground_scalar_reads =
+            self.postprocess_foreground_scalar_reads.saturating_add(1);
+    }
+
+    pub(crate) fn record_postprocess_score_scalar_read(&mut self) {
+        self.postprocess_score_scalar_reads = self.postprocess_score_scalar_reads.saturating_add(1);
     }
 
     pub(crate) fn memory_profile(&self) -> &VideoMemoryProfile {
@@ -649,6 +672,7 @@ impl Sam3VideoSession {
         self.feature_cache_order.clear();
         self.text_cache.clear();
         self.clear_hotstart_stats();
+        self.clear_postprocess_stats();
         self.frame_source.close();
     }
 
@@ -664,6 +688,7 @@ impl Sam3VideoSession {
         self.tracked_objects.clear();
         self.text_cache.clear();
         self.clear_hotstart_stats();
+        self.clear_postprocess_stats();
         self.debug_recorder = None;
     }
 
@@ -779,6 +804,11 @@ impl Sam3VideoSession {
         self.peak_hotstart_buffered_frames = 0;
         self.peak_hotstart_buffered_cpu_bytes = 0;
         self.peak_hotstart_buffered_device_bytes = 0;
+    }
+
+    fn clear_postprocess_stats(&mut self) {
+        self.postprocess_foreground_scalar_reads = 0;
+        self.postprocess_score_scalar_reads = 0;
     }
 
     fn prefetch_window(
@@ -1046,6 +1076,8 @@ mod tests {
             peak_hotstart_buffered_frames: 0,
             peak_hotstart_buffered_cpu_bytes: 0,
             peak_hotstart_buffered_device_bytes: 0,
+            postprocess_foreground_scalar_reads: 0,
+            postprocess_score_scalar_reads: 0,
         })
     }
 
@@ -1244,6 +1276,25 @@ mod tests {
         assert_eq!(drained.peak_hotstart_buffered_frames, 2);
         session.reset();
         assert_eq!(session.cache_stats().peak_hotstart_buffered_frames, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn postprocess_scalar_read_stats_and_retained_dtype_are_explicit_and_resettable() -> Result<()>
+    {
+        let mut session = test_session(VideoMemoryProfile::LowMemory)?;
+        session.session_options.retained_state_dtype = RetainedStateDType::F32;
+        session.record_postprocess_foreground_scalar_read();
+        session.record_postprocess_score_scalar_read();
+        let stats = session.cache_stats();
+        assert_eq!(stats.retained_state_dtype, RetainedStateDType::F32);
+        assert_eq!(stats.postprocess_foreground_scalar_reads, 1);
+        assert_eq!(stats.postprocess_score_scalar_reads, 1);
+
+        session.reset();
+        let stats = session.cache_stats();
+        assert_eq!(stats.postprocess_foreground_scalar_reads, 0);
+        assert_eq!(stats.postprocess_score_scalar_reads, 0);
         Ok(())
     }
 
