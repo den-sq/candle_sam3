@@ -416,6 +416,7 @@ pub(super) fn postprocess_low_res_mask_logits_for_video(
 }
 
 fn postprocess_low_res_mask_logits_on_cpu(mask_logits: &Tensor, max_area: usize) -> Result<Tensor> {
+    let mask_logits = mask_logits.to_dtype(DType::F32)?;
     let (batch, channel, height, width) = mask_logits.dims4()?;
     let mut processed = Vec::with_capacity(batch * channel * height * width);
 
@@ -752,6 +753,22 @@ mod tests {
             .iter()
             .zip(expected)
             .all(|(actual, expected)| (actual - expected).abs() <= 1e-6));
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_low_res_postprocess_accepts_half_compute_logits() -> Result<()> {
+        let logits = Tensor::from_vec(
+            vec![-1.0f32, -1.0, -1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0],
+            (1, 1, 3, 3),
+            &Device::Cpu,
+        )?
+        .to_dtype(DType::F16)?;
+
+        let processed = postprocess_low_res_mask_logits_on_cpu(&logits, 1)?;
+
+        assert_eq!(processed.dtype(), DType::F32);
+        assert_eq!(processed.dims4()?, (1, 1, 3, 3));
         Ok(())
     }
 
