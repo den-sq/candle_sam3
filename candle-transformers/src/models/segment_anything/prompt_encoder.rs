@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use candle::{DType, Device, IndexOp, Result, Tensor, D};
+use candle::{D, DType, Device, IndexOp, Result, Tensor};
 use candle_nn::VarBuilder;
 
 #[derive(Debug)]
@@ -19,7 +19,9 @@ impl PositionEmbeddingRandom {
     }
 
     fn pe_encoding(&self, coords: &Tensor) -> Result<Tensor> {
-        let coords = coords.affine(2., -1.)?;
+        let coords = coords
+            .affine(2., -1.)?
+            .to_dtype(self.positional_encoding_gaussian_matrix.dtype())?;
         let coords = coords.broadcast_matmul(&self.positional_encoding_gaussian_matrix)?;
         let coords = (coords * (2. * std::f64::consts::PI))?;
         Tensor::cat(&[coords.sin()?, coords.cos()?], D::Minus1)
@@ -206,6 +208,7 @@ impl PromptEncoder {
 
     fn embed_masks(&self, masks: &Tensor) -> Result<Tensor> {
         masks
+            .to_dtype(self.no_mask_embed.embeddings().dtype())?
             .apply(&self.mask_downscaling_conv1)?
             .apply(&self.mask_downscaling_ln1)?
             .gelu()?
@@ -317,7 +320,9 @@ impl PromptEncoder {
         };
 
         let dense_embeddings = match masks {
-            None => self.no_mask_dense_embedding_with_dtype(self.no_mask_embed.embeddings().dtype())?,
+            None => {
+                self.no_mask_dense_embedding_with_dtype(self.no_mask_embed.embeddings().dtype())?
+            }
             Some(masks) => self.embed_masks(masks)?,
         };
         Ok((sparse_embeddings, dense_embeddings))
