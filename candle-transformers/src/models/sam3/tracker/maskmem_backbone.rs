@@ -112,7 +112,7 @@ impl TrackerSimpleMaskDownSampler {
     }
 
     pub(super) fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let mut xs = xs.to_dtype(DType::F32)?;
+        let mut xs = xs.to_dtype(self.out_proj.weight().dtype())?;
         let (_, _, height, width) = xs.dims4()?;
         if [height, width] != self.interpol_size {
             xs = resize_bilinear2d_antialias(&xs, self.interpol_size[0], self.interpol_size[1])?;
