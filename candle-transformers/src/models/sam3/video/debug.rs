@@ -6,8 +6,8 @@ use candle::{DType, IndexOp, Result, Tensor};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ObjectFrameOutput, PropagationDirection, SessionPrompt, TrackedObject, TrackerFrameState,
-    VideoDebugConfig, VIDEO_DEBUG_MANIFEST_FILE, VIDEO_DEBUG_MASK_THRESHOLD,
+    ObjectFrameOutput, PropagationDirection, SessionPrompt, TextPromptTokens, TrackedObject,
+    TrackerFrameState, VideoDebugConfig, VIDEO_DEBUG_MANIFEST_FILE, VIDEO_DEBUG_MASK_THRESHOLD,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -423,7 +423,10 @@ pub(super) fn debug_prompt_metadata(
     used_visual_text_prompt: bool,
 ) -> Result<VideoDebugPromptMetadata> {
     Ok(VideoDebugPromptMetadata {
-        text_prompt: prompt.text.clone(),
+        text_prompt: prompt
+            .text
+            .as_ref()
+            .and_then(TextPromptTokens::display_text_owned),
         used_visual_text_prompt,
         normalized_points_xy: prompt
             .points

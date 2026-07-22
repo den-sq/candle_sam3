@@ -1,12 +1,54 @@
 use super::*;
 use crate::models::sam3::neck::TrackerVisualSequences;
-use crate::models::sam3::tracker::add_tensor_memory;
 use crate::models::sam3::torch_ops::tensor::first_scalar_f32;
+use crate::models::sam3::tracker::add_tensor_memory;
 use crate::models::sam3::tracker::PackedPromptHistory;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TextPromptTokens {
+    pub input_ids: Vec<u32>,
+    pub attention_mask: Vec<u32>,
+    /// Optional caller-owned metadata for diagnostics and result labeling.
+    /// It is deliberately excluded from text-encoding cache identity.
+    pub display_text: Option<String>,
+}
+
+impl TextPromptTokens {
+    pub fn new(input_ids: Vec<u32>, attention_mask: Vec<u32>) -> Self {
+        Self {
+            input_ids,
+            attention_mask,
+            display_text: None,
+        }
+    }
+
+    pub fn with_display_text(mut self, display_text: impl Into<String>) -> Self {
+        self.display_text = Some(display_text.into());
+        self
+    }
+
+    pub(super) fn validate(&self) -> Result<()> {
+        if self.input_ids.is_empty() {
+            candle::bail!("text prompt token IDs must not be empty")
+        }
+        if self.input_ids.len() != self.attention_mask.len() {
+            candle::bail!(
+                "text prompt token count {} does not match attention-mask count {}",
+                self.input_ids.len(),
+                self.attention_mask.len()
+            )
+        }
+        Ok(())
+    }
+
+    pub(crate) fn display_text_owned(&self) -> Option<String> {
+        self.display_text.clone()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SessionPrompt {
-    pub text: Option<String>,
+    pub text: Option<TextPromptTokens>,
     pub points: Option<Vec<(f32, f32)>>,
     pub point_labels: Option<Vec<u32>>,
     pub boxes: Option<Vec<(f32, f32, f32, f32)>>,
@@ -26,6 +68,9 @@ impl SessionPrompt {
     }
 
     pub(super) fn with_default_labels(mut self) -> Result<Self> {
+        if let Some(text) = self.text.as_ref() {
+            text.validate()?;
+        }
         match self.points.as_ref() {
             Some(points) if points.is_empty() => {
                 self.points = None;
@@ -562,11 +607,13 @@ impl<'a> Sam3VideoPredictor<'a> {
             let empty_mask_obj_ids = output
                 .objects
                 .iter()
-                .filter_map(|object| match mask_has_foreground(&object.mask_logits, 0.0) {
-                    Ok(true) => None,
-                    Ok(false) => Some(Ok(object.obj_id)),
-                    Err(err) => Some(Err(err)),
-                })
+                .filter_map(
+                    |object| match mask_has_foreground(&object.mask_logits, 0.0) {
+                        Ok(true) => None,
+                        Ok(false) => Some(Ok(object.obj_id)),
+                        Err(err) => Some(Err(err)),
+                    },
+                )
                 .collect::<Result<BTreeSet<_>>>()?;
             let previous_removed_obj_ids = temporal_disambiguation_state.hidden_obj_ids().clone();
             let is_last_frame = order_idx + 1 == processing_order.len();
@@ -1146,7 +1193,7 @@ impl Sam3VideoTrackerCore<'_> {
             ),
             object
                 .latest_text_prompt(frame_idx, direction)
-                .map(|(_, text)| text),
+                .and_then(|(_, text)| text.display_text_owned()),
             object.nearest_input_uses_explicit_geometry(frame_idx, direction),
             true,
             session.video_size(),
@@ -1293,7 +1340,10 @@ impl Sam3VideoTrackerCore<'_> {
             object.display_score.or(Some(1.0)),
             Some(frame_idx),
             Vec::new(),
-            prompt.text.clone(),
+            prompt
+                .text
+                .as_ref()
+                .and_then(TextPromptTokens::display_text_owned),
             prompt.has_geometry(),
             false,
             session.video_size(),
@@ -1367,7 +1417,10 @@ impl Sam3VideoTrackerCore<'_> {
             &grounding,
             Some(frame_idx),
             Vec::new(),
-            prompt.text.clone(),
+            prompt
+                .text
+                .as_ref()
+                .and_then(TextPromptTokens::display_text_owned),
             true,
             false,
             session.video_size(),
@@ -1412,7 +1465,8 @@ impl Sam3VideoTrackerCore<'_> {
                 packed_history.as_ref(),
             )?
             .state;
-        tracker_state = self.attach_state_memory(&tracker_visual_features, &tracker_state, false)?;
+        tracker_state =
+            self.attach_state_memory(&tracker_visual_features, &tracker_state, false)?;
         let detector_score = detector_output.score_value()?;
         let mut output = tracker_state_to_object_output(
             object.obj_id,
@@ -1420,7 +1474,10 @@ impl Sam3VideoTrackerCore<'_> {
             Some(detector_score),
             Some(frame_idx),
             Vec::new(),
-            prompt.text.clone(),
+            prompt
+                .text
+                .as_ref()
+                .and_then(TextPromptTokens::display_text_owned),
             true,
             false,
             session.video_size(),
@@ -1569,9 +1626,10 @@ impl Sam3VideoTrackerCore<'_> {
         let visual_features = session.get_visual_features(model, compute_device, frame_idx)?;
         let tracker_visual_features = tracker_visual_output(&visual_features);
         let text_encoding = session.cached_text_encoding(model, text, compute_device)?;
-        let encoded_prompt = combine_encoded_prompts(Some(&text_encoding), None)?.ok_or_else(|| {
-            candle::Error::Msg("text prompt seed path produced no encoded prompt".to_owned())
-        })?;
+        let encoded_prompt =
+            combine_encoded_prompts(Some(&text_encoding), None)?.ok_or_else(|| {
+                candle::Error::Msg("text prompt seed path produced no encoded prompt".to_owned())
+            })?;
         let grounding = ground_all_from_encoded_prompt(model, &visual_features, &encoded_prompt)?;
         let query_count = grounding_query_count(&grounding.scores)?;
         let mut results = Vec::new();
@@ -1595,14 +1653,13 @@ impl Sam3VideoTrackerCore<'_> {
                 )?
             };
 
-            let query_grounding =
-                grounding_query_output(&grounding, query_idx, detector_score)?;
+            let query_grounding = grounding_query_output(&grounding, query_idx, detector_score)?;
             let mut detector_output = grounding_to_object_output(
                 obj_id,
                 &query_grounding,
                 Some(frame_idx),
                 Vec::new(),
-                Some(text.clone()),
+                text.display_text_owned(),
                 false,
                 false,
                 session.video_size(),
@@ -1663,7 +1720,7 @@ impl Sam3VideoTrackerCore<'_> {
                     Some(detector_score),
                     Some(frame_idx),
                     Vec::new(),
-                    Some(text.clone()),
+                    text.display_text_owned(),
                     false,
                     false,
                     session.video_size(),
@@ -1717,7 +1774,14 @@ impl Sam3VideoTrackerCore<'_> {
         let text_encoding = match prompt.text.as_ref() {
             Some(text) => Some(session.cached_text_encoding(model, text, compute_device)?),
             None if used_visual_prompt => {
-                Some(session.cached_text_encoding(model, "visual", compute_device)?)
+                let visual_tokens = session.visual_prompt_tokens().cloned().ok_or_else(|| {
+                    candle::Error::Msg(
+                        "box-only prompts require pre-tokenized visual sentinel tokens in \
+                         VideoSessionOptions.visual_prompt_tokens"
+                            .to_owned(),
+                    )
+                })?;
+                Some(session.cached_text_encoding(model, &visual_tokens, compute_device)?)
             }
             None => None,
         };
@@ -1732,7 +1796,10 @@ impl Sam3VideoTrackerCore<'_> {
             &grounding,
             Some(frame_idx),
             Vec::new(),
-            prompt.text.clone(),
+            prompt
+                .text
+                .as_ref()
+                .and_then(TextPromptTokens::display_text_owned),
             true,
             false,
             session.video_size(),
@@ -1784,7 +1851,10 @@ impl Sam3VideoTrackerCore<'_> {
             Some(detector_score),
             Some(frame_idx),
             Vec::new(),
-            prompt.text.clone(),
+            prompt
+                .text
+                .as_ref()
+                .and_then(TextPromptTokens::display_text_owned),
             true,
             false,
             session.video_size(),
@@ -1883,7 +1953,10 @@ impl Sam3VideoTrackerCore<'_> {
             Some(1.0),
             Some(frame_idx),
             Vec::new(),
-            prompt.text.clone(),
+            prompt
+                .text
+                .as_ref()
+                .and_then(TextPromptTokens::display_text_owned),
             prompt.has_geometry(),
             false,
             session.video_size(),
@@ -1996,7 +2069,8 @@ impl Sam3VideoTrackerCore<'_> {
             return Ok(matched);
         }
         let visual_features = session.get_visual_features(model, compute_device, frame_idx)?;
-        let mut detector_planes_by_prompt = BTreeMap::<String, Vec<Vec<Vec<bool>>>>::new();
+        let mut detector_planes_by_prompt =
+            BTreeMap::<(Vec<u32>, Vec<u32>), Vec<Vec<Vec<bool>>>>::new();
         for output in frame_output.objects.iter() {
             let Some(object) = session.tracked_objects.get(&output.obj_id) else {
                 continue;
@@ -2007,14 +2081,17 @@ impl Sam3VideoTrackerCore<'_> {
                 continue;
             };
             let tracker_plane = mask_to_bool_plane(&output.masks, VIDEO_DEBUG_MASK_THRESHOLD)?;
-            let detector_planes = if let Some(planes) = detector_planes_by_prompt.get(&text_prompt)
-            {
+            let prompt_key = (
+                text_prompt.input_ids.clone(),
+                text_prompt.attention_mask.clone(),
+            );
+            let detector_planes = if let Some(planes) = detector_planes_by_prompt.get(&prompt_key) {
                 planes.clone()
             } else {
                 let text_encoding =
                     session.cached_text_encoding(model, &text_prompt, compute_device)?;
-                let encoded_prompt =
-                    combine_encoded_prompts(Some(&text_encoding), None)?.ok_or_else(|| {
+                let encoded_prompt = combine_encoded_prompts(Some(&text_encoding), None)?
+                    .ok_or_else(|| {
                         candle::Error::Msg(
                             "text detector path produced no encoded prompt".to_owned(),
                         )
@@ -2043,10 +2120,7 @@ impl Sam3VideoTrackerCore<'_> {
                             .into_iter()
                             .next()
                             .unwrap_or(0.0),
-                        2 => grounding
-                            .scores
-                            .i((0, query_idx))?
-                            .to_vec0::<f32>()?,
+                        2 => grounding.scores.i((0, query_idx))?.to_vec0::<f32>()?,
                         1 => grounding.scores.i(query_idx)?.to_vec0::<f32>()?,
                         _ => 0.0,
                     };
@@ -2059,7 +2133,7 @@ impl Sam3VideoTrackerCore<'_> {
                     let masks = candle_nn::ops::sigmoid(&resized_logits)?;
                     planes.push(mask_to_bool_plane(&masks, VIDEO_DEBUG_MASK_THRESHOLD)?);
                 }
-                detector_planes_by_prompt.insert(text_prompt.clone(), planes.clone());
+                detector_planes_by_prompt.insert(prompt_key, planes.clone());
                 planes
             };
             if detector_planes.iter().any(|detector_plane| {
@@ -2275,10 +2349,7 @@ impl Sam3VideoTrackerCore<'_> {
             } else {
                 output.to_storage_device(session.storage_device())?
             };
-            stored_outputs.insert(
-                output.obj_id,
-                stored_output,
-            );
+            stored_outputs.insert(output.obj_id, stored_output);
         }
         if stored_outputs.is_empty() {
             session.frame_outputs.remove(&frame_idx);
@@ -2733,11 +2804,8 @@ mod tests {
 
     #[test]
     fn compact_cached_output_round_trips_thresholded_masks_logits_and_boxes() -> Result<()> {
-        let mask_logits = Tensor::from_vec(
-            vec![0.0f32, 1.0, -1.0, 0.5],
-            (1, 1, 2, 2),
-            &Device::Cpu,
-        )?;
+        let mask_logits =
+            Tensor::from_vec(vec![0.0f32, 1.0, -1.0, 0.5], (1, 1, 2, 2), &Device::Cpu)?;
         let masks = candle_nn::ops::sigmoid(&mask_logits)?;
         let output = ObjectFrameOutput {
             obj_id: 1,
@@ -2773,11 +2841,7 @@ mod tests {
                 .gt(0.5f64)?
                 .flatten_all()?
                 .to_vec1::<u8>()?,
-            output
-                .masks
-                .gt(0.5f64)?
-                .flatten_all()?
-                .to_vec1::<u8>()?
+            output.masks.gt(0.5f64)?.flatten_all()?.to_vec1::<u8>()?
         );
         assert_eq!(
             materialized.boxes_xyxy.flatten_all()?.to_vec1::<f32>()?,

@@ -1,10 +1,7 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::path::Path;
-
 use candle::{DType, Device, IndexOp, Result, Tensor};
-use tokenizers::{PaddingDirection, PaddingParams, Tokenizer, TruncationParams};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use super::{
     geometry::{EncodedPrompt, GeometryPrompt},
@@ -18,8 +15,6 @@ use super::{
     Sam3ImageModel, Sam3TrackerConfig, Sam3TrackerModel, TrackerFrameState,
 };
 
-const CLIP_EOT_TOKEN: &str = "<|endoftext|>";
-
 mod config;
 pub use config::*;
 mod sources;
@@ -27,8 +22,8 @@ pub use sources::{normalize_rgb_frame_for_sam3, FrameSource, VideoSource};
 mod propagation;
 use propagation::*;
 pub use propagation::{
-    ObjectFrameOutput, Sam3VideoPredictor, Sam3VideoTrackerCore, SessionPrompt, VideoFrameOutput,
-    VideoOutput,
+    ObjectFrameOutput, Sam3VideoPredictor, Sam3VideoTrackerCore, SessionPrompt, TextPromptTokens,
+    VideoFrameOutput, VideoOutput,
 };
 mod session;
 pub use session::{Sam3VideoSession, SessionCacheStats, TrackedObject};
@@ -141,11 +136,13 @@ pub fn parity_replay_temporal_disambiguation_for_outputs(
         let empty_mask_obj_ids = output
             .objects
             .iter()
-            .filter_map(|object| match mask_has_foreground(&object.mask_logits, 0.0) {
-                Ok(true) => None,
-                Ok(false) => Some(Ok(object.obj_id)),
-                Err(err) => Some(Err(err)),
-            })
+            .filter_map(
+                |object| match mask_has_foreground(&object.mask_logits, 0.0) {
+                    Ok(true) => None,
+                    Ok(false) => Some(Ok(object.obj_id)),
+                    Err(err) => Some(Err(err)),
+                },
+            )
             .collect::<Result<BTreeSet<_>>>()?;
         let previous_removed_obj_ids = temporal_disambiguation_state.hidden_obj_ids().clone();
         let unmatched_suppressed_obj_ids = if video_config.hotstart_delay > 0 {
