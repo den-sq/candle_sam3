@@ -13,6 +13,10 @@
 //! DETR-style decoder with presence-token scoring, and a MaskFormer-like
 //! segmentation head.
 //!
+//! Video text tokenization is caller-owned. Use TextPromptTokens for text
+//! prompts and provide VideoSessionOptions::visual_prompt_tokens for box-only
+//! prompts; point-only sessions require neither.
+//!
 //! The current implementation is deliberately a scaffold. The public
 //! API and file layout are in place so the actual port can land
 //! incrementally without reshaping the module tree later.
@@ -55,7 +59,7 @@ pub use tracker::{Sam3TrackerConfig, Sam3TrackerModel, TrackerFrameState, Tracke
 pub use video::{
     normalize_rgb_frame_for_sam3, FrameSource, ObjectFrameOutput, PropagationDirection,
     PropagationOptions, Sam3VideoPredictor, Sam3VideoSession, SessionCacheStats, SessionPrompt,
-    TrackedObject, VideoConfig, VideoDebugArtifactSink, VideoDebugConfig, VideoFrameOutput,
-    VideoMemoryProfile, VideoOutput, VideoSessionOptions, VideoSource,
+    TextPromptTokens, TrackedObject, VideoConfig, VideoDebugArtifactSink, VideoDebugConfig,
+    VideoFrameOutput, VideoMemoryProfile, VideoOutput, VideoSessionOptions, VideoSource,
 };
 pub use vitdet::{Sam3ViTDetTrunk, ViTDetTrunkOutput};

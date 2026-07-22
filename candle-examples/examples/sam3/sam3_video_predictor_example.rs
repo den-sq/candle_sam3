@@ -35,9 +35,10 @@ pub(crate) fn run(
         super::NOTEBOOK_VIDEO_FRAME_DIR_API_URL,
         "SAM3 notebook video frames 0001",
     )?;
-    let tokenizer_path = tokenizer_path
-        .map(ToOwned::to_owned)
-        .context("video notebook example requires `--tokenizer <tokenizer.json>`")?;
+    let tokenizer_path =
+        tokenizer_path.context("video notebook example requires `--tokenizer <tokenizer.json>`")?;
+    let tokenizer = super::get_tokenizer(tokenizer_path, model.config().text.context_length)?;
+    let person_tokens = super::tokenize_video_prompt("person", &tokenizer)?;
     let frame_paths = sorted_frame_paths(&video_path)?;
     let first_frame = load_rgba_frame(&frame_paths, 0)?;
     let frame_width = first_frame.width() as f32;
@@ -101,7 +102,7 @@ pub(crate) fn run(
         config.image.image_std,
     )?;
     let session_options = sam3::VideoSessionOptions {
-        tokenizer_path: Some(PathBuf::from(&tokenizer_path)),
+        visual_prompt_tokens: None,
         memory_profile: session_memory_profile,
         offload_frames_to_cpu: notebook_uses_device_offload,
         offload_state_to_cpu: notebook_uses_device_offload,
@@ -120,7 +121,7 @@ pub(crate) fn run(
         &session_id,
         0,
         sam3::SessionPrompt {
-            text: Some("person".to_string()),
+            text: Some(person_tokens),
             points: None,
             point_labels: None,
             boxes: None,

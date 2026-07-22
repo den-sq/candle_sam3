@@ -313,7 +313,10 @@ fn notebook_asset_root_from_candidate(path: PathBuf) -> Option<PathBuf> {
     }
 }
 
-pub(crate) fn resolve_notebook_asset_root(explicit: Option<&str>, output_dir: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_notebook_asset_root(
+    explicit: Option<&str>,
+    output_dir: &Path,
+) -> Result<PathBuf> {
     if let Some(explicit) = explicit {
         return notebook_asset_root_from_candidate(PathBuf::from(explicit)).ok_or_else(|| {
             E::msg(format!(
@@ -404,7 +407,10 @@ fn frame_name_sort_key(name: &str) -> (Option<usize>, &str) {
     (stem.parse::<usize>().ok(), name)
 }
 
-fn parse_github_directory_downloads(contents_json: &str, label: &str) -> Result<Vec<NotebookAssetDownload>> {
+fn parse_github_directory_downloads(
+    contents_json: &str,
+    label: &str,
+) -> Result<Vec<NotebookAssetDownload>> {
     let mut downloads = serde_json::from_str::<Vec<GitHubDirectoryEntry>>(contents_json)
         .with_context(|| format!("failed to parse GitHub directory listing for {label}"))?
         .into_iter()
@@ -423,7 +429,8 @@ fn parse_github_directory_downloads(contents_json: &str, label: &str) -> Result<
             })
         })
         .collect::<Vec<_>>();
-    downloads.sort_by(|lhs, rhs| frame_name_sort_key(&lhs.name).cmp(&frame_name_sort_key(&rhs.name)));
+    downloads
+        .sort_by(|lhs, rhs| frame_name_sort_key(&lhs.name).cmp(&frame_name_sort_key(&rhs.name)));
     if downloads.is_empty() {
         bail!("GitHub directory listing for {label} did not contain any JPEG frames");
     }
@@ -564,6 +571,15 @@ fn tokenize_prompt(
     let input_ids = Tensor::new(vec![encoding.get_ids().to_vec()], device)?;
     let attention_mask = Tensor::new(vec![encoding.get_attention_mask().to_vec()], device)?;
     Ok((input_ids, attention_mask))
+}
+
+fn tokenize_video_prompt(prompt: &str, tokenizer: &Tokenizer) -> Result<sam3::TextPromptTokens> {
+    let encoding = tokenizer.encode(prompt, true).map_err(E::msg)?;
+    Ok(sam3::TextPromptTokens::new(
+        encoding.get_ids().to_vec(),
+        encoding.get_attention_mask().to_vec(),
+    )
+    .with_display_text(prompt))
 }
 
 /// Phase 12 currently uses the exact image preprocessing path that was validated
@@ -2151,7 +2167,7 @@ pub fn main() -> anyhow::Result<()> {
             .as_ref()
             .map(|inputs| inputs.point_labels.clone())
             .unwrap_or_default();
-        let boxes = geometry_inputs
+        let boxes: Vec<(f32, f32, f32, f32)> = geometry_inputs
             .as_ref()
             .map(|inputs| {
                 inputs
@@ -2167,10 +2183,32 @@ pub fn main() -> anyhow::Result<()> {
             .unwrap_or_default();
         let video_tokenizer_path =
             infer_video_tokenizer_path(args.tokenizer.as_deref(), args.checkpoint.as_deref());
+        let video_tokenizer = if args.video_prompt.is_some() || !boxes.is_empty() {
+            let path = video_tokenizer_path.as_deref().ok_or_else(|| {
+                E::msg("SAM3 video text and box prompts require --tokenizer <tokenizer.json>")
+            })?;
+            Some(get_tokenizer(path, config.text.context_length)?)
+        } else {
+            None
+        };
+        let prompt_tokens = args
+            .video_prompt
+            .as_deref()
+            .map(|prompt| {
+                tokenize_video_prompt(prompt, video_tokenizer.as_ref().expect("required above"))
+            })
+            .transpose()?;
+        let visual_prompt_tokens = (!boxes.is_empty())
+            .then(|| {
+                tokenize_video_prompt("visual", video_tokenizer.as_ref().expect("required above"))
+            })
+            .transpose()?;
         let video_mode = video::VideoMode {
             video_path: video_path.to_string(),
             tokenizer_path: video_tokenizer_path,
             prompt_text: args.video_prompt.clone(),
+            prompt_tokens,
+            visual_prompt_tokens,
             points,
             point_labels,
             boxes,

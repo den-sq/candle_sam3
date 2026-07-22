@@ -27,6 +27,8 @@ pub struct VideoMode {
     pub video_path: String,
     pub tokenizer_path: Option<String>,
     pub prompt_text: Option<String>,
+    pub prompt_tokens: Option<sam3::TextPromptTokens>,
+    pub visual_prompt_tokens: Option<sam3::TextPromptTokens>,
     pub points: Vec<(f32, f32)>,
     pub point_labels: Vec<u32>,
     pub boxes: Vec<(f32, f32, f32, f32)>,
@@ -169,7 +171,7 @@ pub fn run_video_prediction(
         sam3::VideoMemoryProfile::Balanced
     };
     let session_options = sam3::VideoSessionOptions {
-        tokenizer_path: video_mode.tokenizer_path.as_ref().map(PathBuf::from),
+        visual_prompt_tokens: video_mode.visual_prompt_tokens.clone(),
         memory_profile,
         offload_frames_to_cpu: video_mode.offload_frames_to_cpu,
         offload_state_to_cpu: video_mode.offload_state_to_cpu,
@@ -212,7 +214,7 @@ pub fn run_video_prediction(
         &session_id,
         0,
         sam3::SessionPrompt {
-            text: video_mode.prompt_text.clone(),
+            text: video_mode.prompt_tokens.clone(),
             points: (!video_mode.points.is_empty()).then_some(video_mode.points.clone()),
             point_labels: (!video_mode.point_labels.is_empty())
                 .then_some(video_mode.point_labels.clone()),

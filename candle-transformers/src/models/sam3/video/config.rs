@@ -90,7 +90,10 @@ pub enum VideoMemoryProfile {
 
 #[derive(Debug, Clone)]
 pub struct VideoSessionOptions {
-    pub tokenizer_path: Option<PathBuf>,
+    /// Pre-tokenized visual sentinel used by box-only detector prompts.
+    ///
+    /// Callers that never submit box-only prompts may leave this unset.
+    pub visual_prompt_tokens: Option<super::TextPromptTokens>,
     pub memory_profile: VideoMemoryProfile,
     pub offload_frames_to_cpu: bool,
     pub offload_state_to_cpu: bool,
@@ -108,7 +111,7 @@ pub struct VideoSessionOptions {
 impl Default for VideoSessionOptions {
     fn default() -> Self {
         Self {
-            tokenizer_path: None,
+            visual_prompt_tokens: None,
             memory_profile: VideoMemoryProfile::Balanced,
             offload_frames_to_cpu: false,
             offload_state_to_cpu: false,

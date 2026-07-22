@@ -167,7 +167,7 @@ impl TrackedObject {
         &self,
         frame_idx: usize,
         direction: PropagationDirection,
-    ) -> Option<(usize, String)> {
+    ) -> Option<(usize, TextPromptTokens)> {
         match direction {
             PropagationDirection::Forward | PropagationDirection::Both => self
                 .prompt_frames
@@ -305,7 +305,6 @@ pub struct Sam3VideoSession {
     session_id: String,
     frame_source: Box<dyn FrameSource>,
     session_options: VideoSessionOptions,
-    tokenizer: Option<Tokenizer>,
     debug_recorder: Option<VideoDebugRecorder>,
     storage_device: Device,
     pub(super) tracked_objects: BTreeMap<u32, TrackedObject>,
@@ -315,7 +314,7 @@ pub struct Sam3VideoSession {
         BTreeMap<usize, TemporalDisambiguationFrameMetadata>,
     feature_cache: HashMap<usize, VisualBackboneOutput>,
     feature_cache_order: VecDeque<usize>,
-    text_cache: HashMap<String, CachedTextPrompt>,
+    text_cache: HashMap<TextTokenCacheKey, CachedTextPrompt>,
     hotstart_buffered_frames: usize,
     hotstart_buffered_cpu_bytes: usize,
     hotstart_buffered_device_bytes: usize,
@@ -333,11 +332,9 @@ impl Sam3VideoSession {
         model: &Sam3ImageModel,
         compute_device: &Device,
     ) -> Result<Self> {
-        let tokenizer = session_options
-            .tokenizer_path
-            .as_ref()
-            .map(|path| load_tokenizer(path, model.config().text.context_length))
-            .transpose()?;
+        if let Some(tokens) = session_options.visual_prompt_tokens.as_ref() {
+            validate_text_tokens(tokens, model.config().text.context_length)?;
+        }
         let storage_device =
             if session_options.offload_state_to_cpu && !matches!(compute_device, Device::Cpu) {
                 Device::Cpu
@@ -348,7 +345,6 @@ impl Sam3VideoSession {
             session_id: session_id.clone(),
             frame_source,
             session_options,
-            tokenizer,
             debug_recorder: VideoDebugRecorder::new(&session_id, debug_config)?,
             storage_device,
             tracked_objects: BTreeMap::new(),
@@ -423,8 +419,7 @@ impl Sam3VideoSession {
                 );
             }
             let (cpu, device) = object.prompt_history_cache.memory_bytes();
-            cpu_bytes.packed_prompt_history =
-                cpu_bytes.packed_prompt_history.saturating_add(cpu);
+            cpu_bytes.packed_prompt_history = cpu_bytes.packed_prompt_history.saturating_add(cpu);
             device_bytes.packed_prompt_history =
                 device_bytes.packed_prompt_history.saturating_add(device);
         }
@@ -499,8 +494,15 @@ impl Sam3VideoSession {
         &self.session_options.memory_profile
     }
 
+    pub(crate) fn visual_prompt_tokens(&self) -> Option<&TextPromptTokens> {
+        self.session_options.visual_prompt_tokens.as_ref()
+    }
+
     pub(crate) fn low_memory_mode(&self) -> bool {
-        matches!(self.session_options.memory_profile, VideoMemoryProfile::LowMemory)
+        matches!(
+            self.session_options.memory_profile,
+            VideoMemoryProfile::LowMemory
+        )
     }
 
     pub(super) fn debug_recorder_mut(&mut self) -> Option<&mut VideoDebugRecorder> {
@@ -569,12 +571,6 @@ impl Sam3VideoSession {
             );
         }
         let prompt = prompt.with_default_labels()?;
-        if prompt.text.is_some() && self.tokenizer.is_none() {
-            candle::bail!(
-                "video text prompts require a tokenizer; pass `VideoSessionOptions.tokenizer_path`"
-            )
-        }
-
         let obj_id = self.ensure_object(obj_id, frame_idx, max_objects)?;
 
         let tracked = self
@@ -849,24 +845,48 @@ impl Sam3VideoSession {
     pub(crate) fn cached_text_encoding(
         &mut self,
         model: &Sam3ImageModel,
-        text_prompt: &str,
+        text_prompt: &TextPromptTokens,
         compute_device: &Device,
     ) -> Result<TextEncoding> {
-        if let Some(cached) = self.text_cache.get(text_prompt) {
+        validate_text_tokens(text_prompt, model.config().text.context_length)?;
+        let cache_key = TextTokenCacheKey::from(text_prompt);
+        if let Some(cached) = self.text_cache.get(&cache_key) {
             return cached.to_text_encoding(compute_device);
         }
-        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
-            candle::Error::Msg(
-                "video text prompts require a tokenizer; pass `VideoSessionOptions.tokenizer_path`"
-                    .to_owned(),
-            )
-        })?;
-        let (input_ids, attention_mask) = tokenize_prompt(text_prompt, tokenizer, compute_device)?;
+        let input_ids = Tensor::new(vec![text_prompt.input_ids.clone()], compute_device)?;
+        let attention_mask = Tensor::new(vec![text_prompt.attention_mask.clone()], compute_device)?;
         let encoding = model.encode_text_tokens(&input_ids, &attention_mask)?;
         let cached = CachedTextPrompt::from_encoding(&encoding, self.storage_device())?;
-        self.text_cache.insert(text_prompt.to_owned(), cached);
+        self.text_cache.insert(cache_key, cached);
         Ok(encoding)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TextTokenCacheKey {
+    input_ids: Vec<u32>,
+    attention_mask: Vec<u32>,
+}
+
+impl From<&TextPromptTokens> for TextTokenCacheKey {
+    fn from(value: &TextPromptTokens) -> Self {
+        Self {
+            input_ids: value.input_ids.clone(),
+            attention_mask: value.attention_mask.clone(),
+        }
+    }
+}
+
+fn validate_text_tokens(tokens: &TextPromptTokens, context_length: usize) -> Result<()> {
+    tokens.validate()?;
+    if tokens.input_ids.len() != context_length {
+        candle::bail!(
+            "text prompt has {} tokens but SAM3 requires exactly {}",
+            tokens.input_ids.len(),
+            context_length
+        )
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1030,7 +1050,6 @@ mod tests {
                 memory_profile,
                 ..VideoSessionOptions::default()
             },
-            tokenizer: None,
             debug_recorder: None,
             storage_device: Device::Cpu,
             tracked_objects: BTreeMap::new(),
@@ -1266,4 +1285,31 @@ mod tests {
         assert_eq!(close_stats.cpu_low_res_mask_bytes, 0);
         Ok(())
     }
+}
+#[test]
+fn text_cache_key_depends_only_on_token_ids_and_attention_mask() {
+    let first = TextPromptTokens::new(vec![1, 2, 3], vec![1, 1, 1]).with_display_text("person");
+    let renamed =
+        TextPromptTokens::new(vec![1, 2, 3], vec![1, 1, 1]).with_display_text("diagnostic alias");
+    let changed_mask = TextPromptTokens::new(vec![1, 2, 3], vec![1, 1, 0]);
+
+    assert_eq!(
+        TextTokenCacheKey::from(&first),
+        TextTokenCacheKey::from(&renamed)
+    );
+    assert_ne!(
+        TextTokenCacheKey::from(&first),
+        TextTokenCacheKey::from(&changed_mask)
+    );
+}
+
+#[test]
+fn text_token_contract_rejects_empty_mismatched_and_wrong_context_inputs() {
+    assert!(TextPromptTokens::new(Vec::new(), Vec::new())
+        .validate()
+        .is_err());
+    assert!(TextPromptTokens::new(vec![1, 2], vec![1])
+        .validate()
+        .is_err());
+    assert!(validate_text_tokens(&TextPromptTokens::new(vec![1], vec![1]), 2).is_err());
 }

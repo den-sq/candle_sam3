@@ -41,58 +41,6 @@ fn select_best_grounding_query(
     Ok((best_score, best_box, best_mask_logits, best_presence))
 }
 
-pub(super) fn load_tokenizer(path: &Path, context_length: usize) -> Result<Tokenizer> {
-    let tokenizer_path = if path.is_dir() {
-        path.join("tokenizer.json")
-    } else {
-        path.to_path_buf()
-    };
-    let mut tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|err| {
-        candle::Error::Msg(format!(
-            "failed to load tokenizer from {}: {}",
-            tokenizer_path.display(),
-            err
-        ))
-    })?;
-    let pad_id = *tokenizer
-        .get_vocab(true)
-        .get(CLIP_EOT_TOKEN)
-        .ok_or_else(|| {
-            candle::Error::Msg(format!(
-                "tokenizer is missing required token `{}`",
-                CLIP_EOT_TOKEN
-            ))
-        })?;
-    tokenizer
-        .with_padding(Some(PaddingParams {
-            strategy: tokenizers::PaddingStrategy::Fixed(context_length),
-            direction: PaddingDirection::Right,
-            pad_to_multiple_of: None,
-            pad_id,
-            pad_type_id: 0,
-            pad_token: CLIP_EOT_TOKEN.to_string(),
-        }))
-        .with_truncation(Some(TruncationParams {
-            max_length: context_length,
-            ..Default::default()
-        }))
-        .map_err(|err| candle::Error::Msg(format!("failed to configure tokenizer: {}", err)))?;
-    Ok(tokenizer)
-}
-
-pub(super) fn tokenize_prompt(
-    prompt: &str,
-    tokenizer: &Tokenizer,
-    device: &Device,
-) -> Result<(Tensor, Tensor)> {
-    let encoding = tokenizer
-        .encode(prompt, true)
-        .map_err(|err| candle::Error::Msg(format!("failed to tokenize `{}`: {}", prompt, err)))?;
-    let input_ids = Tensor::new(vec![encoding.get_ids().to_vec()], device)?;
-    let attention_mask = Tensor::new(vec![encoding.get_attention_mask().to_vec()], device)?;
-    Ok((input_ids, attention_mask))
-}
-
 pub(super) fn combine_encoded_prompts(
     text_encoding: Option<&TextEncoding>,
     geometry_encoding: Option<&EncodedPrompt>,
