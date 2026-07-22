@@ -107,7 +107,8 @@ impl DecoderAttention {
             .matmul(&v)?
             .reshape((batch_size, self.num_heads, tgt_len, self.head_dim))?
             .transpose(1, 2)?
-            .reshape((batch_size, tgt_len, hidden_size))?;
+            .reshape((batch_size, tgt_len, hidden_size))?
+            .to_dtype(query.dtype())?;
         self.out_proj
             .forward(&hidden_states)?
             .transpose(0, 1)?
@@ -779,9 +780,7 @@ fn normalize_attn_bias(
         [bh, t, s] if *bh == batch_size * num_heads && *t == tgt_len && *s == src_len => {
             Ok(attn_bias.clone())
         }
-        [b, h, t, s]
-            if *b == batch_size && *h == num_heads && *t == tgt_len && *s == src_len =>
-        {
+        [b, h, t, s] if *b == batch_size && *h == num_heads && *t == tgt_len && *s == src_len => {
             Ok(attn_bias.reshape((batch_size * num_heads, tgt_len, src_len))?)
         }
         shape => candle::bail!(
