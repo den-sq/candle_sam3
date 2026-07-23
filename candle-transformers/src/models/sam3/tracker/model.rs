@@ -328,21 +328,25 @@ impl Sam3TrackerModel {
         };
         if let Some(mask_input) = mask_input {
             let mask_input = normalize_mask_prompt(mask_input, backbone_features.device())?;
-            let mask_inputs_float = mask_input.to_dtype(DType::F32)?;
-            let high_res_masks = mask_inputs_float.affine(20.0, -10.0)?;
-            let mask_input_low_res_size = (self.input_mask_size() / self.config.backbone_stride) * 4;
+            let mask_inputs_compute = mask_input.to_dtype(compute_dtype)?;
+            let high_res_masks = mask_inputs_compute.affine(20.0, -10.0)?;
+            let mask_input_low_res_size =
+                (self.input_mask_size() / self.config.backbone_stride) * 4;
             let low_res_masks = resize_bilinear2d_antialias(
                 &high_res_masks,
                 mask_input_low_res_size,
                 mask_input_low_res_size,
             )?;
-            let iou_scores =
-                Tensor::ones((mask_inputs_float.dim(0)?, 1), DType::F32, backbone_features.device())?;
-            let mask_prompt = self.mask_downsample.forward(&mask_inputs_float)?;
+            let iou_scores = Tensor::ones(
+                (mask_inputs_compute.dim(0)?, 1),
+                DType::F32,
+                backbone_features.device(),
+            )?;
+            let mask_prompt = self.mask_downsample.forward(&mask_inputs_compute)?;
             let mut state = self.use_mask_as_output_prepared(
                 &backbone_features,
                 high_res_features,
-                mask_inputs_float,
+                mask_inputs_compute,
                 high_res_masks,
                 low_res_masks,
                 iou_scores,
