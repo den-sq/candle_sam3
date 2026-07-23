@@ -111,12 +111,9 @@ fn select_packed_maskmem_prompt(
     slot_indices: &Tensor,
     compute_dtype: DType,
 ) -> Result<Tensor> {
-    maybe_to_dtype(
-        &packed_features
-            .index_select(slot_indices, 0)?
-            .flatten(0, 1)?,
-        compute_dtype,
-    )
+    maybe_to_dtype(packed_features, compute_dtype)?
+        .index_select(slot_indices, 0)?
+        .flatten(0, 1)
 }
 
 impl Sam3TrackerModel {
@@ -625,7 +622,7 @@ impl Sam3TrackerModel {
                         &slot_indices,
                         self.no_obj_ptr.dtype(),
                     )?;
-                    let prompt_pos = packed_pos
+                    let prompt_pos = maybe_to_dtype(packed_pos, self.no_obj_ptr.dtype())?
                         .index_select(&slot_indices, 0)?
                         .broadcast_add(&self.maskmem_tpos_enc.index_select(&tpos_indices, 0)?)?
                         .flatten(0, 1)?;
@@ -821,6 +818,22 @@ mod tests {
         let slots = Tensor::from_vec(vec![1u32], 1, &Device::Cpu)?;
 
         let selected = select_packed_maskmem_prompt(&packed, &slots, DType::F32)?;
+
+        assert_eq!(selected.dtype(), DType::F32);
+        assert_eq!(selected.dims(), &[4, 1, 4]);
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires CUDA; specifically guards BF16 retained state on pre-Ampere devices"]
+    fn packed_bf16_maskmem_is_cast_before_cuda_index_select() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let packed = Tensor::zeros((2, 4, 1, 4), DType::BF16, &device)?;
+        let slots = Tensor::from_vec(vec![1u32], 1, &device)?;
+
+        let selected = select_packed_maskmem_prompt(&packed, &slots, DType::F32)?;
+        device.synchronize()?;
 
         assert_eq!(selected.dtype(), DType::F32);
         assert_eq!(selected.dims(), &[4, 1, 4]);
