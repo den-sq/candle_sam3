@@ -791,19 +791,7 @@ impl Sam3VideoTrackerCore<'_> {
         retained_state_dtype: RetainedStateDType,
     ) -> Result<TrackerFrameState> {
         let mut state = move_tracker_state(state, storage_device)?;
-        if matches!(storage_device, Device::Cpu) {
-            let dtype = retained_state_dtype.candle_dtype();
-            state.maskmem_features = state
-                .maskmem_features
-                .as_ref()
-                .map(|tensor| maybe_to_dtype(tensor, dtype))
-                .transpose()?;
-            state.maskmem_prompt_features = state
-                .maskmem_prompt_features
-                .as_ref()
-                .map(|tensor| maybe_to_dtype(tensor, dtype))
-                .transpose()?;
-        }
+        cast_retained_maskmem_features(&mut state, retained_state_dtype)?;
         state.memory_selection_score = self.tracker_state_memory_selection_score(&state)?;
         let can_drop_render_tensors = !state.is_cond_frame
             || (state.maskmem_features.is_some() && state.maskmem_pos_enc.is_some());
@@ -2339,6 +2327,24 @@ impl Sam3VideoTrackerCore<'_> {
     }
 }
 
+fn cast_retained_maskmem_features(
+    state: &mut TrackerFrameState,
+    retained_state_dtype: RetainedStateDType,
+) -> Result<()> {
+    let dtype = retained_state_dtype.candle_dtype();
+    state.maskmem_features = state
+        .maskmem_features
+        .as_ref()
+        .map(|tensor| maybe_to_dtype(tensor, dtype))
+        .transpose()?;
+    state.maskmem_prompt_features = state
+        .maskmem_prompt_features
+        .as_ref()
+        .map(|tensor| maybe_to_dtype(tensor, dtype))
+        .transpose()?;
+    Ok(())
+}
+
 fn grounding_query_count(scores: &Tensor) -> Result<usize> {
     match scores.rank() {
         3 | 2 => scores.dim(1),
@@ -2744,6 +2750,45 @@ mod tests {
                     .refinement_detector_cond_frame_removal_window
         );
         assert_eq!(minimum, 16);
+    }
+
+    #[test]
+    fn retained_maskmem_dtype_is_applied_independently_of_storage_device() -> Result<()> {
+        let mut state = TrackerFrameState {
+            low_res_masks: Tensor::zeros((1, 1, 1, 1), DType::F32, &Device::Cpu)?,
+            high_res_masks: Tensor::zeros((1, 1, 1, 1), DType::F32, &Device::Cpu)?,
+            iou_scores: Tensor::zeros((1, 1), DType::F32, &Device::Cpu)?,
+            memory_selection_score: None,
+            obj_ptr: Tensor::zeros((1, 4), DType::F32, &Device::Cpu)?,
+            object_score_logits: Tensor::zeros((1, 1), DType::F32, &Device::Cpu)?,
+            maskmem_features: Some(Tensor::zeros((1, 4, 2, 2), DType::F32, &Device::Cpu)?),
+            maskmem_pos_enc: Some(Tensor::zeros((1, 4, 2, 2), DType::F32, &Device::Cpu)?),
+            maskmem_prompt_features: Some(Tensor::zeros((4, 1, 4), DType::F32, &Device::Cpu)?),
+            maskmem_prompt_pos_enc: Some(Tensor::zeros((4, 1, 4), DType::F32, &Device::Cpu)?),
+            is_cond_frame: false,
+        };
+
+        cast_retained_maskmem_features(&mut state, RetainedStateDType::BF16)?;
+
+        assert_eq!(
+            state.maskmem_features.as_ref().map(Tensor::dtype),
+            Some(DType::BF16)
+        );
+        assert_eq!(
+            state.maskmem_prompt_features.as_ref().map(Tensor::dtype),
+            Some(DType::BF16)
+        );
+        assert_eq!(
+            state.maskmem_pos_enc.as_ref().map(Tensor::dtype),
+            Some(DType::F32),
+            "position encodings retain their original dtype"
+        );
+        assert_eq!(
+            state.maskmem_prompt_pos_enc.as_ref().map(Tensor::dtype),
+            Some(DType::F32),
+            "prompt position encodings retain their original dtype"
+        );
+        Ok(())
     }
 
     #[test]
