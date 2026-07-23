@@ -48,9 +48,6 @@ impl<'a> Sam3VideoTrackerCore<'a> {
             }
             session.record_postprocess_foreground_scalar_read();
             let has_foreground = mask_has_foreground(&output.masks, output_threshold)?;
-            if !has_foreground {
-                continue;
-            }
             let is_confirmed = if use_local_confirmation_gate {
                 session.record_postprocess_score_scalar_read();
                 let has_detectable_output = object_presence_score(&output)? > 0.0;
@@ -64,7 +61,7 @@ impl<'a> Sam3VideoTrackerCore<'a> {
             } else {
                 true
             };
-            if !is_confirmed {
+            if !has_foreground || !is_confirmed {
                 hidden_obj_ids.insert(*obj_id);
                 continue;
             }
@@ -269,7 +266,9 @@ fn apply_object_wise_non_overlapping_constraints(
     let mask_stack = Tensor::cat(&mask_refs, 0)?.contiguous()?;
     let mask_present = mask_stack.ge(threshold as f64)?;
     let score_refs = scores.iter().collect::<Vec<_>>();
-    let score_tensor = Tensor::cat(&score_refs, 0)?.reshape((outputs.len(), 1, 1, 1))?;
+    let score_tensor = Tensor::cat(&score_refs, 0)?
+        .to_dtype(DType::F32)?
+        .reshape((outputs.len(), 1, 1, 1))?;
     let scored_masks = mask_present.where_cond(
         &score_tensor.broadcast_as(mask_stack.shape())?,
         &Tensor::full(f32::NEG_INFINITY, mask_stack.shape(), device)?,

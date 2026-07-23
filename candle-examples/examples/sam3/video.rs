@@ -173,7 +173,7 @@ pub fn run_video_prediction(
         memory_profile,
         offload_frames_to_cpu: video_mode.offload_frames_to_cpu,
         offload_state_to_cpu: video_mode.offload_state_to_cpu,
-        retained_state_dtype: sam3::RetainedStateDType::BF16,
+        retained_state_dtype: sam3::RetainedStateDType::F32,
         prefetch_ahead: video_mode.prefetch_ahead,
         prefetch_behind: video_mode.prefetch_behind,
         max_feature_cache_entries: video_mode.max_feature_cache_entries,

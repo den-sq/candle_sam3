@@ -105,7 +105,7 @@ pub(crate) fn run(
         memory_profile: session_memory_profile,
         offload_frames_to_cpu: notebook_uses_device_offload,
         offload_state_to_cpu: notebook_uses_device_offload,
-        retained_state_dtype: sam3::RetainedStateDType::BF16,
+        retained_state_dtype: sam3::RetainedStateDType::F32,
         prefetch_ahead,
         prefetch_behind,
         max_feature_cache_entries,

@@ -1,7 +1,7 @@
 use super::*;
 use crate::models::sam3::neck::TrackerVisualSequences;
-use crate::models::sam3::tracker::{add_tensor_memory, maybe_to_dtype, PackedPromptHistory};
 use crate::models::sam3::torch_ops::tensor::first_scalar_f32;
+use crate::models::sam3::tracker::{add_tensor_memory, maybe_to_dtype, PackedPromptHistory};
 
 #[derive(Debug, Clone)]
 pub struct SessionPrompt {
@@ -561,11 +561,13 @@ impl<'a> Sam3VideoPredictor<'a> {
             let empty_mask_obj_ids = output
                 .objects
                 .iter()
-                .filter_map(|object| match mask_has_foreground(&object.mask_logits, 0.0) {
-                    Ok(true) => None,
-                    Ok(false) => Some(Ok(object.obj_id)),
-                    Err(err) => Some(Err(err)),
-                })
+                .filter_map(
+                    |object| match mask_has_foreground(&object.mask_logits, 0.0) {
+                        Ok(true) => None,
+                        Ok(false) => Some(Ok(object.obj_id)),
+                        Err(err) => Some(Err(err)),
+                    },
+                )
                 .collect::<Result<BTreeSet<_>>>()?;
             let previous_removed_obj_ids = temporal_disambiguation_state.hidden_obj_ids().clone();
             let is_last_frame = order_idx + 1 == processing_order.len();
@@ -783,29 +785,6 @@ impl Sam3VideoTrackerCore<'_> {
         Ok(state.memory_selection_score)
     }
 
-    fn compact_tracker_state_for_storage(
-        &self,
-        state: &TrackerFrameState,
-        storage_device: &Device,
-        low_memory_mode: bool,
-        retained_state_dtype: RetainedStateDType,
-    ) -> Result<TrackerFrameState> {
-        let mut state = move_tracker_state(state, storage_device)?;
-        cast_retained_maskmem_features(&mut state, retained_state_dtype)?;
-        state.memory_selection_score = self.tracker_state_memory_selection_score(&state)?;
-        let can_drop_render_tensors = !state.is_cond_frame
-            || (state.maskmem_features.is_some() && state.maskmem_pos_enc.is_some());
-        if can_drop_render_tensors {
-            state.high_res_masks = Tensor::zeros(0, DType::F32, storage_device)?;
-            state.iou_scores = Tensor::zeros(0, DType::F32, storage_device)?;
-        }
-        if low_memory_mode {
-            state.maskmem_prompt_features = None;
-            state.maskmem_prompt_pos_enc = None;
-        }
-        Ok(state)
-    }
-
     fn correction_frame_is_cond_frame(&self) -> bool {
         self.tracker
             .config()
@@ -876,11 +855,14 @@ impl Sam3VideoTrackerCore<'_> {
             )?;
             let mut updated_state = move_tracker_state(&state, compute_device)?;
             updated_state.set_maskmem_state(maskmem_features, maskmem_pos_enc)?;
-            let updated_state = self.compact_tracker_state_for_storage(
+            let memory_selection_score =
+                self.tracker_state_memory_selection_score(&updated_state)?;
+            let updated_state = compact_tracker_state_for_storage(
                 &updated_state,
                 session.storage_device(),
                 session.low_memory_mode(),
                 session.retained_state_dtype(),
+                memory_selection_score,
             )?;
             if let Some(tracked) = session.tracked_objects.get_mut(&object.obj_id) {
                 tracked.clear_prompt_history_cache();
@@ -1414,7 +1396,8 @@ impl Sam3VideoTrackerCore<'_> {
                 packed_history.as_ref(),
             )?
             .state;
-        tracker_state = self.attach_state_memory(&tracker_visual_features, &tracker_state, false)?;
+        tracker_state =
+            self.attach_state_memory(&tracker_visual_features, &tracker_state, false)?;
         let detector_score = detector_output.score_value()?;
         let mut output = tracker_state_to_object_output(
             object.obj_id,
@@ -1571,9 +1554,10 @@ impl Sam3VideoTrackerCore<'_> {
         let visual_features = session.get_visual_features(model, compute_device, frame_idx)?;
         let tracker_visual_features = tracker_visual_output(&visual_features);
         let text_encoding = session.cached_text_encoding(model, text, compute_device)?;
-        let encoded_prompt = combine_encoded_prompts(Some(&text_encoding), None)?.ok_or_else(|| {
-            candle::Error::Msg("text prompt seed path produced no encoded prompt".to_owned())
-        })?;
+        let encoded_prompt =
+            combine_encoded_prompts(Some(&text_encoding), None)?.ok_or_else(|| {
+                candle::Error::Msg("text prompt seed path produced no encoded prompt".to_owned())
+            })?;
         let grounding = ground_all_from_encoded_prompt(model, &visual_features, &encoded_prompt)?;
         let query_count = grounding_query_count(&grounding.scores)?;
         let mut results = Vec::new();
@@ -1597,8 +1581,7 @@ impl Sam3VideoTrackerCore<'_> {
                 )?
             };
 
-            let query_grounding =
-                grounding_query_output(&grounding, query_idx, detector_score)?;
+            let query_grounding = grounding_query_output(&grounding, query_idx, detector_score)?;
             let mut detector_output = grounding_to_object_output(
                 obj_id,
                 &query_grounding,
@@ -2015,8 +1998,8 @@ impl Sam3VideoTrackerCore<'_> {
             } else {
                 let text_encoding =
                     session.cached_text_encoding(model, &text_prompt, compute_device)?;
-                let encoded_prompt =
-                    combine_encoded_prompts(Some(&text_encoding), None)?.ok_or_else(|| {
+                let encoded_prompt = combine_encoded_prompts(Some(&text_encoding), None)?
+                    .ok_or_else(|| {
                         candle::Error::Msg(
                             "text detector path produced no encoded prompt".to_owned(),
                         )
@@ -2045,10 +2028,7 @@ impl Sam3VideoTrackerCore<'_> {
                             .into_iter()
                             .next()
                             .unwrap_or(0.0),
-                        2 => grounding
-                            .scores
-                            .i((0, query_idx))?
-                            .to_vec0::<f32>()?,
+                        2 => grounding.scores.i((0, query_idx))?.to_vec0::<f32>()?,
                         1 => grounding.scores.i(query_idx)?.to_vec0::<f32>()?,
                         _ => 0.0,
                     };
@@ -2277,10 +2257,7 @@ impl Sam3VideoTrackerCore<'_> {
             } else {
                 output.to_storage_device(session.storage_device())?
             };
-            stored_outputs.insert(
-                output.obj_id,
-                stored_output,
-            );
+            stored_outputs.insert(output.obj_id, stored_output);
         }
         if stored_outputs.is_empty() {
             session.frame_outputs.remove(&frame_idx);
@@ -2292,11 +2269,14 @@ impl Sam3VideoTrackerCore<'_> {
 
         let low_memory_mode = session.low_memory_mode();
         for (obj_id, _output, tracker_state, display_score) in pending_results {
-            let tracker_storage = self.compact_tracker_state_for_storage(
+            let memory_selection_score =
+                self.tracker_state_memory_selection_score(&tracker_state)?;
+            let tracker_storage = compact_tracker_state_for_storage(
                 &tracker_state,
                 session.storage_device(),
                 low_memory_mode,
                 session.retained_state_dtype(),
+                memory_selection_score,
             )?;
             if let Some(object) = session.tracked_objects.get_mut(&obj_id) {
                 let replaced = object
@@ -2343,6 +2323,29 @@ fn cast_retained_maskmem_features(
         .map(|tensor| maybe_to_dtype(tensor, dtype))
         .transpose()?;
     Ok(())
+}
+
+fn compact_tracker_state_for_storage(
+    state: &TrackerFrameState,
+    storage_device: &Device,
+    low_memory_mode: bool,
+    retained_state_dtype: RetainedStateDType,
+    memory_selection_score: Option<f32>,
+) -> Result<TrackerFrameState> {
+    let mut state = move_tracker_state(state, storage_device)?;
+    cast_retained_maskmem_features(&mut state, retained_state_dtype)?;
+    state.memory_selection_score = memory_selection_score;
+    let can_drop_render_tensors = !state.is_cond_frame
+        || (state.maskmem_features.is_some() && state.maskmem_pos_enc.is_some());
+    if can_drop_render_tensors {
+        state.high_res_masks = Tensor::zeros(0, DType::F32, storage_device)?;
+        state.iou_scores = Tensor::zeros(0, DType::F32, storage_device)?;
+    }
+    if low_memory_mode {
+        state.maskmem_prompt_features = None;
+        state.maskmem_prompt_pos_enc = None;
+    }
+    Ok(state)
 }
 
 fn grounding_query_count(scores: &Tensor) -> Result<usize> {
@@ -2754,7 +2757,7 @@ mod tests {
 
     #[test]
     fn retained_maskmem_dtype_is_applied_independently_of_storage_device() -> Result<()> {
-        let mut state = TrackerFrameState {
+        let state = TrackerFrameState {
             low_res_masks: Tensor::zeros((1, 1, 1, 1), DType::F32, &Device::Cpu)?,
             high_res_masks: Tensor::zeros((1, 1, 1, 1), DType::F32, &Device::Cpu)?,
             iou_scores: Tensor::zeros((1, 1), DType::F32, &Device::Cpu)?,
@@ -2768,7 +2771,13 @@ mod tests {
             is_cond_frame: false,
         };
 
-        cast_retained_maskmem_features(&mut state, RetainedStateDType::BF16)?;
+        let state = compact_tracker_state_for_storage(
+            &state,
+            &Device::Cpu,
+            false,
+            RetainedStateDType::BF16,
+            None,
+        )?;
 
         assert_eq!(
             state.maskmem_features.as_ref().map(Tensor::dtype),
@@ -2791,13 +2800,55 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn retained_maskmem_dtype_is_applied_on_cuda_storage() -> Result<()> {
+        if !candle::utils::cuda_is_available() {
+            return Ok(());
+        }
+        let device = Device::new_cuda(0)?;
+        let state = TrackerFrameState {
+            low_res_masks: Tensor::zeros((1, 1, 1, 1), DType::F32, &Device::Cpu)?,
+            high_res_masks: Tensor::zeros((1, 1, 1, 1), DType::F32, &Device::Cpu)?,
+            iou_scores: Tensor::zeros((1, 1), DType::F32, &Device::Cpu)?,
+            memory_selection_score: None,
+            obj_ptr: Tensor::zeros((1, 4), DType::F32, &Device::Cpu)?,
+            object_score_logits: Tensor::zeros((1, 1), DType::F32, &Device::Cpu)?,
+            maskmem_features: Some(Tensor::zeros((1, 4, 2, 2), DType::F32, &Device::Cpu)?),
+            maskmem_pos_enc: Some(Tensor::zeros((1, 4, 2, 2), DType::F32, &Device::Cpu)?),
+            maskmem_prompt_features: Some(Tensor::zeros((4, 1, 4), DType::F32, &Device::Cpu)?),
+            maskmem_prompt_pos_enc: Some(Tensor::zeros((4, 1, 4), DType::F32, &Device::Cpu)?),
+            is_cond_frame: false,
+        };
+
+        let state = compact_tracker_state_for_storage(
+            &state,
+            &device,
+            false,
+            RetainedStateDType::BF16,
+            None,
+        )?;
+        device.synchronize()?;
+
+        assert!(state
+            .maskmem_features
+            .as_ref()
+            .is_some_and(|tensor| tensor.device().same_device(&device)));
+        assert_eq!(
+            state.maskmem_features.as_ref().map(Tensor::dtype),
+            Some(DType::BF16)
+        );
+        assert_eq!(
+            state.maskmem_prompt_features.as_ref().map(Tensor::dtype),
+            Some(DType::BF16)
+        );
+        Ok(())
+    }
+
     #[test]
     fn compact_cached_output_round_trips_thresholded_masks_logits_and_boxes() -> Result<()> {
-        let mask_logits = Tensor::from_vec(
-            vec![0.0f32, 1.0, -1.0, 0.5],
-            (1, 1, 2, 2),
-            &Device::Cpu,
-        )?;
+        let mask_logits =
+            Tensor::from_vec(vec![0.0f32, 1.0, -1.0, 0.5], (1, 1, 2, 2), &Device::Cpu)?;
         let masks = candle_nn::ops::sigmoid(&mask_logits)?;
         let output = ObjectFrameOutput {
             obj_id: 1,
@@ -2833,11 +2884,7 @@ mod tests {
                 .gt(0.5f64)?
                 .flatten_all()?
                 .to_vec1::<u8>()?,
-            output
-                .masks
-                .gt(0.5f64)?
-                .flatten_all()?
-                .to_vec1::<u8>()?
+            output.masks.gt(0.5f64)?.flatten_all()?.to_vec1::<u8>()?
         );
         assert_eq!(
             materialized.boxes_xyxy.flatten_all()?.to_vec1::<f32>()?,

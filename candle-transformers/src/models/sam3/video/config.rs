@@ -94,8 +94,8 @@ pub enum VideoMemoryProfile {
 /// independent from model compute precision and only affects retained state.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RetainedStateDType {
-    F32,
     #[default]
+    F32,
     BF16,
 }
 
@@ -133,7 +133,7 @@ impl Default for VideoSessionOptions {
             memory_profile: VideoMemoryProfile::Balanced,
             offload_frames_to_cpu: false,
             offload_state_to_cpu: false,
-            retained_state_dtype: RetainedStateDType::BF16,
+            retained_state_dtype: RetainedStateDType::F32,
             prefetch_ahead: 2,
             prefetch_behind: 1,
             max_feature_cache_entries: 2,
