@@ -7,19 +7,23 @@ pub(crate) fn resize_bilinear2d_antialias(
     out_w: usize,
 ) -> Result<Tensor> {
     let input_dtype = input.dtype();
-    let compute_dtype = match input_dtype {
-        // Keep model compute tensors native; callers accept the reduced accumulation precision.
-        // If long-history drift becomes material, give F16 the same F32 boundary roundtrip as BF16.
-        DType::F16 | DType::F32 => input_dtype,
-        DType::BF16 if bf16_resize_supported(input.device()) => DType::BF16,
-        _ => DType::F32,
-    };
+    let compute_dtype = resize_compute_dtype(input_dtype, input.device());
     let input = input.to_dtype(compute_dtype)?;
     let output = resize_bilinear2d_antialias_native(&input, out_h, out_w)?;
     if input_dtype == DType::BF16 && compute_dtype == DType::F32 {
         output.to_dtype(DType::BF16)
     } else {
         Ok(output)
+    }
+}
+
+fn resize_compute_dtype(input_dtype: DType, device: &Device) -> DType {
+    match input_dtype {
+        // Narrow accumulation is intentional for this SAM3 boundary and is tolerance-bounded in
+        // tests. See den-sq/sam_parity#46 for the mixed-precision decision and evidence.
+        DType::F16 | DType::F32 => input_dtype,
+        DType::BF16 if bf16_resize_supported(device) => DType::BF16,
+        _ => DType::F32,
     }
 }
 
@@ -170,21 +174,25 @@ fn resize_bilinear2d_antialias_cpu<T: AntialiasValue>(
 fn bf16_resize_supported(_device: &Device) -> bool {
     #[cfg(feature = "cuda")]
     if let Device::Cuda(device) = _device {
-        use candle::cuda_backend::cudarc::driver::{result, sys};
-
         // Candle's native BF16 CUDA resize/pooling kernels require Ampere (SM 8.0).
-        let cuda_device = device.cuda_stream().context().cu_device();
-        let major = unsafe {
-            result::device::get_attribute(
-                cuda_device,
-                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-            )
-        }
-        .unwrap_or(0);
-        return major >= 8;
+        return cuda_compute_capability_major(device).unwrap_or(0) >= 8;
     }
 
     true
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_compute_capability_major(device: &candle::CudaDevice) -> Option<i32> {
+    use candle::cuda_backend::cudarc::driver::{result, sys};
+
+    let cuda_device = device.cuda_stream().context().cu_device();
+    unsafe {
+        result::device::get_attribute(
+            cuda_device,
+            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+        )
+    }
+    .ok()
 }
 
 fn antialias_linear_weights(input_size: usize, output_size: usize) -> Vec<Vec<(usize, f32)>> {
@@ -233,8 +241,16 @@ mod tests {
     }
 
     fn max_abs_diff(lhs: &Tensor, rhs: &Tensor) -> Result<f32> {
-        let lhs = lhs.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        let rhs = rhs.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let lhs = lhs
+            .to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let rhs = rhs
+            .to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
         Ok(lhs
             .iter()
             .zip(rhs.iter())
@@ -266,6 +282,19 @@ mod tests {
     }
 
     #[test]
+    fn f16_general_antialias_error_is_bounded_at_mask_memory_amplitude() -> Result<()> {
+        let input = input(7, 11)?.affine(5.0, 0.0)?;
+        let reference = resize_bilinear2d_antialias(&input, 4, 6)?;
+        let output = resize_bilinear2d_antialias(&input.to_dtype(DType::F16)?, 4, 6)?;
+        let error = max_abs_diff(&reference, &output)?;
+        assert!(
+            error <= 0.012,
+            "F16 general-antialias error {error} exceeded the declared ±10-input tolerance"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn non_float_input_retains_legacy_f32_output() -> Result<()> {
         let input = Tensor::zeros((1, 1, 3, 5), DType::U8, &Device::Cpu)?;
         let output = resize_bilinear2d_antialias(&input, 7, 11)?;
@@ -275,17 +304,51 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
-    fn cuda_preserves_f16_and_compatibly_restores_bf16() -> Result<()> {
+    fn cuda_covers_resize_paths_and_bf16_capability_route() -> Result<()> {
         if !candle::utils::cuda_is_available() {
             return Ok(());
         }
         let device = Device::new_cuda(0)?;
-        let input = input(3, 5)?.to_device(&device)?;
-        for dtype in [DType::F16, DType::BF16] {
-            let output = resize_bilinear2d_antialias(&input.to_dtype(dtype)?, 7, 11)?;
-            device.synchronize()?;
-            assert_eq!(output.dtype(), dtype);
-            assert_eq!(output.dims4()?, (1, 2, 7, 11));
+        let Device::Cuda(cuda_device) = &device else {
+            unreachable!("Device::new_cuda returned a non-CUDA device");
+        };
+        let major = cuda_compute_capability_major(cuda_device)
+            .expect("CUDA compute capability must be queryable for route selection");
+        let expected_bf16_compute = if major >= 8 { DType::BF16 } else { DType::F32 };
+        assert_eq!(
+            resize_compute_dtype(DType::BF16, &device),
+            expected_bf16_compute,
+            "SM{major} selected the wrong BF16 resize route"
+        );
+
+        let cases = [
+            (3, 5, 3, 5, "identity"),
+            (3, 5, 7, 11, "upsample"),
+            (8, 12, 4, 3, "integer-downsample"),
+            (7, 11, 4, 6, "general-antialias"),
+        ];
+        for (in_h, in_w, out_h, out_w, path) in cases {
+            let input = input(in_h, in_w)?;
+            let reference = resize_bilinear2d_antialias(&input, out_h, out_w)?;
+            for (dtype, tolerance) in [(DType::F16, 0.003f32), (DType::BF16, 0.03f32)] {
+                let output = resize_bilinear2d_antialias(
+                    &input.to_dtype(dtype)?.to_device(&device)?,
+                    out_h,
+                    out_w,
+                )?;
+                device.synchronize()?;
+                assert_eq!(output.dtype(), dtype, "{path} returned the wrong dtype");
+                assert_eq!(
+                    output.dims4()?,
+                    (1, 2, out_h, out_w),
+                    "{path} returned the wrong shape"
+                );
+                let error = max_abs_diff(&reference, &output)?;
+                assert!(
+                    error <= tolerance,
+                    "{dtype:?} {path} error {error} exceeded {tolerance} on SM{major}"
+                );
+            }
         }
         Ok(())
     }
