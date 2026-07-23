@@ -134,10 +134,11 @@ impl Sam3TrackerModel {
         max_abs_pos: Option<usize>,
         dummy: bool,
     ) -> Result<Tensor> {
+        let compute_dtype = self.obj_ptr_tpos_proj.weight().dtype();
         if dummy {
             return Tensor::zeros(
                 (rel_pos_list.len(), self.config.memory_dim),
-                DType::F32,
+                compute_dtype,
                 device,
             );
         }
@@ -147,7 +148,8 @@ impl Sam3TrackerModel {
             .unwrap_or(1) as f64;
         let pos_inds = device_f32_vector(device, rel_pos_list)?;
         let pos_inds = pos_inds.affine(1.0 / t_diff_max, 0.0)?;
-        let pos_enc = get_1d_sine_pe(&pos_inds, self.config.hidden_dim)?;
+        let pos_enc =
+            get_1d_sine_pe(&pos_inds, self.config.hidden_dim)?.to_dtype(compute_dtype)?;
         self.obj_ptr_tpos_proj.forward(&pos_enc)
     }
 
