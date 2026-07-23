@@ -36,6 +36,10 @@ pub struct SessionCacheStats {
     pub postprocess_score_scalar_reads: usize,
     pub cpu_low_res_mask_bytes: usize,
     pub device_low_res_mask_bytes: usize,
+    pub retained_maskmem_feature_elements: usize,
+    pub cpu_retained_maskmem_feature_bytes: usize,
+    pub device_retained_maskmem_feature_bytes: usize,
+    pub retained_maskmem_feature_dtype_mismatches: usize,
     pub hotstart_buffered_frames: usize,
     pub hotstart_buffered_cpu_bytes: usize,
     pub hotstart_buffered_device_bytes: usize,
@@ -398,6 +402,11 @@ impl Sam3VideoSession {
         };
         let mut cpu_low_res_mask_bytes = 0usize;
         let mut device_low_res_mask_bytes = 0usize;
+        let mut retained_maskmem_feature_elements = 0usize;
+        let mut cpu_retained_maskmem_feature_bytes = 0usize;
+        let mut device_retained_maskmem_feature_bytes = 0usize;
+        let mut retained_maskmem_feature_dtype_mismatches = 0usize;
+        let expected_retained_dtype = self.session_options.retained_state_dtype.candle_dtype();
 
         for visual in self.feature_cache.values() {
             let (cpu, device) = visual.memory_bytes();
@@ -423,6 +432,25 @@ impl Sam3VideoSession {
                 let (cpu, device) = state.memory_bytes();
                 cpu_bytes.tracker_states = cpu_bytes.tracker_states.saturating_add(cpu);
                 device_bytes.tracker_states = device_bytes.tracker_states.saturating_add(device);
+                for tensor in [
+                    state.maskmem_features.as_ref(),
+                    state.maskmem_prompt_features.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    retained_maskmem_feature_elements =
+                        retained_maskmem_feature_elements.saturating_add(tensor.elem_count());
+                    add_tensor_memory(
+                        tensor,
+                        &mut cpu_retained_maskmem_feature_bytes,
+                        &mut device_retained_maskmem_feature_bytes,
+                    );
+                    if tensor.dtype() != expected_retained_dtype {
+                        retained_maskmem_feature_dtype_mismatches =
+                            retained_maskmem_feature_dtype_mismatches.saturating_add(1);
+                    }
+                }
                 add_tensor_memory(
                     &state.low_res_masks,
                     &mut cpu_low_res_mask_bytes,
@@ -430,8 +458,7 @@ impl Sam3VideoSession {
                 );
             }
             let (cpu, device) = object.prompt_history_cache.memory_bytes();
-            cpu_bytes.packed_prompt_history =
-                cpu_bytes.packed_prompt_history.saturating_add(cpu);
+            cpu_bytes.packed_prompt_history = cpu_bytes.packed_prompt_history.saturating_add(cpu);
             device_bytes.packed_prompt_history =
                 device_bytes.packed_prompt_history.saturating_add(device);
         }
@@ -476,6 +503,10 @@ impl Sam3VideoSession {
             postprocess_score_scalar_reads: self.postprocess_score_scalar_reads,
             cpu_low_res_mask_bytes,
             device_low_res_mask_bytes,
+            retained_maskmem_feature_elements,
+            cpu_retained_maskmem_feature_bytes,
+            device_retained_maskmem_feature_bytes,
+            retained_maskmem_feature_dtype_mismatches,
             hotstart_buffered_frames: self.hotstart_buffered_frames,
             hotstart_buffered_cpu_bytes: self.hotstart_buffered_cpu_bytes,
             hotstart_buffered_device_bytes: self.hotstart_buffered_device_bytes,
@@ -523,7 +554,10 @@ impl Sam3VideoSession {
     }
 
     pub(crate) fn low_memory_mode(&self) -> bool {
-        matches!(self.session_options.memory_profile, VideoMemoryProfile::LowMemory)
+        matches!(
+            self.session_options.memory_profile,
+            VideoMemoryProfile::LowMemory
+        )
     }
 
     pub(super) fn debug_recorder_mut(&mut self) -> Option<&mut VideoDebugRecorder> {
@@ -1216,6 +1250,27 @@ mod tests {
             object.tracker_states.keys().copied().collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn cache_stats_separate_retained_maskmem_features_from_compute_dtype_state() -> Result<()> {
+        let mut session = test_session(VideoMemoryProfile::LowMemory)?;
+        session.session_options.retained_state_dtype = RetainedStateDType::BF16;
+        let mut state = test_tracker_state()?;
+        state.maskmem_features = Some(Tensor::zeros((1, 2, 2), DType::BF16, &Device::Cpu)?);
+        state.maskmem_prompt_features = Some(Tensor::zeros((1, 3), DType::BF16, &Device::Cpu)?);
+        state.maskmem_pos_enc = Some(Tensor::zeros((1, 2, 2), DType::F32, &Device::Cpu)?);
+        let mut object = TrackedObject::new(7, 0);
+        object.tracker_states.insert(0, state);
+        session.tracked_objects.insert(7, object);
+
+        let stats = session.cache_stats();
+        assert_eq!(stats.retained_maskmem_feature_elements, 7);
+        assert_eq!(stats.cpu_retained_maskmem_feature_bytes, 14);
+        assert_eq!(stats.device_retained_maskmem_feature_bytes, 0);
+        assert_eq!(stats.retained_maskmem_feature_dtype_mismatches, 0);
+        assert!(stats.cpu_bytes.tracker_states > stats.cpu_retained_maskmem_feature_bytes);
         Ok(())
     }
 
