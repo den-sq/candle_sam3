@@ -507,7 +507,7 @@ impl Sam3TrackerModel {
             maskmem_features: state
                 .maskmem_features
                 .as_ref()
-                .map(|tensor| maybe_to_device(&maybe_to_dtype(tensor, DType::BF16)?, storage))
+                .map(|tensor| maybe_to_device(tensor, storage))
                 .transpose()?,
             maskmem_pos_enc: state
                 .maskmem_pos_enc
@@ -517,7 +517,7 @@ impl Sam3TrackerModel {
             maskmem_prompt_features: state
                 .maskmem_prompt_features
                 .as_ref()
-                .map(|tensor| maybe_to_device(&maybe_to_dtype(tensor, DType::BF16)?, storage))
+                .map(|tensor| maybe_to_device(tensor, storage))
                 .transpose()?,
             maskmem_prompt_pos_enc: state
                 .maskmem_prompt_pos_enc

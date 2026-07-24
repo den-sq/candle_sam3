@@ -247,6 +247,15 @@ impl PackedPromptHistory {
             state.maskmem_prompt_features.as_ref(),
             state.maskmem_prompt_pos_enc.as_ref(),
         ) {
+            // Retained mask memory may use BF16 even when the compute device
+            // cannot execute BF16 indexing/copy kernels (for example Turing).
+            // The packed cache is an execution optimization, so keep it in the
+            // tracker compute dtype while the authoritative retained tensors
+            // remain in their configured storage dtype.
+            let compute_dtype = state.obj_ptr.dtype();
+            let maskmem_prompt_features =
+                maybe_to_dtype(maskmem_prompt_features, compute_dtype)?;
+            let maskmem_prompt_pos_enc = maybe_to_dtype(maskmem_prompt_pos_enc, compute_dtype)?;
             let next_maskmem_slot = self.maskmem_frames.len();
             Self::append_tensor(
                 &mut self.maskmem_prompt_features,
@@ -392,6 +401,69 @@ pub(super) fn add_tensor_memory(tensor: &Tensor, cpu: &mut usize, device: &mut u
         *cpu = cpu.saturating_add(bytes);
     } else {
         *device = device.saturating_add(bytes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn retained_bf16_state(device: &Device) -> Result<TrackerFrameState> {
+        let mut state = TrackerFrameState {
+            low_res_masks: Tensor::zeros((1, 1, 2, 2), DType::F32, device)?,
+            high_res_masks: Tensor::zeros((1, 1, 8, 8), DType::F32, device)?,
+            iou_scores: Tensor::zeros((1, 1), DType::F32, device)?,
+            memory_selection_score: None,
+            obj_ptr: Tensor::zeros((1, 4), DType::F32, device)?,
+            object_score_logits: Tensor::zeros((1, 1), DType::F32, device)?,
+            maskmem_features: None,
+            maskmem_pos_enc: None,
+            maskmem_prompt_features: None,
+            maskmem_prompt_pos_enc: None,
+            is_cond_frame: false,
+        };
+        state.set_maskmem_state(
+            Tensor::zeros((1, 2, 2, 2), DType::BF16, device)?,
+            Tensor::zeros((1, 2, 2, 2), DType::BF16, device)?,
+        )?;
+        Ok(state)
+    }
+
+    #[test]
+    fn packed_prompt_history_uses_compute_dtype_for_retained_bf16() -> Result<()> {
+        let mut history = PackedPromptHistory::default();
+        history.append_state(0, &retained_bf16_state(&Device::Cpu)?)?;
+
+        assert_eq!(
+            history.maskmem_prompt_features().map(Tensor::dtype),
+            Some(DType::F32)
+        );
+        assert_eq!(
+            history.maskmem_prompt_pos_enc().map(Tensor::dtype),
+            Some(DType::F32)
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires CUDA; specifically guards BF16 retained state on pre-Ampere devices"]
+    fn packed_prompt_history_concatenates_retained_bf16_on_turing() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let mut history = PackedPromptHistory::default();
+        history.append_state(0, &retained_bf16_state(&device)?)?;
+        history.append_state(1, &retained_bf16_state(&device)?)?;
+        device.synchronize()?;
+
+        assert_eq!(
+            history.maskmem_prompt_features().map(Tensor::dtype),
+            Some(DType::F32)
+        );
+        assert_eq!(
+            history.maskmem_prompt_pos_enc().map(Tensor::dtype),
+            Some(DType::F32)
+        );
+        Ok(())
     }
 }
 

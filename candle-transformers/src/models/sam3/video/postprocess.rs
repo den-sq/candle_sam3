@@ -31,9 +31,9 @@ impl<'a> Sam3VideoTrackerCore<'a> {
             hidden_obj_ids.extend(obj_ids.iter().copied());
         }
         let mut visible_outputs = Vec::new();
-        let mut visible_scores = Vec::new();
         let use_local_confirmation_gate =
             predictor_config.masklet_confirmation_enable && config.hotstart_delay == 0;
+        let mut visible_states = Vec::new();
 
         for (obj_id, raw_output, state, _) in results.iter() {
             let output = if postprocess_on_cpu
@@ -46,8 +46,11 @@ impl<'a> Sam3VideoTrackerCore<'a> {
             if hidden_obj_ids.contains(obj_id) {
                 continue;
             }
-            let has_detectable_output = object_has_detectable_output(&output, output_threshold)?;
+            session.record_postprocess_foreground_scalar_read();
+            let has_foreground = mask_has_foreground(&output.masks, output_threshold)?;
             let is_confirmed = if use_local_confirmation_gate {
+                session.record_postprocess_score_scalar_read();
+                let has_detectable_output = object_presence_score(&output)? > 0.0;
                 let object = session.tracked_objects.get_mut(obj_id).ok_or_else(|| {
                     candle::Error::Msg(format!(
                         "unknown obj_id {} while updating postprocess confirmation state",
@@ -58,24 +61,24 @@ impl<'a> Sam3VideoTrackerCore<'a> {
             } else {
                 true
             };
-            if !mask_has_foreground(&output.masks, output_threshold)? {
-                continue;
-            }
-            if !is_confirmed {
+            if !has_foreground || !is_confirmed {
                 hidden_obj_ids.insert(*obj_id);
                 continue;
             }
-            visible_outputs.push(output.clone());
-            visible_scores.push(if output.presence_scores.is_some() {
-                object_presence_score(&output)?
-            } else if postprocess_on_cpu {
-                tracker_state_presence_score_on_device(state, &postprocess_device)?
-            } else {
-                tracker_state_presence_score(state)?
-            });
+            visible_outputs.push(output);
+            visible_states.push(state);
         }
 
-        let visible_outputs = if config.non_overlap_masks_for_output {
+        let apply_multi_object_non_overlap =
+            config.non_overlap_masks_for_output && visible_outputs.len() > 1;
+        let visible_outputs = if apply_multi_object_non_overlap {
+            let visible_scores = visible_outputs
+                .iter()
+                .zip(visible_states)
+                .map(|(output, state)| {
+                    object_presence_score_tensor(output, state, &postprocess_device)
+                })
+                .collect::<Result<Vec<_>>>()?;
             apply_object_wise_non_overlapping_constraints(
                 &visible_outputs,
                 &visible_scores,
@@ -85,17 +88,10 @@ impl<'a> Sam3VideoTrackerCore<'a> {
             visible_outputs
                 .into_iter()
                 .map(|output| {
-                    let plane = mask_to_bool_plane(&output.masks, output_threshold)?;
-                    let height = plane.len();
-                    let width = plane.first().map(Vec::len).unwrap_or(0);
-                    let data = plane
-                        .iter()
-                        .flat_map(|row| {
-                            row.iter().map(|value| if *value { 1.0f32 } else { 0.0f32 })
-                        })
-                        .collect::<Vec<_>>();
-                    let binary_mask =
-                        Tensor::from_vec(data, (1, height, width), output.masks.device())?;
+                    let binary_mask = output
+                        .masks
+                        .ge(output_threshold as f64)?
+                        .to_dtype(DType::F32)?;
                     rebuild_object_output_from_binary_mask(&output, &binary_mask)
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -103,7 +99,13 @@ impl<'a> Sam3VideoTrackerCore<'a> {
 
         let mut final_outputs = Vec::new();
         for mut output in visible_outputs {
-            if mask_has_foreground(&output.masks, output_threshold)? {
+            let has_foreground = if apply_multi_object_non_overlap {
+                session.record_postprocess_foreground_scalar_read();
+                mask_has_foreground(&output.masks, output_threshold)?
+            } else {
+                true
+            };
+            if has_foreground {
                 output.boxes_xyxy = mask_to_normalized_xyxy(&output.masks)?;
                 final_outputs.push(output);
             } else {
@@ -174,16 +176,26 @@ pub(super) fn tracker_state_presence_score(state: &TrackerFrameState) -> Result<
     first_scalar_f32(&candle_nn::ops::sigmoid(&state.object_score_logits)?)
 }
 
-fn tracker_state_presence_score_on_device(
+fn object_presence_score_tensor(
+    output: &ObjectFrameOutput,
     state: &TrackerFrameState,
     device: &Device,
-) -> Result<f32> {
-    let logits = if state.object_score_logits.device().same_device(device) {
-        state.object_score_logits.clone()
+) -> Result<Tensor> {
+    let scores = if let Some(scores) = output.presence_scores.as_ref() {
+        if scores.device().same_device(device) {
+            scores.clone()
+        } else {
+            scores.to_device(device)?
+        }
     } else {
-        state.object_score_logits.to_device(device)?
+        let logits = if state.object_score_logits.device().same_device(device) {
+            state.object_score_logits.clone()
+        } else {
+            state.object_score_logits.to_device(device)?
+        };
+        candle_nn::ops::sigmoid(&logits)?
     };
-    first_scalar_f32(&candle_nn::ops::sigmoid(&logits)?)
+    flatten_all_contiguous(&scores)?.i(0)?.reshape((1,))
 }
 
 pub(super) fn mask_has_foreground(mask: &Tensor, threshold: f32) -> Result<bool> {
@@ -193,10 +205,6 @@ pub(super) fn mask_has_foreground(mask: &Tensor, threshold: f32) -> Result<bool>
         .max_all()?
         .to_scalar::<f32>()?
         > 0.0)
-}
-
-fn object_has_detectable_output(output: &ObjectFrameOutput, threshold: f32) -> Result<bool> {
-    Ok(mask_has_foreground(&output.masks, threshold)? && object_presence_score(output)? > 0.0)
 }
 
 fn binary_mask_logits(mask: &Tensor) -> Result<Tensor> {
@@ -237,7 +245,7 @@ fn rebuild_object_output_from_binary_mask(
 
 fn apply_object_wise_non_overlapping_constraints(
     outputs: &[ObjectFrameOutput],
-    scores: &[f32],
+    scores: &[Tensor],
     threshold: f32,
 ) -> Result<Vec<ObjectFrameOutput>> {
     if outputs.len() <= 1 {
@@ -257,7 +265,10 @@ fn apply_object_wise_non_overlapping_constraints(
     let mask_refs = mask_tensors.iter().collect::<Vec<_>>();
     let mask_stack = Tensor::cat(&mask_refs, 0)?.contiguous()?;
     let mask_present = mask_stack.ge(threshold as f64)?;
-    let score_tensor = Tensor::from_vec(scores.to_vec(), (outputs.len(), 1, 1, 1), device)?;
+    let score_refs = scores.iter().collect::<Vec<_>>();
+    let score_tensor = Tensor::cat(&score_refs, 0)?
+        .to_dtype(DType::F32)?
+        .reshape((outputs.len(), 1, 1, 1))?;
     let scored_masks = mask_present.where_cond(
         &score_tensor.broadcast_as(mask_stack.shape())?,
         &Tensor::full(f32::NEG_INFINITY, mask_stack.shape(), device)?,
@@ -404,6 +415,7 @@ pub(super) fn postprocess_low_res_mask_logits_for_video(
 }
 
 fn postprocess_low_res_mask_logits_on_cpu(mask_logits: &Tensor, max_area: usize) -> Result<Tensor> {
+    let mask_logits = mask_logits.to_dtype(DType::F32)?;
     let (batch, channel, height, width) = mask_logits.dims4()?;
     let mut processed = Vec::with_capacity(batch * channel * height * width);
 
@@ -740,6 +752,22 @@ mod tests {
             .iter()
             .zip(expected)
             .all(|(actual, expected)| (actual - expected).abs() <= 1e-6));
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_low_res_postprocess_accepts_half_compute_logits() -> Result<()> {
+        let logits = Tensor::from_vec(
+            vec![-1.0f32, -1.0, -1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0],
+            (1, 1, 3, 3),
+            &Device::Cpu,
+        )?
+        .to_dtype(DType::F16)?;
+
+        let processed = postprocess_low_res_mask_logits_on_cpu(&logits, 1)?;
+
+        assert_eq!(processed.dtype(), DType::F32);
+        assert_eq!(processed.dims4()?, (1, 1, 3, 3));
         Ok(())
     }
 

@@ -97,7 +97,8 @@ impl FusionAttention {
             .matmul(&v)?
             .reshape((batch_size, self.num_heads, tgt_len, self.head_dim))?
             .transpose(1, 2)?
-            .reshape((batch_size, tgt_len, hidden_size))?;
+            .reshape((batch_size, tgt_len, hidden_size))?
+            .to_dtype(query.dtype())?;
         self.out_proj
             .forward(&hidden_states)?
             .transpose(0, 1)?

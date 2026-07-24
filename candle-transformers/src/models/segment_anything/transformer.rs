@@ -1,5 +1,5 @@
-use candle::{Result, Tensor};
-use candle_nn::{layer_norm, LayerNorm, Linear, Module, VarBuilder};
+use candle::{DType, Result, Tensor};
+use candle_nn::{LayerNorm, Linear, Module, VarBuilder, layer_norm};
 
 #[derive(Debug)]
 struct Attention {
@@ -47,19 +47,20 @@ impl Attention {
     }
 
     fn forward(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+        let in_dtype = q.dtype();
         let q = self.q_proj.forward(&q.contiguous()?)?;
         let k = self.k_proj.forward(&k.contiguous()?)?;
         let v = self.v_proj.forward(&v.contiguous()?)?;
 
-        let q = self.separate_heads(&q)?;
-        let k = self.separate_heads(&k)?;
-        let v = self.separate_heads(&v)?;
+        let q = self.separate_heads(&q)?.to_dtype(DType::F32)?;
+        let k = self.separate_heads(&k)?.to_dtype(DType::F32)?;
+        let v = self.separate_heads(&v)?.to_dtype(DType::F32)?;
 
         let (_, _, _, c_per_head) = q.dims4()?;
         let attn = (q.matmul(&k.t()?)? / (c_per_head as f64).sqrt())?;
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
 
-        let out = attn.matmul(&v)?;
+        let out = attn.matmul(&v)?.to_dtype(in_dtype)?;
         self.recombine_heads(&out)?.apply(&self.out_proj)
     }
 }

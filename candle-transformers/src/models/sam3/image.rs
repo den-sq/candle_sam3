@@ -159,6 +159,7 @@ pub struct GroundingOutput {
 #[derive(Debug)]
 pub struct Sam3ImageModel {
     config: Config,
+    compute_dtype: DType,
     vision_trunk: Sam3ViTDetTrunk,
     vision_neck: Sam3DualViTDetNeck,
     text: Sam3TextEncoder,
@@ -202,6 +203,7 @@ impl Sam3ImageModel {
         };
         Ok(Self {
             config: config.clone(),
+            compute_dtype: model_dtype,
             vision_trunk,
             vision_neck,
             text,
@@ -214,6 +216,11 @@ impl Sam3ImageModel {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Tensor dtype used by the model weights and compute-heavy encoder paths.
+    pub fn compute_dtype(&self) -> DType {
+        self.compute_dtype
     }
 
     pub fn input_size(&self) -> ImageSize {
@@ -271,7 +278,8 @@ impl Sam3ImageModel {
             3 => image.unsqueeze(0)?,
             4 => image.clone(),
             rank => candle::bail!("sam3 image encoder expects CHW or BCHW input, got rank {rank}"),
-        };
+        }
+        .to_dtype(self.compute_dtype)?;
         let trunk = self.vision_trunk.forward(&image)?;
         self.vision_neck.forward(&trunk)
     }
@@ -281,7 +289,8 @@ impl Sam3ImageModel {
             3 => image.unsqueeze(0)?,
             4 => image.clone(),
             rank => candle::bail!("sam3 image encoder expects CHW or BCHW input, got rank {rank}"),
-        };
+        }
+        .to_dtype(self.compute_dtype)?;
         self.vision_trunk.forward(&image)
     }
 
@@ -293,7 +302,8 @@ impl Sam3ImageModel {
             3 => image.unsqueeze(0)?,
             4 => image.clone(),
             rank => candle::bail!("sam3 image encoder expects CHW or BCHW input, got rank {rank}"),
-        };
+        }
+        .to_dtype(self.compute_dtype)?;
         self.vision_trunk.forward_with_block_outputs(&image)
     }
 
@@ -310,7 +320,8 @@ impl Sam3ImageModel {
             3 => image.unsqueeze(0)?,
             4 => image.clone(),
             rank => candle::bail!("sam3 image encoder expects CHW or BCHW input, got rank {rank}"),
-        };
+        }
+        .to_dtype(self.compute_dtype)?;
         self.vision_trunk
             .forward_with_debug_blocks(&image, debug_blocks)
     }
