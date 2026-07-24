@@ -906,16 +906,16 @@ impl Sam3TrackerModel {
     ) -> Result<TrackerFrameState> {
         let device = backbone_features.device();
         let mask_inputs = normalize_mask_prompt(mask_inputs, device)?;
-        let mask_inputs_float = mask_inputs.to_dtype(DType::F32)?;
-        let high_res_masks = mask_inputs_float.affine(20.0, -10.0)?;
+        let mask_inputs_compute = mask_inputs.to_dtype(backbone_features.dtype())?;
+        let high_res_masks = mask_inputs_compute.affine(20.0, -10.0)?;
         let mask_input_low_res_size = (self.input_mask_size() / self.config.backbone_stride) * 4;
         let low_res_masks = resize_bilinear2d_antialias(
             &high_res_masks,
             mask_input_low_res_size,
             mask_input_low_res_size,
         )?;
-        let iou_scores = Tensor::ones((mask_inputs_float.dim(0)?, 1), DType::F32, device)?;
-        let mask_prompt = self.mask_downsample.forward(&mask_inputs_float)?;
+        let iou_scores = Tensor::ones((mask_inputs_compute.dim(0)?, 1), DType::F32, device)?;
+        let mask_prompt = self.mask_downsample.forward(&mask_inputs_compute)?;
         let prepared_high_res_features = match high_res_features {
             Some(high_res_features) => Some(self.prepare_high_res_features(high_res_features)?),
             None => None,
@@ -923,7 +923,7 @@ impl Sam3TrackerModel {
         self.use_mask_as_output_prepared(
             backbone_features,
             prepared_high_res_features.as_deref(),
-            mask_inputs_float,
+            mask_inputs_compute,
             high_res_masks,
             low_res_masks,
             iou_scores,
@@ -936,7 +936,7 @@ impl Sam3TrackerModel {
         &self,
         backbone_features: &Tensor,
         high_res_features: Option<&[Tensor]>,
-        mask_inputs_float: Tensor,
+        mask_inputs_compute: Tensor,
         high_res_masks: Tensor,
         low_res_masks: Tensor,
         iou_scores: Tensor,
@@ -951,7 +951,7 @@ impl Sam3TrackerModel {
             false,
             is_cond_frame,
         )?;
-        let object_present = mask_inputs_float
+        let object_present = mask_inputs_compute
             .flatten(1, 3)?
             .gt(0f64)?
             .to_dtype(DType::F32)?

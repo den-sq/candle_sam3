@@ -1,32 +1,132 @@
-use candle::{DType, Device, Result, Tensor};
+use candle::{DType, Device, Result, Tensor, WithDType};
+use half::{bf16, f16};
 
 pub(crate) fn resize_bilinear2d_antialias(
     input: &Tensor,
     out_h: usize,
     out_w: usize,
 ) -> Result<Tensor> {
-    let input_f32 = input.to_dtype(DType::F32)?;
-    let (batch, channels, in_h, in_w) = input_f32.dims4()?;
+    let input_dtype = input.dtype();
+    let compute_dtype = resize_compute_dtype(input_dtype, input.device());
+    let input = input.to_dtype(compute_dtype)?;
+    let output = resize_bilinear2d_antialias_native(&input, out_h, out_w)?;
+    if input_dtype == DType::BF16 && compute_dtype == DType::F32 {
+        output.to_dtype(DType::BF16)
+    } else {
+        Ok(output)
+    }
+}
+
+fn resize_compute_dtype(input_dtype: DType, device: &Device) -> DType {
+    match input_dtype {
+        // Narrow accumulation is intentional for this SAM3 boundary and is tolerance-bounded in
+        // tests. See den-sq/sam_parity#46 for the mixed-precision decision and evidence.
+        DType::F16 | DType::F32 => input_dtype,
+        DType::BF16 if bf16_resize_supported(device) => DType::BF16,
+        _ => DType::F32,
+    }
+}
+
+fn resize_bilinear2d_antialias_native(
+    input: &Tensor,
+    out_h: usize,
+    out_w: usize,
+) -> Result<Tensor> {
+    let (batch, channels, in_h, in_w) = input.dims4()?;
     if in_h == out_h && in_w == out_w {
-        return Ok(input_f32);
+        return Ok(input.clone());
     }
     if out_h >= in_h && out_w >= in_w {
-        return input_f32.upsample_bilinear2d(out_h, out_w, false);
+        return input.upsample_bilinear2d(out_h, out_w, false);
     }
     if in_h % out_h == 0 && in_w % out_w == 0 {
         let stride_h = in_h / out_h;
         let stride_w = in_w / out_w;
         if stride_h > 0 && stride_w > 0 {
-            return input_f32.avg_pool2d_with_stride((stride_h, stride_w), (stride_h, stride_w));
+            return input.avg_pool2d_with_stride((stride_h, stride_w), (stride_h, stride_w));
         }
     }
 
-    let input_cpu = input_f32.to_device(&Device::Cpu)?;
-    let input_vec = input_cpu.flatten_all()?.to_vec1::<f32>()?;
     let width_weights = antialias_linear_weights(in_w, out_w);
     let height_weights = antialias_linear_weights(in_h, out_h);
-    let mut horizontal = vec![0.0f32; batch * channels * in_h * out_w];
-    let mut output = vec![0.0f32; batch * channels * out_h * out_w];
+    match input.dtype() {
+        DType::F16 => resize_bilinear2d_antialias_cpu::<f16>(
+            input,
+            (batch, channels, in_h, in_w),
+            out_h,
+            out_w,
+            &width_weights,
+            &height_weights,
+        ),
+        DType::BF16 => resize_bilinear2d_antialias_cpu::<bf16>(
+            input,
+            (batch, channels, in_h, in_w),
+            out_h,
+            out_w,
+            &width_weights,
+            &height_weights,
+        ),
+        DType::F32 => resize_bilinear2d_antialias_cpu::<f32>(
+            input,
+            (batch, channels, in_h, in_w),
+            out_h,
+            out_w,
+            &width_weights,
+            &height_weights,
+        ),
+        dtype => candle::bail!("unsupported dtype {dtype:?} for bilinear antialias resize"),
+    }
+}
+
+trait AntialiasValue: WithDType + Copy {
+    fn zero_value() -> Self;
+    fn weighted_add(sum: Self, value: Self, weight: f32) -> Self;
+}
+
+impl AntialiasValue for f32 {
+    fn zero_value() -> Self {
+        0.0
+    }
+
+    fn weighted_add(sum: Self, value: Self, weight: f32) -> Self {
+        sum + value * weight
+    }
+}
+
+impl AntialiasValue for f16 {
+    fn zero_value() -> Self {
+        Self::ZERO
+    }
+
+    fn weighted_add(sum: Self, value: Self, weight: f32) -> Self {
+        sum + value * Self::from_f32(weight)
+    }
+}
+
+impl AntialiasValue for bf16 {
+    fn zero_value() -> Self {
+        Self::ZERO
+    }
+
+    fn weighted_add(sum: Self, value: Self, weight: f32) -> Self {
+        sum + value * Self::from_f32(weight)
+    }
+}
+
+fn resize_bilinear2d_antialias_cpu<T: AntialiasValue>(
+    input: &Tensor,
+    (batch, channels, in_h, in_w): (usize, usize, usize, usize),
+    out_h: usize,
+    out_w: usize,
+    width_weights: &[Vec<(usize, f32)>],
+    height_weights: &[Vec<(usize, f32)>],
+) -> Result<Tensor> {
+    let input_vec = input
+        .to_device(&Device::Cpu)?
+        .flatten_all()?
+        .to_vec1::<T>()?;
+    let mut horizontal = vec![T::zero_value(); batch * channels * in_h * out_w];
+    let mut output = vec![T::zero_value(); batch * channels * out_h * out_w];
     let input_stride_c = in_h * in_w;
     let input_stride_b = channels * input_stride_c;
     let horizontal_stride_c = in_h * out_w;
@@ -43,9 +143,9 @@ pub(crate) fn resize_bilinear2d_antialias(
                 let row_offset = input_base + y * in_w;
                 let horizontal_row_offset = horizontal_base + y * out_w;
                 for (out_x, weights) in width_weights.iter().enumerate() {
-                    let mut value = 0.0f32;
+                    let mut value = T::zero_value();
                     for (src_x, weight) in weights {
-                        value += input_vec[row_offset + *src_x] * *weight;
+                        value = T::weighted_add(value, input_vec[row_offset + *src_x], *weight);
                     }
                     horizontal[horizontal_row_offset + out_x] = value;
                 }
@@ -53,9 +153,13 @@ pub(crate) fn resize_bilinear2d_antialias(
             for (out_y, weights) in height_weights.iter().enumerate() {
                 let output_row_offset = output_base + out_y * out_w;
                 for out_x in 0..out_w {
-                    let mut value = 0.0f32;
+                    let mut value = T::zero_value();
                     for (src_y, weight) in weights {
-                        value += horizontal[horizontal_base + *src_y * out_w + out_x] * *weight;
+                        value = T::weighted_add(
+                            value,
+                            horizontal[horizontal_base + *src_y * out_w + out_x],
+                            *weight,
+                        );
                     }
                     output[output_row_offset + out_x] = value;
                 }
@@ -65,6 +169,30 @@ pub(crate) fn resize_bilinear2d_antialias(
 
     Tensor::from_vec(output, (batch, channels, out_h, out_w), &Device::Cpu)?
         .to_device(input.device())
+}
+
+fn bf16_resize_supported(_device: &Device) -> bool {
+    #[cfg(feature = "cuda")]
+    if let Device::Cuda(device) = _device {
+        // Candle's native BF16 CUDA resize/pooling kernels require Ampere (SM 8.0).
+        return cuda_compute_capability_major(device).unwrap_or(0) >= 8;
+    }
+
+    true
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_compute_capability_major(device: &candle::CudaDevice) -> Option<i32> {
+    use candle::cuda_backend::cudarc::driver::{result, sys};
+
+    let cuda_device = device.cuda_stream().context().cu_device();
+    unsafe {
+        result::device::get_attribute(
+            cuda_device,
+            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+        )
+    }
+    .ok()
 }
 
 fn antialias_linear_weights(input_size: usize, output_size: usize) -> Vec<Vec<(usize, f32)>> {
@@ -96,4 +224,132 @@ fn antialias_linear_weights(input_size: usize, output_size: usize) -> Vec<Vec<(u
         all_weights.push(weights);
     }
     all_weights
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(height: usize, width: usize) -> Result<Tensor> {
+        let values = (0..2 * height * width)
+            .map(|index| {
+                let index = index as f32;
+                (index * 0.173).sin() * 1.7 + (index * 0.071).cos() * 0.3
+            })
+            .collect::<Vec<_>>();
+        Tensor::from_vec(values, (1, 2, height, width), &Device::Cpu)
+    }
+
+    fn max_abs_diff(lhs: &Tensor, rhs: &Tensor) -> Result<f32> {
+        let lhs = lhs
+            .to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let rhs = rhs
+            .to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        Ok(lhs
+            .iter()
+            .zip(rhs.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0f32, f32::max))
+    }
+
+    #[test]
+    fn preserves_native_float_dtype_across_all_resize_paths() -> Result<()> {
+        let cases = [(3, 5, 3, 5), (3, 5, 7, 11), (8, 12, 4, 3), (7, 11, 4, 6)];
+        for (in_h, in_w, out_h, out_w) in cases {
+            let input_f32 = input(in_h, in_w)?;
+            let reference = resize_bilinear2d_antialias(&input_f32, out_h, out_w)?;
+            for (dtype, tolerance) in [
+                (DType::F16, 0.003f32),
+                (DType::BF16, 0.02f32),
+                (DType::F32, 0.0f32),
+            ] {
+                let input = input_f32.to_dtype(dtype)?;
+                let output = resize_bilinear2d_antialias(&input, out_h, out_w)?;
+                assert_eq!(output.dtype(), dtype);
+                assert!(
+                    max_abs_diff(&reference, &output)? <= tolerance,
+                    "{dtype:?} resize {in_h}x{in_w} -> {out_h}x{out_w} exceeded {tolerance}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn f16_general_antialias_error_is_bounded_at_mask_memory_amplitude() -> Result<()> {
+        let input = input(7, 11)?.affine(5.0, 0.0)?;
+        let reference = resize_bilinear2d_antialias(&input, 4, 6)?;
+        let output = resize_bilinear2d_antialias(&input.to_dtype(DType::F16)?, 4, 6)?;
+        let error = max_abs_diff(&reference, &output)?;
+        assert!(
+            error <= 0.012,
+            "F16 general-antialias error {error} exceeded the declared ±10-input tolerance"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn non_float_input_retains_legacy_f32_output() -> Result<()> {
+        let input = Tensor::zeros((1, 1, 3, 5), DType::U8, &Device::Cpu)?;
+        let output = resize_bilinear2d_antialias(&input, 7, 11)?;
+        assert_eq!(output.dtype(), DType::F32);
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_covers_resize_paths_and_bf16_capability_route() -> Result<()> {
+        if !candle::utils::cuda_is_available() {
+            return Ok(());
+        }
+        let device = Device::new_cuda(0)?;
+        let Device::Cuda(cuda_device) = &device else {
+            unreachable!("Device::new_cuda returned a non-CUDA device");
+        };
+        let major = cuda_compute_capability_major(cuda_device)
+            .expect("CUDA compute capability must be queryable for route selection");
+        let expected_bf16_compute = if major >= 8 { DType::BF16 } else { DType::F32 };
+        assert_eq!(
+            resize_compute_dtype(DType::BF16, &device),
+            expected_bf16_compute,
+            "SM{major} selected the wrong BF16 resize route"
+        );
+
+        let cases = [
+            (3, 5, 3, 5, "identity"),
+            (3, 5, 7, 11, "upsample"),
+            (8, 12, 4, 3, "integer-downsample"),
+            (7, 11, 4, 6, "general-antialias"),
+        ];
+        for (in_h, in_w, out_h, out_w, path) in cases {
+            let input = input(in_h, in_w)?;
+            let reference = resize_bilinear2d_antialias(&input, out_h, out_w)?;
+            for (dtype, tolerance) in [(DType::F16, 0.003f32), (DType::BF16, 0.03f32)] {
+                let output = resize_bilinear2d_antialias(
+                    &input.to_dtype(dtype)?.to_device(&device)?,
+                    out_h,
+                    out_w,
+                )?;
+                device.synchronize()?;
+                assert_eq!(output.dtype(), dtype, "{path} returned the wrong dtype");
+                assert_eq!(
+                    output.dims4()?,
+                    (1, 2, out_h, out_w),
+                    "{path} returned the wrong shape"
+                );
+                let error = max_abs_diff(&reference, &output)?;
+                assert!(
+                    error <= tolerance,
+                    "{dtype:?} {path} error {error} exceeded {tolerance} on SM{major}"
+                );
+            }
+        }
+        Ok(())
+    }
 }
