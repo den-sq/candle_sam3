@@ -65,6 +65,11 @@ ug = ["dep:candle-ug"]
 name = "bench_main"
 harness = false
 
+[[bench]]
+name = "conv_transpose2d"
+harness = false
+required-features = ["cuda"]
+
 [[example]]
 name = "metal_basics"
 required-features = ["metal"]
