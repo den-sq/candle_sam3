@@ -932,6 +932,27 @@ fn conv2d_c_eq_h_eq_w(dev: &Device) -> Result<()> {
     Ok(())
 }
 
+#[cfg(all(feature = "cuda", feature = "cudnn"))]
+#[test]
+fn conv_transpose2d_sam3_neck_gpu() -> Result<()> {
+    let dev = Device::new_cuda(0)?;
+    for (c_in, c_out, h_in, h_out) in [(1024, 512, 72, 144), (512, 256, 144, 288)] {
+        // Match the neck's NHWC trunk output viewed as NCHW after a permutation.
+        let input = Tensor::ones((1, h_in, h_in, c_in), candle_core::DType::F32, &dev)?
+            .permute((0, 3, 1, 2))?;
+        let kernel = Tensor::ones((c_in, c_out, 2, 2), candle_core::DType::F32, &dev)?;
+        let output = input.conv_transpose2d(&kernel, 0, 0, 2, 1)?;
+        assert_eq!(output.dims(), [1, c_out, h_out, h_out]);
+
+        // With a 2x2 kernel and stride 2 there is no spatial overlap, so every output
+        // element is the sum of one value from each input channel.
+        for index in [(0, 0, 0, 0), (0, c_out - 1, h_out - 1, h_out - 1)] {
+            assert_eq!(output.i(index)?.to_scalar::<f32>()?, c_in as f32);
+        }
+    }
+    Ok(())
+}
+
 test_device!(conv1d, conv1d_cpu, conv1d_gpu, conv1d_metal);
 test_device!(
     conv1d_small,
