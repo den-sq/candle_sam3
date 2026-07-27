@@ -937,19 +937,52 @@ fn conv2d_c_eq_h_eq_w(dev: &Device) -> Result<()> {
 fn conv_transpose2d_sam3_neck_gpu() -> Result<()> {
     let dev = Device::new_cuda(0)?;
     for (c_in, c_out, h_in, h_out) in [(1024, 512, 72, 144), (512, 256, 144, 288)] {
-        // Match the neck's NHWC trunk output viewed as NCHW after a permutation.
-        let input = Tensor::ones((1, h_in, h_in, c_in), candle_core::DType::F32, &dev)?
+        // Match the neck's NHWC trunk output viewed as NCHW after a permutation. Both
+        // tensors are asymmetric so a channel/spatial permutation cannot pass unnoticed.
+        let input_elements = c_in * h_in * h_in;
+        let input = Tensor::arange(0f32, input_elements as f32, &dev)?
+            .affine(1.0 / input_elements as f64, 0.0)?
+            .reshape((1, h_in, h_in, c_in))?
             .permute((0, 3, 1, 2))?;
-        let kernel = Tensor::ones((c_in, c_out, 2, 2), candle_core::DType::F32, &dev)?;
-        let output = input.conv_transpose2d(&kernel, 0, 0, 2, 1)?;
-        assert_eq!(output.dims(), [1, c_out, h_out, h_out]);
+        let kernel_elements = c_in * c_out * 2 * 2;
+        let kernel = Tensor::arange(0f32, kernel_elements as f32, &dev)?
+            .affine(1.0 / kernel_elements as f64, 0.0)?
+            .reshape((c_out, c_in, 2, 2))?
+            .transpose(0, 1)?;
 
-        // With a 2x2 kernel and stride 2 there is no spatial overlap, so every output
-        // element is the sum of one value from each input channel.
-        for index in [(0, 0, 0, 0), (0, c_out - 1, h_out - 1, h_out - 1)] {
-            assert_eq!(output.i(index)?.to_scalar::<f32>()?, c_in as f32);
-        }
+        // A non-contiguous filter selects the generic CUDA implementation and provides a
+        // full-output reference for the cuDNN path, whose contiguous filter causes the
+        // SAM3-strided input to be materialized before backward-data dispatch.
+        let expected = input.conv_transpose2d(&kernel, 0, 0, 2, 1)?;
+        let output = input.conv_transpose2d(&kernel.contiguous()?, 0, 0, 2, 1)?;
+        assert_eq!(output.dims(), [1, c_out, h_out, h_out]);
+        let max_expected = expected.abs()?.max_all()?.to_scalar::<f32>()?;
+        let max_diff = (&output - &expected)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        let tolerance = 1e-4 * max_expected.max(1.0);
+        assert!(
+            max_diff <= tolerance,
+            "SAM3 strided-input cuDNN result differs from generic CUDA: \
+             max_diff={max_diff}, tolerance={tolerance}"
+        );
     }
+    Ok(())
+}
+
+#[cfg(all(feature = "cuda", feature = "cudnn"))]
+#[test]
+fn conv_transpose2d_u32_cudnn_fallback_gpu() -> Result<()> {
+    let dev = Device::new_cuda(0)?;
+    let input = Tensor::new(&[1u32, 2, 3, 4], &dev)?.reshape((1, 1, 2, 2))?;
+    let kernel = Tensor::new(&[1u32, 2, 3, 4], &dev)?.reshape((1, 1, 2, 2))?;
+    let output = input.conv_transpose2d(&kernel, 0, 0, 1, 1)?;
+    assert_eq!(output.dims(), [1, 1, 3, 3]);
+    assert_eq!(
+        output.flatten_all()?.to_vec1::<u32>()?,
+        [1, 4, 4, 6, 20, 16, 9, 24, 16]
+    );
     Ok(())
 }
 

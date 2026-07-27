@@ -2202,7 +2202,7 @@ impl BackendStorage for CudaStorage {
                 .map_err(crate::Error::wrap)?;
                 S::F64(out)
             }
-            (S::U8(_), S::U8(_)) => {
+            (S::U8(_), S::U8(_)) | (S::U32(_), S::U32(_)) => {
                 return {
                     let slice = ConvTranspose2D(params).map(
                         inp,
@@ -2214,9 +2214,6 @@ impl BackendStorage for CudaStorage {
                     Ok(Self { slice, device })
                 };
             }
-            (S::U32(_), S::U32(_)) => Err(CudaError::InternalError(
-                "conv_transpose2d does not support u32",
-            ))?,
             (S::I16(_), S::I16(_)) => Err(CudaError::InternalError(
                 "conv_transpose2d does not support i16",
             ))?,
