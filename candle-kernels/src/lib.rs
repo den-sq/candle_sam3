@@ -32,6 +32,10 @@ pub const ALL_IDS: [Id; 11] = [
     Id::Unary,
 ];
 
+/// Whether this build contains the F32/SM75 fused SDPA kernel rather than its
+/// unsupported link-compatible stub.
+pub const F32_SM75_SDPA_AVAILABLE: bool = cfg!(candle_f32_sm75_sdpa);
+
 pub struct Module {
     index: usize,
     ptx: &'static str,

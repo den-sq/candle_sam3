@@ -12,6 +12,8 @@ fn main() -> Result<()> {
     println!("cargo::rerun-if-changed=src/compatibility.cuh");
     println!("cargo::rerun-if-changed=src/cuda_utils.cuh");
     println!("cargo::rerun-if-changed=src/binary_op_macros.cuh");
+    println!("cargo:rerun-if-env-changed=CANDLE_DISABLE_F32_SM75_SDPA");
+    println!("cargo:rustc-check-cfg=cfg(candle_f32_sm75_sdpa)");
 
     // Build for PTX
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -77,7 +79,8 @@ fn main() -> Result<()> {
 
     moe_builder.build_lib(out_dir.join("libmoe.a"))?;
 
-    let sdpa_source = if compute_cap == 75 {
+    let sdpa_available = compute_cap == 75 && env::var_os("CANDLE_DISABLE_F32_SM75_SDPA").is_none();
+    let sdpa_source = if sdpa_available {
         "src/cutlass_sdpa.cu"
     } else {
         "src/cutlass_sdpa_stub.cu"
@@ -87,7 +90,7 @@ fn main() -> Result<()> {
         .out_dir(&out_dir)
         .arg("-std=c++17")
         .arg("-O3");
-    if compute_cap == 75 {
+    if sdpa_available {
         sdpa_builder = sdpa_builder
             .include_path("src")
             .with_cutlass(Some(CUTLASS_COMMIT))
@@ -98,6 +101,9 @@ fn main() -> Result<()> {
         sdpa_builder = sdpa_builder.arg("-Xcompiler").arg("-fPIC");
     }
     sdpa_builder.build_lib(out_dir.join("libcutlass_sdpa.a"))?;
+    if sdpa_available {
+        println!("cargo:rustc-cfg=candle_f32_sm75_sdpa");
+    }
 
     println!("cargo:rustc-link-search={}", out_dir.display());
     println!("cargo:rustc-link-lib=moe");

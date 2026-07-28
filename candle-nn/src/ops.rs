@@ -1559,6 +1559,12 @@ impl candle::CustomOp3 for Sdpa {
         {
             candle::bail!("CUDA F32 SDPA dimensions must fit in i32");
         }
+        if !cuda_f32_sm75_sdpa_kernel_available() {
+            candle::bail!(
+                "CUDA F32 SM75 SDPA kernel is unavailable in this build; \
+                 build with CUDA_COMPUTE_CAP=75 or use the explicit attention fallback"
+            );
+        }
 
         let device = q.device().clone();
         let q = q.as_cuda_slice::<f32>()?;
@@ -1852,6 +1858,23 @@ impl candle::CustomOp3 for Sdpa {
 
         let newstorage = candle::MetalStorage::new(output, device.clone(), elem_count, q.dtype());
         Ok((newstorage, out_shape))
+    }
+}
+
+/// Returns whether the current binary was compiled with the fused F32/SM75
+/// CUDA SDPA kernel.
+///
+/// Runtime device capability must still be checked separately before calling
+/// [`sdpa`]. Builds for other CUDA architectures contain an unsupported
+/// link-compatible stub.
+pub fn cuda_f32_sm75_sdpa_kernel_available() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        candle::cuda_backend::kernels::F32_SM75_SDPA_AVAILABLE
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
     }
 }
 

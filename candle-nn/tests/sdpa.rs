@@ -212,6 +212,9 @@ mod cuda_sdpa_tests {
 
     #[test]
     fn f32_d64_matches_explicit_attention() -> Result<()> {
+        if !candle_nn::ops::cuda_f32_sm75_sdpa_kernel_available() {
+            return Ok(());
+        }
         let device = Device::new_cuda(0)?;
         let mut rng = rand::rngs::StdRng::seed_from_u64(54);
         let shape = (2, 3, 65, 64);
@@ -247,6 +250,27 @@ mod cuda_sdpa_tests {
             expected_values[max_index],
             &actual_values[..8],
             &expected_values[..8],
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_build_reports_before_stub_launch() -> Result<()> {
+        if candle_nn::ops::cuda_f32_sm75_sdpa_kernel_available() {
+            return Ok(());
+        }
+        let device = Device::new_cuda(0)?;
+        let shape = (1, 1, 2, 64);
+        let q = Tensor::zeros(shape, DType::F32, &device)?;
+        let k = Tensor::zeros(shape, DType::F32, &device)?;
+        let v = Tensor::zeros(shape, DType::F32, &device)?;
+        let error = candle_nn::ops::sdpa(&q, &k, &v, None, false, 0.125, 1.)
+            .expect_err("a stub build must reject direct fused SDPA");
+        assert!(
+            error
+                .to_string()
+                .contains("kernel is unavailable in this build"),
+            "unexpected unavailable-kernel error: {error}"
         );
         Ok(())
     }

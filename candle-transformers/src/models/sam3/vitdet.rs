@@ -135,6 +135,9 @@ fn f32_sm75_sdpa_supported(_device: &Device) -> bool {
     if let Device::Cuda(device) = _device {
         use candle::cuda_backend::cudarc::driver::{result, sys};
 
+        if !candle_nn::ops::cuda_f32_sm75_sdpa_kernel_available() {
+            return false;
+        }
         let cuda_device = device.cuda_stream().context().cu_device();
         let attribute =
             |attribute| unsafe { result::device::get_attribute(cuda_device, attribute) };
@@ -146,6 +149,30 @@ fn f32_sm75_sdpa_supported(_device: &Device) -> bool {
     }
 
     false
+}
+
+fn sam3_vision_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: &Tensor,
+    scale_value: f32,
+    input_dtype: DType,
+    head_dim: usize,
+) -> Result<Tensor> {
+    if input_dtype == DType::F32
+        && f32_sm75_sdpa_supported(q.device())
+        && head_dim == 64
+        && q.is_contiguous()
+        && k.is_contiguous()
+        && v.is_contiguous()
+    {
+        candle_nn::ops::sdpa(q, k, v, None, false, scale_value, 1.)
+    } else {
+        let q = q.broadcast_mul(scale)?;
+        let attn = q.matmul(&k.transpose(2, 3)?)?;
+        candle_nn::ops::softmax_last_dim(&attn)?.matmul(v)
+    }
 }
 
 impl Sam3VisionAttention {
@@ -186,19 +213,15 @@ impl Sam3VisionAttention {
         let q = q.to_dtype(DType::F32)?;
         let k = k.to_dtype(DType::F32)?;
         let v = v.to_dtype(DType::F32)?;
-        let hidden_states = if in_dtype == DType::F32
-            && f32_sm75_sdpa_supported(q.device())
-            && self.head_dim == 64
-            && q.is_contiguous()
-            && k.is_contiguous()
-            && v.is_contiguous()
-        {
-            candle_nn::ops::sdpa(&q, &k, &v, None, false, self.scale_value, 1.)?
-        } else {
-            let q = q.broadcast_mul(&self.scale)?;
-            let attn = q.matmul(&k.transpose(2, 3)?)?;
-            candle_nn::ops::softmax_last_dim(&attn)?.matmul(&v)?
-        };
+        let hidden_states = sam3_vision_attention(
+            &q,
+            &k,
+            &v,
+            &self.scale,
+            self.scale_value,
+            in_dtype,
+            self.head_dim,
+        )?;
         let hidden_states = hidden_states
             .to_dtype(in_dtype)?
             .transpose(1, 2)?
@@ -661,8 +684,8 @@ impl Sam3ViTDetTrunk {
 
 #[cfg(all(test, feature = "cuda"))]
 mod cuda_attention_tests {
-    use super::{VisionConfig, VisionRotaryEmbedding};
-    use candle::{Device, Result, Tensor};
+    use super::{sam3_vision_attention, VisionConfig, VisionRotaryEmbedding};
+    use candle::{DType, Device, Result, Tensor};
 
     fn explicit_sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
         let scores = (q * scale)?.matmul(&k.transpose(2, 3)?)?;
@@ -678,6 +701,9 @@ mod cuda_attention_tests {
         const HEADS: usize = 16;
         const HEAD_DIM: usize = 64;
 
+        if !candle_nn::ops::cuda_f32_sm75_sdpa_kernel_available() {
+            return Ok(());
+        }
         let device = Device::new_cuda(0)?;
         let config = VisionConfig::default();
         let rotary = VisionRotaryEmbedding::new(&config, grid, grid, rotary_scale, &device)?;
@@ -715,5 +741,31 @@ mod cuda_attention_tests {
     #[test]
     fn fused_sdpa_matches_global_attention_with_rotary() -> Result<()> {
         check_sam3_shape(1, 72 * 72, 72, 24. / 72.)
+    }
+
+    #[test]
+    fn unavailable_fused_kernel_uses_explicit_fallback() -> Result<()> {
+        if candle_nn::ops::cuda_f32_sm75_sdpa_kernel_available() {
+            return Ok(());
+        }
+        const HEAD_DIM: usize = 64;
+        let device = Device::new_cuda(0)?;
+        let shape = (1, 2, 65, HEAD_DIM);
+        let q = Tensor::randn(0f32, 0.2, shape, &device)?;
+        let k = Tensor::randn(0f32, 0.2, shape, &device)?;
+        let v = Tensor::randn(0f32, 0.2, shape, &device)?;
+        let scale_value = (HEAD_DIM as f32).sqrt().recip();
+        let scale = Tensor::new(scale_value, &device)?;
+
+        let expected = explicit_sdpa(&q, &k, &v, scale_value as f64)?;
+        let actual = sam3_vision_attention(&q, &k, &v, &scale, scale_value, DType::F32, HEAD_DIM)?;
+        device.synchronize()?;
+
+        let max_abs = (&actual - &expected)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(max_abs <= 1e-6, "fallback max absolute error {max_abs}");
+        Ok(())
     }
 }
