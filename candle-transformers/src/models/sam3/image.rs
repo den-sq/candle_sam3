@@ -9,6 +9,7 @@ use super::decoder::{DecoderOutput, Sam3TransformerDecoder};
 use super::encoder::{FusionEncoderOutput, Sam3FusionEncoder};
 use super::geometry::{EncodedPrompt, GeometryPrompt, SequenceGeometryEncoder};
 use super::neck::{Sam3DualViTDetNeck, VisualBackboneOutput};
+use super::profiling;
 use super::segmentation::{SegmentationOutput, UniversalSegmentationHead};
 use super::text::{Sam3TextEncoder, TextEncoding};
 use super::vitdet::{Sam3ViTDetTrunk, ViTDetTrunkOutput};
@@ -274,13 +275,18 @@ impl Sam3ImageModel {
     }
 
     pub fn encode_image_features(&self, image: &Tensor) -> Result<VisualBackboneOutput> {
+        let _encoder_range = profiling::range("sam3.image_encoder");
         let image = match image.rank() {
             3 => image.unsqueeze(0)?,
             4 => image.clone(),
             rank => candle::bail!("sam3 image encoder expects CHW or BCHW input, got rank {rank}"),
         }
         .to_dtype(self.compute_dtype)?;
-        let trunk = self.vision_trunk.forward(&image)?;
+        let trunk = {
+            let _range = profiling::range("sam3.image_encoder.trunk");
+            self.vision_trunk.forward(&image)?
+        };
+        let _range = profiling::range("sam3.image_encoder.neck");
         self.vision_neck.forward(&trunk)
     }
 
