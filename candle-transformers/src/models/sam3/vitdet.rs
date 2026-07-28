@@ -5,6 +5,7 @@ use candle_nn::{Conv2d, Conv2dConfig, LayerNorm, Linear, Module, VarBuilder};
 
 use super::{
     config::VisionConfig,
+    profiling,
     torch_ops::window::{window_partition_nhwc, window_unpartition_nhwc},
 };
 
@@ -36,6 +37,7 @@ impl PatchEmbed {
     }
 
     fn forward(&self, images: &Tensor) -> Result<Tensor> {
+        let _range = profiling::range("sam3.vit.patch_embed");
         self.proj.forward(images)?.permute((0, 2, 3, 1))
     }
 }
@@ -88,15 +90,9 @@ impl VisionRotaryEmbedding {
     }
 
     fn apply(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
-        let (_, _, seq_len, head_dim) = q.dims4()?;
-        let freqs_real =
-            self.freqs_real
-                .narrow(0, 0, seq_len)?
-                .reshape((1, 1, seq_len, head_dim / 2))?;
-        let freqs_imag =
-            self.freqs_imag
-                .narrow(0, 0, seq_len)?
-                .reshape((1, 1, seq_len, head_dim / 2))?;
+        let (_, _, seq_len, _) = q.dims4()?;
+        let freqs_real = self.freqs_real.narrow(0, 0, seq_len)?;
+        let freqs_imag = self.freqs_imag.narrow(0, 0, seq_len)?;
         Ok((
             apply_rotary_enc_real(q, &freqs_real, &freqs_imag)?,
             apply_rotary_enc_real(k, &freqs_real, &freqs_imag)?,
@@ -105,15 +101,35 @@ impl VisionRotaryEmbedding {
 }
 
 fn apply_rotary_enc_real(xs: &Tensor, freqs_real: &Tensor, freqs_imag: &Tensor) -> Result<Tensor> {
+    // The SAM3 image-encoder performance baseline is F32. Candle's interleaved
+    // RoPE primitive implements the same pairwise complex rotation in one
+    // backend operation, avoiding the expanded mul/add/stack graph below.
+    //
+    // Keep the existing F32-intermediate path for reduced-precision inputs:
+    // the cached frequencies are F32 and the current F16/BF16 parity contract
+    // intentionally performs the rotation in F32 before casting back.
+    if xs.dtype() == DType::F32 {
+        return candle_nn::rotary_emb::rope_i(xs, freqs_real, freqs_imag);
+    }
+    apply_rotary_enc_real_f32_intermediate(xs, freqs_real, freqs_imag)
+}
+
+fn apply_rotary_enc_real_f32_intermediate(
+    xs: &Tensor,
+    freqs_real: &Tensor,
+    freqs_imag: &Tensor,
+) -> Result<Tensor> {
     let (batch_size, num_heads, seq_len, head_dim) = xs.dims4()?;
     let xs_dtype = xs.dtype();
+    let freqs_real = freqs_real.reshape((1, 1, seq_len, head_dim / 2))?;
+    let freqs_imag = freqs_imag.reshape((1, 1, seq_len, head_dim / 2))?;
     let xs = xs
         .to_dtype(DType::F32)?
         .reshape((batch_size, num_heads, seq_len, head_dim / 2, 2))?;
     let xs_real = xs.i((.., .., .., .., 0))?;
     let xs_imag = xs.i((.., .., .., .., 1))?;
-    let real = (xs_real.broadcast_mul(freqs_real)? - xs_imag.broadcast_mul(freqs_imag)?)?;
-    let imag = (xs_real.broadcast_mul(freqs_imag)? + xs_imag.broadcast_mul(freqs_real)?)?;
+    let real = (xs_real.broadcast_mul(&freqs_real)? - xs_imag.broadcast_mul(&freqs_imag)?)?;
+    let imag = (xs_real.broadcast_mul(&freqs_imag)? + xs_imag.broadcast_mul(&freqs_real)?)?;
     Tensor::stack(&[&real, &imag], 4)?
         .reshape((batch_size, num_heads, seq_len, head_dim))?
         .to_dtype(xs_dtype)
@@ -160,19 +176,40 @@ fn sam3_vision_attention(
     input_dtype: DType,
     head_dim: usize,
 ) -> Result<Tensor> {
-    if input_dtype == DType::F32
+    if sam3_vision_attention_uses_fused(q, k, v, input_dtype, head_dim) {
+        let _range = profiling::range("sam3.vit.attn.fused_sdpa");
+        candle_nn::ops::sdpa(q, k, v, None, false, scale_value, 1.)
+    } else {
+        let q = {
+            let _range = profiling::range("sam3.vit.attn.fallback_scale");
+            q.broadcast_mul(scale)?
+        };
+        let attn = {
+            let _range = profiling::range("sam3.vit.attn.fallback_qk");
+            q.matmul(&k.transpose(2, 3)?)?
+        };
+        let attn = {
+            let _range = profiling::range("sam3.vit.attn.fallback_softmax");
+            candle_nn::ops::softmax_last_dim(&attn)?
+        };
+        let _range = profiling::range("sam3.vit.attn.fallback_av");
+        attn.matmul(v)
+    }
+}
+
+fn sam3_vision_attention_uses_fused(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    input_dtype: DType,
+    head_dim: usize,
+) -> bool {
+    input_dtype == DType::F32
         && f32_sm75_sdpa_supported(q.device())
         && head_dim == 64
         && q.is_contiguous()
         && k.is_contiguous()
         && v.is_contiguous()
-    {
-        candle_nn::ops::sdpa(q, k, v, None, false, scale_value, 1.)
-    } else {
-        let q = q.broadcast_mul(scale)?;
-        let attn = q.matmul(&k.transpose(2, 3)?)?;
-        candle_nn::ops::softmax_last_dim(&attn)?.matmul(v)
-    }
 }
 
 impl Sam3VisionAttention {
@@ -200,19 +237,29 @@ impl Sam3VisionAttention {
         let in_dtype = hidden_states.dtype();
         let (batch_size, height, width, channels) = hidden_states.dims4()?;
         let seq_len = height * width;
-        let qkv = self
-            .qkv
-            .forward(&hidden_states.contiguous()?)?
-            .reshape((batch_size, seq_len, 3, self.num_heads, self.head_dim))?
-            .permute((2, 0, 3, 1, 4))?
-            .contiguous()?;
+        let qkv = {
+            let _range = profiling::range("sam3.vit.attn.qkv_and_layout");
+            self.qkv
+                .forward(&hidden_states.contiguous()?)?
+                .reshape((batch_size, seq_len, 3, self.num_heads, self.head_dim))?
+                .permute((2, 0, 3, 1, 4))?
+                .contiguous()?
+        };
         let q = qkv.i(0)?;
         let k = qkv.i(1)?;
         let v = qkv.i(2)?;
-        let (q, k) = self.rotary_emb.apply(&q, &k)?;
-        let q = q.to_dtype(DType::F32)?;
-        let k = k.to_dtype(DType::F32)?;
-        let v = v.to_dtype(DType::F32)?;
+        let (q, k) = {
+            let _range = profiling::range("sam3.vit.attn.rope");
+            self.rotary_emb.apply(&q, &k)?
+        };
+        let (q, k, v) = {
+            let _range = profiling::range("sam3.vit.attn.to_f32");
+            (
+                q.to_dtype(DType::F32)?,
+                k.to_dtype(DType::F32)?,
+                v.to_dtype(DType::F32)?,
+            )
+        };
         let hidden_states = sam3_vision_attention(
             &q,
             &k,
@@ -222,10 +269,14 @@ impl Sam3VisionAttention {
             in_dtype,
             self.head_dim,
         )?;
-        let hidden_states = hidden_states
-            .to_dtype(in_dtype)?
-            .transpose(1, 2)?
-            .reshape((batch_size, height, width, channels))?;
+        let hidden_states = {
+            let _range = profiling::range("sam3.vit.attn.output_layout");
+            hidden_states
+                .to_dtype(in_dtype)?
+                .transpose(1, 2)?
+                .reshape((batch_size, height, width, channels))?
+        };
+        let _range = profiling::range("sam3.vit.attn.proj");
         self.proj.forward(&hidden_states)
     }
 }
@@ -246,7 +297,15 @@ impl Sam3VisionMlp {
     }
 
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
-        let hidden_states = self.fc1.forward(&hidden_states.contiguous()?)?.gelu_erf()?;
+        let hidden_states = {
+            let _range = profiling::range("sam3.vit.mlp.fc1");
+            self.fc1.forward(&hidden_states.contiguous()?)?
+        };
+        let hidden_states = {
+            let _range = profiling::range("sam3.vit.mlp.gelu");
+            hidden_states.gelu_erf()?
+        };
+        let _range = profiling::range("sam3.vit.mlp.fc2");
         self.fc2.forward(&hidden_states.contiguous()?)
     }
 
@@ -265,11 +324,13 @@ struct Sam3VisionBlock {
     norm2: LayerNorm,
     mlp: Sam3VisionMlp,
     window_size: usize,
+    profile_name: String,
 }
 
 impl Sam3VisionBlock {
     fn new(
         config: &VisionConfig,
+        block_index: usize,
         window_size: usize,
         input_size: (usize, usize),
         vb: VarBuilder,
@@ -296,39 +357,67 @@ impl Sam3VisionBlock {
             norm2: candle_nn::layer_norm(config.embed_dim, 1e-5, vb.pp("norm2"))?,
             mlp: Sam3VisionMlp::new(config, vb.pp("mlp"))?,
             window_size,
+            profile_name: format!(
+                "sam3.vit.block.{block_index:02}.{}",
+                if window_size == 0 { "global" } else { "local" }
+            ),
         })
     }
 
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        let _block_range = profiling::range(&self.profile_name);
         let residual = hidden_states;
-        let hidden_states = self.norm1.forward(hidden_states)?;
+        let hidden_states = {
+            let _range = profiling::range("sam3.vit.block.norm1");
+            self.norm1.forward(hidden_states)?
+        };
         let original_hw = (hidden_states.dim(1)?, hidden_states.dim(2)?);
         let (hidden_states, padded_hw) = if self.window_size > 0 {
+            let _range = profiling::range("sam3.vit.block.window_partition");
             window_partition_nhwc(&hidden_states, self.window_size)?
         } else {
             (hidden_states, original_hw)
         };
         let hidden_states = self.attn.forward(&hidden_states)?;
         let hidden_states = if self.window_size > 0 {
+            let _range = profiling::range("sam3.vit.block.window_unpartition");
             window_unpartition_nhwc(&hidden_states, self.window_size, padded_hw, original_hw)?
         } else {
             hidden_states
         };
-        let hidden_states = (residual + hidden_states)?.contiguous()?;
+        let hidden_states = {
+            let _range = profiling::range("sam3.vit.block.attn_residual");
+            (residual + hidden_states)?.contiguous()?
+        };
         let residual = &hidden_states;
-        let hidden_states = self.norm2.forward(&hidden_states)?;
+        let hidden_states = {
+            let _range = profiling::range("sam3.vit.block.norm2");
+            self.norm2.forward(&hidden_states)?
+        };
         let hidden_states = self.mlp.forward(&hidden_states)?;
+        let _range = profiling::range("sam3.vit.block.mlp_residual");
         (residual + hidden_states)?.contiguous()
     }
 
     fn forward_windowed(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        let _block_range = profiling::range(&self.profile_name);
         let residual = hidden_states;
-        let hidden_states = self.norm1.forward(hidden_states)?;
+        let hidden_states = {
+            let _range = profiling::range("sam3.vit.block.norm1");
+            self.norm1.forward(hidden_states)?
+        };
         let hidden_states = self.attn.forward(&hidden_states)?;
-        let hidden_states = (residual + hidden_states)?.contiguous()?;
+        let hidden_states = {
+            let _range = profiling::range("sam3.vit.block.attn_residual");
+            (residual + hidden_states)?.contiguous()?
+        };
         let residual = &hidden_states;
-        let hidden_states = self.norm2.forward(&hidden_states)?;
+        let hidden_states = {
+            let _range = profiling::range("sam3.vit.block.norm2");
+            self.norm2.forward(&hidden_states)?
+        };
         let hidden_states = self.mlp.forward(&hidden_states)?;
+        let _range = profiling::range("sam3.vit.block.mlp_residual");
         (residual + hidden_states)?.contiguous()
     }
 
@@ -527,6 +616,7 @@ impl Sam3ViTDetTrunk {
             };
             blocks.push(Sam3VisionBlock::new(
                 config,
+                layer_idx,
                 window_size,
                 input_size,
                 block_vb.pp(layer_idx),
@@ -593,8 +683,10 @@ impl Sam3ViTDetTrunk {
             let original_hw = (hidden_states.dim(1)?, hidden_states.dim(2)?);
             // Keep tensors partitioned across consecutive windowed blocks so we only
             // pay the NHWC<->window layout materialization once per run.
-            let (mut windowed_states, padded_hw) =
-                window_partition_nhwc(&hidden_states, window_size)?;
+            let (mut windowed_states, padded_hw) = {
+                let _range = profiling::range("sam3.vit.window_run.partition");
+                window_partition_nhwc(&hidden_states, window_size)?
+            };
             while block_index < self.blocks.len() {
                 let block = &self.blocks[block_index];
                 if block.window_size != window_size {
@@ -603,8 +695,10 @@ impl Sam3ViTDetTrunk {
                 windowed_states = block.forward_windowed(&windowed_states)?;
                 block_index += 1;
             }
-            hidden_states =
-                window_unpartition_nhwc(&windowed_states, window_size, padded_hw, original_hw)?;
+            hidden_states = {
+                let _range = profiling::range("sam3.vit.window_run.unpartition");
+                window_unpartition_nhwc(&windowed_states, window_size, padded_hw, original_hw)?
+            };
         }
         Ok(hidden_states)
     }
@@ -637,6 +731,7 @@ impl Sam3ViTDetTrunk {
             );
         }
         if let Some(pos_embed) = &self.pos_embed {
+            let _range = profiling::range("sam3.vit.absolute_position_add");
             let pos_embed = pos_embed.get(patch_height, patch_width)?;
             hidden_states = hidden_states.broadcast_add(&pos_embed)?;
         }
@@ -647,6 +742,7 @@ impl Sam3ViTDetTrunk {
             );
         }
         if let Some(pre_layer_norm) = &self.pre_layer_norm {
+            let _range = profiling::range("sam3.vit.pre_layer_norm");
             hidden_states = pre_layer_norm.forward(&hidden_states)?;
         }
         if !debug_blocks.is_empty() {
@@ -684,7 +780,10 @@ impl Sam3ViTDetTrunk {
 
 #[cfg(all(test, feature = "cuda"))]
 mod cuda_attention_tests {
-    use super::{sam3_vision_attention, VisionConfig, VisionRotaryEmbedding};
+    use super::{
+        sam3_vision_attention, sam3_vision_attention_uses_fused, VisionConfig,
+        VisionRotaryEmbedding,
+    };
     use candle::{DType, Device, Result, Tensor};
 
     fn explicit_sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
@@ -712,16 +811,21 @@ mod cuda_attention_tests {
         let k = Tensor::randn(0f32, 0.2, shape, &device)?;
         let v = Tensor::randn(0f32, 0.2, shape, &device)?;
         let (q, k) = rotary.apply(&q, &k)?;
-        let scale = (HEAD_DIM as f64).sqrt().recip();
+        let scale_value = (HEAD_DIM as f32).sqrt().recip();
+        let scale = Tensor::new(scale_value, &device)?;
+        assert!(
+            sam3_vision_attention_uses_fused(&q, &k, &v, DType::F32, HEAD_DIM),
+            "the real SAM3 rotary-attention layout must remain eligible for fused SDPA"
+        );
 
         // Exercise the exact full SAM3 launch shape. The explicit comparison
         // uses one representative batch/head slice to avoid materializing the
         // global shape's one-gigabyte score tensor in a correctness test.
-        let actual = candle_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.)?;
+        let actual = sam3_vision_attention(&q, &k, &v, &scale, scale_value, DType::F32, HEAD_DIM)?;
         let q_ref = q.narrow(0, 0, 1)?.narrow(1, 0, 1)?;
         let k_ref = k.narrow(0, 0, 1)?.narrow(1, 0, 1)?;
         let v_ref = v.narrow(0, 0, 1)?.narrow(1, 0, 1)?;
-        let expected = explicit_sdpa(&q_ref, &k_ref, &v_ref, scale)?;
+        let expected = explicit_sdpa(&q_ref, &k_ref, &v_ref, scale_value as f64)?;
         let actual = actual.narrow(0, 0, 1)?.narrow(1, 0, 1)?;
         device.synchronize()?;
 
@@ -766,6 +870,32 @@ mod cuda_attention_tests {
             .max_all()?
             .to_scalar::<f32>()?;
         assert!(max_abs <= 1e-6, "fallback max absolute error {max_abs}");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_rotary_enc_real, apply_rotary_enc_real_f32_intermediate};
+    use candle::{Device, Result, Tensor};
+
+    #[test]
+    fn fused_f32_rope_matches_expanded_sam3_rotation() -> Result<()> {
+        let device = Device::Cpu;
+        let xs = Tensor::from_iter(
+            (0..2 * 3 * 5 * 8).map(|index| (index as f32 - 113.0) / 37.0),
+            &device,
+        )?
+        .reshape((2, 3, 5, 8))?;
+        let angles = Tensor::from_iter((0..5 * 4).map(|index| index as f32 / 19.0), &device)?
+            .reshape((5, 4))?;
+        let cos = angles.cos()?;
+        let sin = angles.sin()?;
+
+        let fused = apply_rotary_enc_real(&xs, &cos, &sin)?;
+        let expanded = apply_rotary_enc_real_f32_intermediate(&xs, &cos, &sin)?;
+        let max_abs = (&fused - &expanded)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(max_abs <= 1e-6, "fused RoPE max abs diff: {max_abs}");
         Ok(())
     }
 }
