@@ -1480,7 +1480,7 @@ struct Sdpa {
 
 impl candle::CustomOp3 for Sdpa {
     fn name(&self) -> &'static str {
-        "metal-sdpa"
+        "sdpa"
     }
 
     fn cpu_fwd(
@@ -1493,6 +1493,118 @@ impl candle::CustomOp3 for Sdpa {
         _l3: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
         candle::bail!("SDPA has no cpu impl")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        q: &candle::CudaStorage,
+        q_l: &Layout,
+        k: &candle::CudaStorage,
+        k_l: &Layout,
+        v: &candle::CudaStorage,
+        v_l: &Layout,
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        use candle::cuda_backend::cudarc::driver::{DevicePtr, DeviceSlice};
+        use candle::cuda_backend::kernels::ffi;
+        use core::ffi::c_void;
+
+        let [batch, q_heads, q_sequence, q_head_dim]: [usize; 4] =
+            q_l.dims().try_into().map_err(|_| {
+                candle::Error::Msg(format!("CUDA SDPA expects rank-4 q, got {:?}", q_l.dims()))
+            })?;
+        let [k_batch, k_heads, kv_sequence, k_head_dim]: [usize; 4] =
+            k_l.dims().try_into().map_err(|_| {
+                candle::Error::Msg(format!("CUDA SDPA expects rank-4 k, got {:?}", k_l.dims()))
+            })?;
+        let [v_batch, v_heads, v_sequence, v_head_dim]: [usize; 4] =
+            v_l.dims().try_into().map_err(|_| {
+                candle::Error::Msg(format!("CUDA SDPA expects rank-4 v, got {:?}", v_l.dims()))
+            })?;
+
+        if (batch, q_heads) != (k_batch, k_heads)
+            || (batch, q_heads) != (v_batch, v_heads)
+            || kv_sequence != v_sequence
+            || q_head_dim != k_head_dim
+            || q_head_dim != v_head_dim
+        {
+            candle::bail!(
+                "CUDA SDPA requires matching batch, head, sequence, and head dimensions, got q {:?}, k {:?}, v {:?}",
+                q_l.dims(),
+                k_l.dims(),
+                v_l.dims()
+            );
+        }
+        if q_head_dim != 64 {
+            candle::bail!("CUDA F32 SDPA currently supports head dimension 64, got {q_head_dim}");
+        }
+        if self.mask.is_some() || self.do_causal || self.softcapping != 1. {
+            candle::bail!(
+                "CUDA F32 SDPA currently supports unmasked, non-causal attention without softcapping"
+            );
+        }
+        if q.dtype() != DType::F32 || k.dtype() != DType::F32 || v.dtype() != DType::F32 {
+            candle::bail!(
+                "CUDA F32 SDPA expects f32 q, k, and v, got {:?}, {:?}, {:?}",
+                q.dtype(),
+                k.dtype(),
+                v.dtype()
+            );
+        }
+        if batch > i32::MAX as usize
+            || q_heads > i32::MAX as usize
+            || q_sequence > i32::MAX as usize
+            || kv_sequence > i32::MAX as usize
+        {
+            candle::bail!("CUDA F32 SDPA dimensions must fit in i32");
+        }
+
+        let device = q.device().clone();
+        let q = q.as_cuda_slice::<f32>()?;
+        let q = match q_l.contiguous_offsets() {
+            Some((start, end)) => q.slice(start..end),
+            None => candle::bail!("CUDA F32 SDPA requires contiguous q"),
+        };
+        let k = k.as_cuda_slice::<f32>()?;
+        let k = match k_l.contiguous_offsets() {
+            Some((start, end)) => k.slice(start..end),
+            None => candle::bail!("CUDA F32 SDPA requires contiguous k"),
+        };
+        let v = v.as_cuda_slice::<f32>()?;
+        let v = match v_l.contiguous_offsets() {
+            Some((start, end)) => v.slice(start..end),
+            None => candle::bail!("CUDA F32 SDPA requires contiguous v"),
+        };
+
+        let output_elements = batch
+            .checked_mul(q_heads)
+            .and_then(|n| n.checked_mul(q_sequence))
+            .and_then(|n| n.checked_mul(v_head_dim))
+            .ok_or_else(|| candle::Error::Msg("CUDA F32 SDPA output size overflow".into()))?;
+        let output = unsafe { device.alloc::<f32>(output_elements)? };
+        let error = unsafe {
+            ffi::launch_candle_f32_sm75_attention(
+                q.device_ptr(q.stream()).0 as *const f32,
+                k.device_ptr(k.stream()).0 as *const f32,
+                v.device_ptr(v.stream()).0 as *const f32,
+                output.device_ptr(output.stream()).0 as *mut f32,
+                batch as i32,
+                q_heads as i32,
+                q_sequence as i32,
+                kv_sequence as i32,
+                self.scale,
+                device.cuda_stream().cu_stream() as *mut c_void,
+            )
+        };
+        if error != 0 {
+            candle::bail!("CUTLASS CUDA F32 SDPA launch failed with CUDA error code {error}");
+        }
+
+        Ok((
+            candle::CudaStorage::wrap_cuda_slice(output, device),
+            Shape::from_dims(&[batch, q_heads, q_sequence, v_head_dim]),
+        ))
     }
 
     #[cfg(feature = "metal")]

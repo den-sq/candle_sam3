@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use candle::{DType, IndexOp, Result, Tensor};
+use candle::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{Conv2d, Conv2dConfig, LayerNorm, Linear, Module, VarBuilder};
 
 use super::{
@@ -126,7 +126,26 @@ struct Sam3VisionAttention {
     num_heads: usize,
     head_dim: usize,
     scale: Tensor,
+    scale_value: f32,
     rotary_emb: VisionRotaryEmbedding,
+}
+
+fn f32_sm75_sdpa_supported(_device: &Device) -> bool {
+    #[cfg(feature = "cuda")]
+    if let Device::Cuda(device) = _device {
+        use candle::cuda_backend::cudarc::driver::{result, sys};
+
+        let cuda_device = device.cuda_stream().context().cu_device();
+        let attribute =
+            |attribute| unsafe { result::device::get_attribute(cuda_device, attribute) };
+        let major =
+            attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR);
+        let minor =
+            attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR);
+        return matches!((major, minor), (Ok(7), Ok(5)));
+    }
+
+    false
 }
 
 impl Sam3VisionAttention {
@@ -138,12 +157,14 @@ impl Sam3VisionAttention {
         let qkv = candle_nn::linear_b(config.embed_dim, config.embed_dim * 3, true, vb.pp("qkv"))?;
         let proj = candle_nn::linear_b(config.embed_dim, config.embed_dim, true, vb.pp("proj"))?;
         let head_dim = config.embed_dim / config.num_heads;
+        let scale_value = (head_dim as f32).powf(-0.5);
         Ok(Self {
             qkv,
             proj,
             num_heads: config.num_heads,
             head_dim,
-            scale: Tensor::new((head_dim as f32).powf(-0.5), vb.device())?,
+            scale: Tensor::new(scale_value, vb.device())?,
+            scale_value,
             rotary_emb,
         })
     }
@@ -162,13 +183,23 @@ impl Sam3VisionAttention {
         let k = qkv.i(1)?;
         let v = qkv.i(2)?;
         let (q, k) = self.rotary_emb.apply(&q, &k)?;
-        let q = q.to_dtype(DType::F32)?.broadcast_mul(&self.scale)?;
+        let q = q.to_dtype(DType::F32)?;
         let k = k.to_dtype(DType::F32)?;
         let v = v.to_dtype(DType::F32)?;
-        let attn = q.matmul(&k.transpose(2, 3)?)?;
-        let attn = candle_nn::ops::softmax_last_dim(&attn)?;
-        let hidden_states = attn
-            .matmul(&v)?
+        let hidden_states = if in_dtype == DType::F32
+            && f32_sm75_sdpa_supported(q.device())
+            && self.head_dim == 64
+            && q.is_contiguous()
+            && k.is_contiguous()
+            && v.is_contiguous()
+        {
+            candle_nn::ops::sdpa(&q, &k, &v, None, false, self.scale_value, 1.)?
+        } else {
+            let q = q.broadcast_mul(&self.scale)?;
+            let attn = q.matmul(&k.transpose(2, 3)?)?;
+            candle_nn::ops::softmax_last_dim(&attn)?.matmul(&v)?
+        };
+        let hidden_states = hidden_states
             .to_dtype(in_dtype)?
             .transpose(1, 2)?
             .reshape((batch_size, height, width, channels))?;
@@ -625,5 +656,64 @@ impl Sam3ViTDetTrunk {
             block_outputs,
             debug_tensors,
         ))
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_attention_tests {
+    use super::{VisionConfig, VisionRotaryEmbedding};
+    use candle::{Device, Result, Tensor};
+
+    fn explicit_sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
+        let scores = (q * scale)?.matmul(&k.transpose(2, 3)?)?;
+        candle_nn::ops::softmax_last_dim(&scores)?.matmul(v)
+    }
+
+    fn check_sam3_shape(
+        batch: usize,
+        sequence: usize,
+        grid: usize,
+        rotary_scale: f32,
+    ) -> Result<()> {
+        const HEADS: usize = 16;
+        const HEAD_DIM: usize = 64;
+
+        let device = Device::new_cuda(0)?;
+        let config = VisionConfig::default();
+        let rotary = VisionRotaryEmbedding::new(&config, grid, grid, rotary_scale, &device)?;
+        let shape = (batch, HEADS, sequence, HEAD_DIM);
+        let q = Tensor::randn(0f32, 0.2, shape, &device)?;
+        let k = Tensor::randn(0f32, 0.2, shape, &device)?;
+        let v = Tensor::randn(0f32, 0.2, shape, &device)?;
+        let (q, k) = rotary.apply(&q, &k)?;
+        let scale = (HEAD_DIM as f64).sqrt().recip();
+
+        // Exercise the exact full SAM3 launch shape. The explicit comparison
+        // uses one representative batch/head slice to avoid materializing the
+        // global shape's one-gigabyte score tensor in a correctness test.
+        let actual = candle_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.)?;
+        let q_ref = q.narrow(0, 0, 1)?.narrow(1, 0, 1)?;
+        let k_ref = k.narrow(0, 0, 1)?.narrow(1, 0, 1)?;
+        let v_ref = v.narrow(0, 0, 1)?.narrow(1, 0, 1)?;
+        let expected = explicit_sdpa(&q_ref, &k_ref, &v_ref, scale)?;
+        let actual = actual.narrow(0, 0, 1)?.narrow(1, 0, 1)?;
+        device.synchronize()?;
+
+        let max_abs = (&actual - &expected)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(max_abs <= 2e-5, "max absolute error {max_abs}");
+        Ok(())
+    }
+
+    #[test]
+    fn fused_sdpa_matches_local_attention_with_rotary() -> Result<()> {
+        check_sam3_shape(9, 24 * 24, 24, 1.)
+    }
+
+    #[test]
+    fn fused_sdpa_matches_global_attention_with_rotary() -> Result<()> {
+        check_sam3_shape(1, 72 * 72, 72, 24. / 72.)
     }
 }
