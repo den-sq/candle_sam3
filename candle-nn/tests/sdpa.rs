@@ -185,3 +185,93 @@ mod metal_sdpa_tests {
         Ok(())
     }
 }
+
+#[cfg(feature = "cuda")]
+mod cuda_sdpa_tests {
+    use candle::{DType, Device, Result, Shape, Tensor};
+    use rand::SeedableRng;
+    use rand_distr::Distribution;
+
+    fn randn<S: Into<Shape>>(
+        rng: &mut rand::rngs::StdRng,
+        shape: S,
+        dev: &Device,
+    ) -> Result<Tensor> {
+        let shape = shape.into();
+        let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
+        let values = (0..shape.elem_count())
+            .map(|_| normal.sample(rng))
+            .collect::<Vec<f32>>();
+        Tensor::from_vec(values, &shape, dev)
+    }
+
+    fn explicit_sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
+        let scores = (q * scale)?.matmul(&k.transpose(2, 3)?)?;
+        candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32)?)?.matmul(v)
+    }
+
+    #[test]
+    fn f32_d64_matches_explicit_attention() -> Result<()> {
+        if !candle_nn::ops::cuda_f32_sm75_sdpa_kernel_available() {
+            return Ok(());
+        }
+        let device = Device::new_cuda(0)?;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(54);
+        let shape = (2, 3, 65, 64);
+        let q = randn(&mut rng, shape, &device)?;
+        let k = randn(&mut rng, shape, &device)?;
+        let v = randn(&mut rng, shape, &device)?;
+        let scale = (64f64).sqrt().recip();
+
+        let expected = explicit_sdpa(&q, &k, &v, scale)?;
+        let actual = candle_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.)?;
+        device.synchronize()?;
+
+        let delta = (&actual - &expected)?
+            .abs()?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let (max_index, max_abs) = delta
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|(_, lhs), (_, rhs)| lhs.total_cmp(rhs))
+            .unwrap();
+        let actual_values = actual.flatten_all()?.to_vec1::<f32>()?;
+        let expected_values = expected.flatten_all()?.to_vec1::<f32>()?;
+        let tensor_max_abs = (&actual - &expected)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(
+            max_abs <= 2e-5,
+            "max absolute error {max_abs} ({tensor_max_abs}) at {max_index}: actual {}, expected {}; first actual {:?}; first expected {:?}",
+            actual_values[max_index],
+            expected_values[max_index],
+            &actual_values[..8],
+            &expected_values[..8],
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_build_reports_before_stub_launch() -> Result<()> {
+        if candle_nn::ops::cuda_f32_sm75_sdpa_kernel_available() {
+            return Ok(());
+        }
+        let device = Device::new_cuda(0)?;
+        let shape = (1, 1, 2, 64);
+        let q = Tensor::zeros(shape, DType::F32, &device)?;
+        let k = Tensor::zeros(shape, DType::F32, &device)?;
+        let v = Tensor::zeros(shape, DType::F32, &device)?;
+        let error = candle_nn::ops::sdpa(&q, &k, &v, None, false, 0.125, 1.)
+            .expect_err("a stub build must reject direct fused SDPA");
+        assert!(
+            error
+                .to_string()
+                .contains("kernel is unavailable in this build"),
+            "unexpected unavailable-kernel error: {error}"
+        );
+        Ok(())
+    }
+}

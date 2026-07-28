@@ -2,6 +2,19 @@ use core::ffi::c_void;
 #[allow(dead_code)]
 #[allow(improper_ctypes)]
 extern "C" {
+    pub fn launch_candle_f32_sm75_attention(
+        query: *const f32,
+        key: *const f32,
+        value: *const f32,
+        output: *mut f32,
+        batch: i32,
+        heads: i32,
+        query_sequence: i32,
+        key_sequence: i32,
+        scale: f32,
+        stream: *mut c_void,
+    ) -> i32;
+
     // for unquntized models
     pub fn moe_gemm_wmma(
         input: *const c_void,         // device pointer [size_m, size_k]
