@@ -98,6 +98,27 @@ struct Args {
     #[arg(long, default_value = "1")]
     video_frame_stride: usize,
 
+    /// Video artifact style to export. Repeat to produce multiple styles in one run.
+    /// Defaults to `per-object-overlay`.
+    #[arg(long, value_enum)]
+    video_render: Vec<video::VideoRenderMode>,
+
+    /// Probability threshold used for binary masks and rendered video artifacts.
+    #[arg(long, default_value = "0.5", value_parser = parse_video_mask_threshold)]
+    video_mask_threshold: f32,
+
+    /// Draw object boxes on video overlay artifacts (enabled by default).
+    #[arg(long, conflicts_with = "video_no_draw_boxes")]
+    video_draw_boxes: bool,
+
+    /// Do not draw object boxes on video overlay artifacts.
+    #[arg(long = "no-video-draw-boxes")]
+    video_no_draw_boxes: bool,
+
+    /// Draw upstream-style white, black, and object-color mask contours on overlays.
+    #[arg(long)]
+    video_draw_contours: bool,
+
     /// Number of future frames to prefetch around the active video frame.
     #[arg(long, default_value = "2")]
     video_prefetch_ahead: usize,
@@ -290,6 +311,17 @@ fn parse_floats(value: &str, expected: usize) -> std::result::Result<Vec<f32>, S
     Ok(parts)
 }
 
+fn parse_video_mask_threshold(value: &str) -> std::result::Result<f32, String> {
+    let threshold = value
+        .parse::<f32>()
+        .map_err(|err| format!("invalid mask threshold `{value}`: {err}"))?;
+    if threshold.is_finite() && (0.0..=1.0).contains(&threshold) {
+        Ok(threshold)
+    } else {
+        Err("video mask threshold must be a finite value between 0 and 1".to_owned())
+    }
+}
+
 fn resolve_repo_file(path: &str, expected_file: &str) -> std::path::PathBuf {
     let path = PathBuf::from(path);
     if path.is_dir() {
@@ -313,7 +345,10 @@ fn notebook_asset_root_from_candidate(path: PathBuf) -> Option<PathBuf> {
     }
 }
 
-pub(crate) fn resolve_notebook_asset_root(explicit: Option<&str>, output_dir: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_notebook_asset_root(
+    explicit: Option<&str>,
+    output_dir: &Path,
+) -> Result<PathBuf> {
     if let Some(explicit) = explicit {
         return notebook_asset_root_from_candidate(PathBuf::from(explicit)).ok_or_else(|| {
             E::msg(format!(
@@ -404,7 +439,10 @@ fn frame_name_sort_key(name: &str) -> (Option<usize>, &str) {
     (stem.parse::<usize>().ok(), name)
 }
 
-fn parse_github_directory_downloads(contents_json: &str, label: &str) -> Result<Vec<NotebookAssetDownload>> {
+fn parse_github_directory_downloads(
+    contents_json: &str,
+    label: &str,
+) -> Result<Vec<NotebookAssetDownload>> {
     let mut downloads = serde_json::from_str::<Vec<GitHubDirectoryEntry>>(contents_json)
         .with_context(|| format!("failed to parse GitHub directory listing for {label}"))?
         .into_iter()
@@ -423,7 +461,8 @@ fn parse_github_directory_downloads(contents_json: &str, label: &str) -> Result<
             })
         })
         .collect::<Vec<_>>();
-    downloads.sort_by(|lhs, rhs| frame_name_sort_key(&lhs.name).cmp(&frame_name_sort_key(&rhs.name)));
+    downloads
+        .sort_by(|lhs, rhs| frame_name_sort_key(&lhs.name).cmp(&frame_name_sort_key(&rhs.name)));
     if downloads.is_empty() {
         bail!("GitHub directory listing for {label} did not contain any JPEG frames");
     }
@@ -1554,6 +1593,40 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn video_render_cli_accepts_repeated_modes_and_style_controls() -> Result<()> {
+        let args = Args::try_parse_from([
+            "sam3",
+            "--video-render",
+            "combined-upstream",
+            "--video-render",
+            "cutout-rgba",
+            "--video-mask-threshold",
+            "0.7",
+            "--no-video-draw-boxes",
+            "--video-draw-contours",
+        ])?;
+
+        assert_eq!(
+            args.video_render,
+            vec![
+                video::VideoRenderMode::CombinedUpstream,
+                video::VideoRenderMode::CutoutRgba,
+            ]
+        );
+        assert_eq!(args.video_mask_threshold, 0.7);
+        assert!(args.video_no_draw_boxes);
+        assert!(args.video_draw_contours);
+        Ok(())
+    }
+
+    #[test]
+    fn video_mask_threshold_rejects_values_outside_unit_interval() {
+        let err = Args::try_parse_from(["sam3", "--video-mask-threshold", "1.1"])
+            .expect_err("thresholds greater than one should be rejected");
+        assert!(err.to_string().contains("between 0 and 1"));
+    }
+
+    #[test]
     fn geometry_prompt_defaults_positive_labels_for_points() -> Result<()> {
         let device = Device::Cpu;
         let points = vec![PointArg { x: 0.25, y: 0.5 }, PointArg { x: 0.75, y: 0.9 }];
@@ -2167,6 +2240,11 @@ pub fn main() -> anyhow::Result<()> {
             .unwrap_or_default();
         let video_tokenizer_path =
             infer_video_tokenizer_path(args.tokenizer.as_deref(), args.checkpoint.as_deref());
+        let render_modes = if args.video_render.is_empty() {
+            vec![video::VideoRenderMode::PerObjectOverlay]
+        } else {
+            args.video_render.clone()
+        };
         let video_mode = video::VideoMode {
             video_path: video_path.to_string(),
             tokenizer_path: video_tokenizer_path,
@@ -2176,6 +2254,10 @@ pub fn main() -> anyhow::Result<()> {
             boxes,
             box_labels,
             frame_stride: args.video_frame_stride,
+            render_modes,
+            mask_threshold: args.video_mask_threshold,
+            draw_boxes: args.video_draw_boxes || !args.video_no_draw_boxes,
+            draw_contours: args.video_draw_contours,
             prefetch_ahead: args.video_prefetch_ahead,
             prefetch_behind: args.video_prefetch_behind,
             max_feature_cache_entries: args.video_max_feature_cache_entries,

@@ -243,6 +243,38 @@ cargo run -p candle-examples --features cuda --example sam3 -- \
   --output-dir candle-examples/examples/sam3/output/video
 ```
 
+The default video render remains the existing per-object green overlay. When
+provided, the repeatable `--video-render` option selects one or more artifact
+styles to export in the same run:
+
+```bash
+cargo run -p candle-examples --example sam3 -- \
+  --video /path/to/video.mp4 \
+  --video-prompt "person" \
+  --video-render combined-upstream \
+  --video-render cutout-rgba \
+  --video-render cutout-rgb-black \
+  --video-draw-contours \
+  --video-mask-threshold 0.5 \
+  --output-dir candle-examples/examples/sam3/output/video
+```
+
+Available render modes are:
+
+- `per-object-overlay`: legacy green overlays in `masked_frames/`
+- `combined-upstream`: one all-object frame using stable tab10 colors in
+  `combined_frames/`
+- `cutout-rgba`: per-object cutouts with transparent backgrounds in
+  `cutouts_rgba/`
+- `cutout-rgb-black`: per-object cutouts with black backgrounds in
+  `cutouts_rgb_black/`
+
+Boxes are drawn on overlays by default; use `--no-video-draw-boxes` to omit
+them. `--video-draw-contours` adds the upstream-style white, black, and
+object-color contour strokes. `reference.json` records the selected modes,
+render controls, and output directories. `video_results.json` records the
+combined-frame and per-object cutout paths when those artifacts are selected.
+
 ## Paths
 
 The example accepts either:
